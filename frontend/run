@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+CMD="${1:-start}"
+LOCAL_NODE="$ROOT/.runtime/bin/node"
+LOCAL_NPM_CLI="$ROOT/.runtime/lib/node_modules/npm/bin/npm-cli.js"
+
+if [ -x "$LOCAL_NODE" ] && [ -f "$LOCAL_NPM_CLI" ]; then
+  NODE_BIN="$LOCAL_NODE"
+  NPM_COMMAND=("$LOCAL_NODE" "$LOCAL_NPM_CLI")
+  export PATH="$ROOT/.runtime/bin:${PATH:-}"
+else
+  NODE_BIN="node"
+  NPM_COMMAND=(npm)
+fi
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    echo "A SHA-256 utility (shasum or sha256sum) is required." >&2
+    exit 1
+  fi
+}
+
+ensure_node() {
+  if ! command -v "$NODE_BIN" >/dev/null; then
+    echo "Node.js 20.19+, 22.13+, or 24 is required. Install an LTS release from https://nodejs.org/" >&2
+    exit 1
+  fi
+  major="$("$NODE_BIN" -p "process.versions.node.split('.')[0]")"
+  minor="$("$NODE_BIN" -p "process.versions.node.split('.')[1]")"
+  if { [ "$major" -eq 20 ] && [ "$minor" -lt 19 ]; } || [ "$major" -eq 21 ] || { [ "$major" -eq 22 ] && [ "$minor" -lt 13 ]; } || [ "$major" -lt 20 ] || [ "$major" -eq 23 ] || [ "$major" -ge 25 ]; then
+    echo "Node.js 20.19+, 22.13+, or 24 required; found $("$NODE_BIN" -v)" >&2
+    exit 1
+  fi
+}
+
+ensure_deps() {
+  local expected installed
+  mkdir -p -m 700 .local-data logs
+  expected="$(sha256_file package-lock.json)"
+  installed="$(cat .local-data/dependencies.sha256 2>/dev/null || true)"
+  if [ ! -x node_modules/.bin/tsx ] || [ "$installed" != "$expected" ]; then
+    echo "Installing pinned dependencies..."
+    "${NPM_COMMAND[@]}" ci --cache .local-data/npm-cache --no-audit --no-fund
+    printf '%s\n' "$expected" > .local-data/dependencies.sha256
+  fi
+}
+
+ensure_node
+case "$CMD" in
+  start|dev)
+    ensure_deps
+    "$NODE_BIN" scripts/launcher.mjs "$CMD"
+    ;;
+  doctor|stop|logs)
+    "$NODE_BIN" scripts/launcher.mjs "$CMD"
+    ;;
+  reset)
+    echo "Destructive reset: this removes local configuration, database, and runtime state."
+    printf "Type RESET to continue: "
+    read -r answer
+    if [ "$answer" = RESET ]; then
+      "$NODE_BIN" scripts/launcher.mjs stop
+      rm -rf .local-data
+      echo "Local state reset."
+    else
+      echo "Reset aborted."
+    fi
+    ;;
+  update)
+    if [ -f .gate-crossex-source-install ] && [ ! -d .git ]; then
+      exec env GCT_INSTALL_DIR="$ROOT" /bin/bash "$ROOT/bootstrap.sh" --update
+    fi
+    "$NODE_BIN" scripts/launcher.mjs stop
+    ensure_deps
+    if [ -f .local-data/gate-crossex.sqlite ]; then
+      backup_path=".local-data/gate-crossex.sqlite.backup.$(date +%Y%m%d%H%M%S)"
+      "$NODE_BIN" scripts/backup-database.mjs .local-data/gate-crossex.sqlite "$backup_path"
+      echo "Consistent database backup created at $backup_path."
+    fi
+    git pull --ff-only
+    "${NPM_COMMAND[@]}" ci --cache .local-data/npm-cache --no-audit --no-fund
+    sha256_file package-lock.json > .local-data/dependencies.sha256
+    "${NPM_COMMAND[@]}" run build
+    ;;
+  backup)
+    ensure_deps
+    "$NODE_BIN" scripts/launcher.mjs stop
+    if [ ! -f .local-data/gate-crossex.sqlite ]; then
+      echo "No local database exists to back up." >&2
+      exit 1
+    fi
+    backup_path="${2:-.local-data/gate-crossex.sqlite.backup.$(date +%Y%m%d%H%M%S)}"
+    "$NODE_BIN" scripts/backup-database.mjs .local-data/gate-crossex.sqlite "$backup_path"
+    echo "Verified database backup created at $backup_path."
+    ;;
+  restore)
+    ensure_deps
+    restore_path="${2:-}"
+    if [ -z "$restore_path" ]; then
+      echo "Usage: ./run restore <backup.sqlite>" >&2
+      exit 2
+    fi
+    echo "Restore local state from $restore_path. The current database will be preserved."
+    printf "Type RESTORE to continue: "
+    read -r answer
+    if [ "$answer" != RESTORE ]; then
+      echo "Restore aborted."
+      exit 0
+    fi
+    "$NODE_BIN" scripts/launcher.mjs stop
+    "$NODE_BIN" scripts/restore-database.mjs "$restore_path" .local-data/gate-crossex.sqlite
+    ;;
+  maintenance)
+    ensure_deps
+    "$NODE_BIN" scripts/launcher.mjs stop
+    "$NODE_BIN" scripts/maintain-database.mjs .local-data/gate-crossex.sqlite
+    ;;
+  *)
+    echo "Usage: ./run [dev|doctor|stop|logs|reset|update|backup [path]|restore <path>|maintenance]" >&2
+    exit 2
+    ;;
+esac

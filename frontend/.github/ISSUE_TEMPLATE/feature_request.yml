@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose a focused local-first improvement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful outcome, including UI and safety behavior.
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: Local-first boundary
+      options:
+        - label: This proposal does not require hosted services, telemetry, user accounts, subscriptions, or maintainer-controlled data collection.
+          required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

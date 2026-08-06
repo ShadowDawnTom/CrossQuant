@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gate-crossex-arbitrage"
+version = "0.1.0"
+description = "Gate CrossEx 资金费率跨所套利监控器"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "CrossEx Arbitrage" }]
+dependencies = []
+
+[project.scripts]
+crossex-arb = "crossex_arb.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

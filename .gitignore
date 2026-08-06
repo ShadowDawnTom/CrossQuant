@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# 克隆的 Gate CrossEx 前端只提交源码，不提交本地运行状态或凭据。
+frontend/node_modules/
+frontend/.local-data/
+frontend/logs/
+frontend/.env
+frontend/.runtime/

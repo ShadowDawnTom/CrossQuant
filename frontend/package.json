@@ -1,0 +1,52 @@
+{
+  "name": "gate-crossex-terminal",
+  "private": true,
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build:packages": "npm run build -w packages/shared-types && npm run build -w packages/domain && npm run build -w packages/public-data",
+    "build": "npm run build:packages && npm run build -w apps/backend && npm run build -w apps/frontend",
+    "typecheck": "npm run build:packages && npm run typecheck --workspaces --if-present",
+    "test": "npm run build:packages && npm run test --workspaces --if-present",
+    "test:e2e": "npm run build && playwright test",
+    "test:e2e:run": "playwright test",
+    "lint": "eslint .",
+    "benchmark:db": "node scripts/benchmark-database.mjs",
+    "test:bootstrap": "node --test scripts/bootstrap-installer.test.mjs",
+    "test:release": "node --test scripts/release-installer.test.mjs",
+    "release:bundle:macos": "node scripts/build-release-bundle.mjs",
+    "release:bundle:windows": "node scripts/build-release-bundle-windows.mjs",
+    "verify": "npm run lint && npm run typecheck && npm test && npm run test:bootstrap && npm run test:release && npm run build && npm run test:e2e:run",
+    "predev": "npm run build:packages",
+    "dev": "concurrently -n backend,frontend -c blue,magenta \"npm run dev -w apps/backend\" \"npm run dev -w apps/frontend\""
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.13.0 <23 || >=24 <25"
+  },
+  "allowScripts": {
+    "better-sqlite3": true,
+    "esbuild": false,
+    "fsevents": false
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "^1.62.0",
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "22.18.6",
+    "concurrently": "9.2.4",
+    "eslint": "10.8.0",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-react-refresh": "0.5.3",
+    "globals": "16.4.0",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.65.0",
+    "vitest": "3.2.7"
+  }
+}

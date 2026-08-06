@@ -1,0 +1,17 @@
+node_modules
+dist
+dist-ts
+.local-data
+.env
+.env.*
+!.env.example
+logs
+.vite
+playwright-report
+test-results
+release
+.release-cache
+.runtime
+.gate-crossex-source-install
+.gate-crossex-source.json
+.claude/

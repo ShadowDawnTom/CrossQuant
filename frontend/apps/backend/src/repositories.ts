@@ -1,0 +1,531 @@
+import { randomUUID } from 'node:crypto';
+import type Database from 'better-sqlite3';
+import {
+  HyperliquidPerpMetadataSnapshotSchema,
+  type FundingRatePoint,
+  type HyperliquidPerpMetadataSnapshot,
+} from '@gate-crossex/public-data';
+import { PortfolioSnapshotSchema, ReconciliationReportSchema, UserPreferencesSchema, type CrossExInstrument, type CrossExRiskLimit, type PortfolioSnapshot, type PublicMarketSnapshot, type ReconciliationReport, type UserPreferences } from '@gate-crossex/shared-types';
+
+export interface CredentialMetadata {
+  id: string;
+  label: string;
+  provider: string;
+  createdAt: string;
+  lastVerifiedAt: string | null;
+}
+
+interface CredentialMetadataRow {
+  id: string;
+  label: string;
+  provider: string;
+  created_at: string;
+  last_verified_at: string | null;
+}
+
+export function getCredentialMetadata(database: Database.Database, id: string): CredentialMetadata | null {
+  const row = database.prepare(`
+    SELECT id, label, provider, created_at, last_verified_at
+    FROM credential_metadata
+    WHERE id = ?
+  `).get(id) as CredentialMetadataRow | undefined;
+  if (!row) return null;
+  return {
+    id: row.id,
+    label: row.label,
+    provider: row.provider,
+    createdAt: row.created_at,
+    lastVerifiedAt: row.last_verified_at,
+  };
+}
+
+export function upsertCredentialMetadata(
+  database: Database.Database,
+  metadata: CredentialMetadata,
+): void {
+  database.prepare(`
+    INSERT INTO credential_metadata (id, label, provider, created_at, last_verified_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      label = excluded.label,
+      provider = excluded.provider,
+      last_verified_at = excluded.last_verified_at
+  `).run(
+    metadata.id,
+    metadata.label,
+    metadata.provider,
+    metadata.createdAt,
+    metadata.lastVerifiedAt,
+  );
+}
+
+export function deleteCredentialMetadata(database: Database.Database, id: string): void {
+  database.prepare('DELETE FROM credential_metadata WHERE id = ?').run(id);
+}
+
+export function readUserPreferences(database: Database.Database): UserPreferences {
+  const rows = database.prepare('SELECT key, value_json FROM user_preferences').all() as Array<{ key: string; value_json: string }>;
+  const preferences: Record<string, unknown> = {};
+  for (const row of rows) {
+    // Rows from removed settings keys or hand-edited databases must not break every preference.
+    const valueSchema = UserPreferencesSchema.shape[row.key as keyof typeof UserPreferencesSchema.shape];
+    if (!valueSchema) continue;
+    try {
+      const parsed = valueSchema.safeParse(JSON.parse(row.value_json));
+      if (parsed.success && parsed.data !== undefined) preferences[row.key] = parsed.data;
+    } catch { /* Skip corrupt value_json; the next save overwrites it. */ }
+  }
+  return preferences as UserPreferences;
+}
+
+export function saveUserPreferences(database: Database.Database, preferences: UserPreferences): void {
+  const upsert = database.prepare(`
+    INSERT INTO user_preferences (key, value_json, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+  `);
+  const updatedAt = new Date().toISOString();
+  database.transaction(() => {
+    for (const [key, value] of Object.entries(preferences)) {
+      if (value === undefined) continue;
+      upsert.run(key, JSON.stringify(value), updatedAt);
+    }
+  })();
+}
+
+export function addAuditEvent(
+  database: Database.Database,
+  type: string,
+  payload: Record<string, unknown>,
+): void {
+  database.prepare(`
+    INSERT INTO audit_events (id, created_at, type, correlation_id, payload_json)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(randomUUID(), new Date().toISOString(), type, null, JSON.stringify(payload));
+}
+
+interface InstrumentRow {
+  symbol: string;
+  exchange_type: string;
+  business_type: string;
+  state: string;
+  min_size: string;
+  min_notional: string | null;
+  lot_size: string;
+  tick_size: string;
+  max_num_orders: string;
+  max_market_size: string | null;
+  max_limit_size: string | null;
+  contract_size: string | null;
+  liquidation_fee: string | null;
+  default_leverage: string | null;
+  delist_time: string;
+  fetched_at: string;
+}
+
+export interface CachedInstrumentCatalog {
+  items: CrossExInstrument[];
+  fetchedAt: string;
+}
+
+function instrumentFromRow(row: InstrumentRow): CrossExInstrument {
+  return {
+    symbol: row.symbol,
+    exchangeType: row.exchange_type,
+    businessType: row.business_type,
+    state: row.state,
+    minSize: row.min_size,
+    minNotional: row.min_notional,
+    lotSize: row.lot_size,
+    tickSize: row.tick_size,
+    maxNumOrders: row.max_num_orders,
+    maxMarketSize: row.max_market_size,
+    maxLimitSize: row.max_limit_size,
+    contractSize: row.contract_size,
+    liquidationFee: row.liquidation_fee,
+    defaultLeverage: row.default_leverage,
+    delistTime: row.delist_time,
+  };
+}
+
+export function readInstrumentCatalog(database: Database.Database): CachedInstrumentCatalog | null {
+  const rows = database.prepare(`
+    SELECT symbol, exchange_type, business_type, state, min_size, min_notional, lot_size,
+      tick_size, max_num_orders, max_market_size, max_limit_size, contract_size,
+      liquidation_fee, default_leverage, delist_time, fetched_at
+    FROM crossex_instruments
+    ORDER BY symbol
+  `).all() as InstrumentRow[];
+  if (rows.length === 0 || !rows[0]) return null;
+  return { items: rows.map(instrumentFromRow), fetchedAt: rows[0].fetched_at };
+}
+
+export function replaceInstrumentCatalog(
+  database: Database.Database,
+  items: CrossExInstrument[],
+  fetchedAt: string,
+): void {
+  const insert = database.prepare(`
+    INSERT INTO crossex_instruments (
+      symbol, exchange_type, business_type, state, min_size, min_notional, lot_size,
+      tick_size, max_num_orders, max_market_size, max_limit_size, contract_size,
+      liquidation_fee, default_leverage, delist_time, fetched_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  database.transaction(() => {
+    database.prepare('DELETE FROM crossex_instruments').run();
+    for (const item of items) {
+      insert.run(
+        item.symbol, item.exchangeType, item.businessType, item.state, item.minSize,
+        item.minNotional, item.lotSize, item.tickSize, item.maxNumOrders,
+        item.maxMarketSize, item.maxLimitSize, item.contractSize,
+        item.liquidationFee, item.defaultLeverage, item.delistTime, fetchedAt,
+      );
+    }
+    database.prepare(`
+      INSERT INTO market_data_sync (source, last_attempt_at, last_success_at, last_error_code)
+      VALUES ('gate_crossex_instruments', ?, ?, NULL)
+      ON CONFLICT(source) DO UPDATE SET
+        last_attempt_at = excluded.last_attempt_at,
+        last_success_at = excluded.last_success_at,
+        last_error_code = NULL
+    `).run(fetchedAt, fetchedAt);
+  })();
+}
+
+export function recordMarketDataFailure(
+  database: Database.Database,
+  source: string,
+  attemptedAt: string,
+  errorCode: string,
+): void {
+  database.prepare(`
+    INSERT INTO market_data_sync (source, last_attempt_at, last_success_at, last_error_code)
+    VALUES (?, ?, NULL, ?)
+    ON CONFLICT(source) DO UPDATE SET
+      last_attempt_at = excluded.last_attempt_at,
+      last_error_code = excluded.last_error_code
+  `).run(source, attemptedAt, errorCode);
+}
+
+export function readHyperliquidPerpMetadata(
+  database: Database.Database,
+): HyperliquidPerpMetadataSnapshot | null {
+  const row = database.prepare(`
+    SELECT native_names_json, fetched_at
+    FROM hyperliquid_perp_metadata
+    WHERE singleton = 1
+  `).get() as { native_names_json: string; fetched_at: string } | undefined;
+  if (!row) return null;
+  try {
+    const parsed = HyperliquidPerpMetadataSnapshotSchema.safeParse({
+      nativeNames: JSON.parse(row.native_names_json),
+      fetchedAt: row.fetched_at,
+    });
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeHyperliquidPerpMetadata(
+  database: Database.Database,
+  snapshot: HyperliquidPerpMetadataSnapshot,
+): void {
+  const validated = HyperliquidPerpMetadataSnapshotSchema.parse(snapshot);
+  database.prepare(`
+    INSERT INTO hyperliquid_perp_metadata (singleton, native_names_json, fetched_at)
+    VALUES (1, ?, ?)
+    ON CONFLICT(singleton) DO UPDATE SET
+      native_names_json = excluded.native_names_json,
+      fetched_at = excluded.fetched_at
+  `).run(JSON.stringify(validated.nativeNames), validated.fetchedAt);
+}
+
+export interface FundingHistoryCoverage {
+  symbol: string;
+  coveredFrom: number;
+  coveredTo: number;
+  lastAttemptAt: string;
+  lastSuccessAt: string | null;
+  lastErrorCode: string | null;
+}
+
+interface FundingHistoryCoverageRow {
+  symbol: string;
+  covered_from: number;
+  covered_to: number;
+  last_attempt_at: string;
+  last_success_at: string | null;
+  last_error_code: string | null;
+}
+
+export function readFundingHistoryCoverage(
+  database: Database.Database,
+  symbol: string,
+): FundingHistoryCoverage | null {
+  const row = database.prepare(`
+    SELECT symbol, covered_from, covered_to, last_attempt_at, last_success_at, last_error_code
+    FROM funding_history_coverage
+    WHERE symbol = ?
+  `).get(symbol) as FundingHistoryCoverageRow | undefined;
+  return row ? {
+    symbol: row.symbol,
+    coveredFrom: row.covered_from,
+    coveredTo: row.covered_to,
+    lastAttemptAt: row.last_attempt_at,
+    lastSuccessAt: row.last_success_at,
+    lastErrorCode: row.last_error_code,
+  } : null;
+}
+
+export function readFundingRateHistory(
+  database: Database.Database,
+  symbol: string,
+  startExclusive: number,
+  endInclusive: number,
+): FundingRatePoint[] {
+  const rows = database.prepare(`
+    SELECT funding_time, rate
+    FROM funding_rate_history
+    WHERE symbol = ? AND funding_time > ? AND funding_time <= ?
+    ORDER BY funding_time
+  `).all(symbol, startExclusive, endInclusive) as Array<{ funding_time: number; rate: string }>;
+  return rows.map((row) => ({ timestamp: row.funding_time, rate: row.rate }));
+}
+
+export function listCachedFundingHistorySymbols(database: Database.Database, limit = 140): string[] {
+  const safeLimit = Math.max(1, Math.min(1_000, Math.trunc(limit)));
+  const rows = database.prepare(`
+    SELECT symbol
+    FROM funding_history_coverage
+    ORDER BY COALESCE(last_success_at, last_attempt_at) DESC, symbol
+    LIMIT ?
+  `).all(safeLimit) as Array<{ symbol: string }>;
+  return rows.map((row) => row.symbol);
+}
+
+/**
+ * Replace one authoritative upstream range and extend its contiguous coverage atomically.
+ * `points` must already contain at most one exact-decimal aggregate per timestamp.
+ */
+export function replaceFundingHistoryRange(
+  database: Database.Database,
+  symbol: string,
+  startExclusive: number,
+  endInclusive: number,
+  points: readonly FundingRatePoint[],
+  fetchedAt: string,
+): void {
+  const insert = database.prepare(`
+    INSERT INTO funding_rate_history (symbol, funding_time, rate, fetched_at)
+    VALUES (?, ?, ?, ?)
+  `);
+  database.transaction(() => {
+    const existing = readFundingHistoryCoverage(database, symbol);
+    if (existing && (startExclusive > existing.coveredTo || endInclusive < existing.coveredFrom)) {
+      throw new Error(`Funding history range for ${symbol} is not contiguous with cached coverage`);
+    }
+    database.prepare(`
+      DELETE FROM funding_rate_history
+      WHERE symbol = ? AND funding_time > ? AND funding_time <= ?
+    `).run(symbol, startExclusive, endInclusive);
+    for (const point of points) insert.run(symbol, point.timestamp, point.rate, fetchedAt);
+    database.prepare(`
+      INSERT INTO funding_history_coverage (
+        symbol, covered_from, covered_to, last_attempt_at, last_success_at, last_error_code
+      ) VALUES (?, ?, ?, ?, ?, NULL)
+      ON CONFLICT(symbol) DO UPDATE SET
+        covered_from = MIN(funding_history_coverage.covered_from, excluded.covered_from),
+        covered_to = MAX(funding_history_coverage.covered_to, excluded.covered_to),
+        last_attempt_at = excluded.last_attempt_at,
+        last_success_at = excluded.last_success_at,
+        last_error_code = NULL
+    `).run(symbol, startExclusive, endInclusive, fetchedAt, fetchedAt);
+  })();
+}
+
+export function recordFundingHistoryFailure(
+  database: Database.Database,
+  symbol: string,
+  attemptedAt: string,
+  errorCode: string,
+): void {
+  database.prepare(`
+    UPDATE funding_history_coverage
+    SET last_attempt_at = ?, last_error_code = ?
+    WHERE symbol = ?
+  `).run(attemptedAt, errorCode, symbol);
+}
+
+export function pruneFundingRateHistory(database: Database.Database, cutoff: number): void {
+  database.transaction(() => {
+    database.prepare('DELETE FROM funding_rate_history WHERE funding_time <= ?').run(cutoff);
+    database.prepare('DELETE FROM funding_history_coverage WHERE covered_to <= ?').run(cutoff);
+    database.prepare(`
+      UPDATE funding_history_coverage
+      SET covered_from = ?
+      WHERE covered_from < ?
+    `).run(cutoff, cutoff);
+  })();
+}
+
+export function replaceRiskLimits(
+  database: Database.Database,
+  limits: CrossExRiskLimit[],
+  fetchedAt: string,
+): void {
+  const insert = database.prepare(`
+    INSERT INTO crossex_risk_tiers (
+      symbol, tier, min_risk_limit_value, max_risk_limit_value, quick_cal_amount,
+      leverage_max, maintenance_rate, fetched_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  database.transaction(() => {
+    for (const limit of limits) {
+      database.prepare('DELETE FROM crossex_risk_tiers WHERE symbol = ?').run(limit.symbol);
+      for (const tier of limit.tiers) {
+        insert.run(
+          limit.symbol, tier.tier, tier.minRiskLimitValue, tier.maxRiskLimitValue,
+          tier.quickCalAmount, tier.leverageMax, tier.maintenanceRate, fetchedAt,
+        );
+      }
+    }
+  })();
+}
+
+interface RiskTierRow {
+  symbol: string;
+  tier: string;
+  min_risk_limit_value: string;
+  max_risk_limit_value: string;
+  quick_cal_amount: string;
+  leverage_max: string;
+  maintenance_rate: string;
+  fetched_at: string;
+}
+
+export function readRiskLimit(database: Database.Database, symbol: string): { item: CrossExRiskLimit; fetchedAt: string } | null {
+  const rows = database.prepare(`
+    SELECT symbol, tier, min_risk_limit_value, max_risk_limit_value, quick_cal_amount,
+      leverage_max, maintenance_rate, fetched_at
+    FROM crossex_risk_tiers WHERE symbol = ? ORDER BY CAST(tier AS INTEGER)
+  `).all(symbol) as RiskTierRow[];
+  if (rows.length === 0 || !rows[0]) return null;
+  return {
+    item: {
+      symbol,
+      tiers: rows.map((row) => ({
+        tier: row.tier,
+        minRiskLimitValue: row.min_risk_limit_value,
+        maxRiskLimitValue: row.max_risk_limit_value,
+        quickCalAmount: row.quick_cal_amount,
+        leverageMax: row.leverage_max,
+        maintenanceRate: row.maintenance_rate,
+      })),
+    },
+    fetchedAt: rows[0].fetched_at,
+  };
+}
+
+interface PublicMarketSnapshotRow {
+  symbol: string;
+  venue: 'BINANCE' | 'GATE' | 'OKX';
+  product: 'FUTURE';
+  bid_price: string | null;
+  ask_price: string | null;
+  last_price: string | null;
+  mark_price: string;
+  index_price: string;
+  funding_rate: string;
+  predicted_funding_rate: string | null;
+  next_funding_at: string;
+  source_timestamp: string;
+  fetched_at: string;
+  source: PublicMarketSnapshot['source'];
+}
+
+export function readPublicMarketSnapshot(database: Database.Database, symbol: string): PublicMarketSnapshot | null {
+  const row = database.prepare(`
+    SELECT symbol, venue, product, bid_price, ask_price, last_price, mark_price, index_price,
+      funding_rate, predicted_funding_rate, next_funding_at, source_timestamp, fetched_at, source
+    FROM public_market_snapshots WHERE symbol = ?
+  `).get(symbol) as PublicMarketSnapshotRow | undefined;
+  if (!row) return null;
+  return {
+    symbol: row.symbol, venue: row.venue, product: row.product,
+    bidPrice: row.bid_price, askPrice: row.ask_price, lastPrice: row.last_price,
+    markPrice: row.mark_price, indexPrice: row.index_price, fundingRate: row.funding_rate,
+    predictedFundingRate: row.predicted_funding_rate, nextFundingAt: row.next_funding_at,
+    sourceTimestamp: row.source_timestamp, fetchedAt: row.fetched_at, source: row.source,
+  };
+}
+
+export function upsertPublicMarketSnapshot(database: Database.Database, snapshot: PublicMarketSnapshot): void {
+  database.prepare(`
+    INSERT INTO public_market_snapshots (
+      symbol, venue, product, bid_price, ask_price, last_price, mark_price, index_price,
+      funding_rate, predicted_funding_rate, next_funding_at, source_timestamp, fetched_at, source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(symbol) DO UPDATE SET
+      venue = excluded.venue, product = excluded.product, bid_price = excluded.bid_price,
+      ask_price = excluded.ask_price, last_price = excluded.last_price,
+      mark_price = excluded.mark_price, index_price = excluded.index_price,
+      funding_rate = excluded.funding_rate, predicted_funding_rate = excluded.predicted_funding_rate,
+      next_funding_at = excluded.next_funding_at, source_timestamp = excluded.source_timestamp,
+      fetched_at = excluded.fetched_at, source = excluded.source
+  `).run(
+    snapshot.symbol, snapshot.venue, snapshot.product, snapshot.bidPrice, snapshot.askPrice,
+    snapshot.lastPrice, snapshot.markPrice, snapshot.indexPrice, snapshot.fundingRate,
+    snapshot.predictedFundingRate, snapshot.nextFundingAt, snapshot.sourceTimestamp,
+    snapshot.fetchedAt, snapshot.source,
+  );
+}
+
+export function savePortfolioSnapshot(database: Database.Database, snapshot: PortfolioSnapshot): void {
+  const validated = PortfolioSnapshotSchema.parse(snapshot);
+  database.transaction(() => {
+    database.prepare(`
+      INSERT INTO portfolio_snapshots (id, fetched_at, remote_updated_at, payload_json)
+      VALUES (?, ?, ?, ?)
+    `).run(randomUUID(), validated.fetchedAt, validated.account.remoteUpdatedAt, JSON.stringify(validated));
+    database.prepare(`
+      DELETE FROM portfolio_snapshots
+      WHERE id NOT IN (SELECT id FROM portfolio_snapshots ORDER BY fetched_at DESC LIMIT 20)
+    `).run();
+  })();
+}
+
+export function readLatestPortfolioSnapshot(database: Database.Database): PortfolioSnapshot | null {
+  const row = database.prepare(`
+    SELECT payload_json FROM portfolio_snapshots ORDER BY fetched_at DESC LIMIT 1
+  `).get() as { payload_json: string } | undefined;
+  if (!row) return null;
+  try {
+    return PortfolioSnapshotSchema.parse(JSON.parse(row.payload_json) as unknown);
+  } catch {
+    return null;
+  }
+}
+
+export function saveReconciliationReport(database: Database.Database, report: ReconciliationReport): void {
+  const validated = ReconciliationReportSchema.parse(report);
+  database.transaction(() => {
+    database.prepare(`
+      INSERT INTO reconciliation_reports (id, created_at, status, payload_json)
+      VALUES (?, ?, ?, ?)
+    `).run(validated.id, validated.createdAt, validated.status, JSON.stringify(validated));
+    database.prepare(`
+      DELETE FROM reconciliation_reports
+      WHERE id NOT IN (SELECT id FROM reconciliation_reports ORDER BY created_at DESC LIMIT 100)
+    `).run();
+  })();
+}
+
+export function listReconciliationReports(database: Database.Database, limit = 20): ReconciliationReport[] {
+  const safeLimit = Math.max(1, Math.min(100, Math.trunc(limit)));
+  const rows = database.prepare(`
+    SELECT payload_json FROM reconciliation_reports ORDER BY created_at DESC LIMIT ?
+  `).all(safeLimit) as Array<{ payload_json: string }>;
+  return rows.map((row) => ReconciliationReportSchema.parse(JSON.parse(row.payload_json) as unknown));
+}

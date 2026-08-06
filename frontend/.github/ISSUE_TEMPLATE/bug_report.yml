@@ -1,0 +1,77 @@
+name: Bug report
+description: Report a reproducible problem without sharing credentials or private trading data.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never include API keys, account identifiers, unredacted logs, or database files. Use SECURITY.md for vulnerabilities.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - macOS prebuilt installer
+        - Windows prebuilt installer
+        - Source launcher
+        - Docker
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - Docker
+    validations:
+      required: true
+  - type: input
+    id: architecture
+    attributes:
+      label: Architecture
+      description: For example, Apple Silicon, Intel, x64, or ARM64.
+  - type: input
+    id: runtime
+    attributes:
+      label: Node.js version (source installs only)
+      placeholder: Output of node --version
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Give the smallest safe sequence that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Optional output from the doctor command. Check local paths and redact private data.
+      render: shell
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, account identifiers, private trading data, and unredacted logs.
+          required: true
+        - label: This report does not contain vulnerability details that should be reported privately.
+          required: true

@@ -1,0 +1,26 @@
+services:
+  gate-crossex:
+    build: .
+    init: true
+    read_only: true
+    ports:
+      - "127.0.0.1:17840:17840"
+    environment:
+      # The process must listen on the container interface. The published host
+      # port remains loopback-only and is not reachable from the LAN.
+      GCT_HOST: 0.0.0.0
+      GCT_FRONTEND_ORIGIN: http://127.0.0.1:17840
+      GCT_FRONTEND_PORT: 17840
+      GCT_DISABLE_OS_KEYCHAIN: "1"
+      GCT_CREDENTIAL_ENV_PATH: /app/.local-data/credentials.env
+    volumes:
+      - gate-crossex-data:/app/.local-data
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+volumes:
+  gate-crossex-data:
