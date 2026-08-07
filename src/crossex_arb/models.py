@@ -22,12 +22,6 @@ class FundingInfo:
     next_time_ms: int
     interval_seconds: int
 
-    @property
-    def hourly_rate(self) -> Decimal:
-        if self.interval_seconds <= 0:
-            raise ValueError(f"{self.symbol} 的 funding_interval 无效")
-        return self.rate / (Decimal(self.interval_seconds) / Decimal(3600))
-
 
 @dataclass(frozen=True)
 class Ticker:
@@ -48,6 +42,20 @@ class FeeRate:
 
 
 @dataclass(frozen=True)
+class CandidateRejection:
+    asset: str
+    quote: str
+    symbols: tuple[str, ...]
+    reason: str
+    detail: str
+
+    def to_dict(self) -> dict[str, object]:
+        data = asdict(self)
+        data["symbols"] = list(self.symbols)
+        return data
+
+
+@dataclass(frozen=True)
 class Opportunity:
     asset: str
     quote: str
@@ -55,12 +63,21 @@ class Opportunity:
     short_symbol: str
     long_rate: Decimal
     short_rate: Decimal
-    gross_return: Decimal
-    trading_cost: Decimal
-    net_return: Decimal
-    net_annualized: Decimal
-    mark_divergence: Decimal | None
+    long_funding_events: int
+    short_funding_events: int
+    long_funding_cashflow: Decimal
+    short_funding_cashflow: Decimal
+    gross_snapshot_return: Decimal
+    trading_cost_budget: Decimal
+    net_snapshot_return: Decimal
+    snapshot_annualized: Decimal
+    scenario_horizon_hours: Decimal
+    mark_divergence: Decimal
+    ticker_time_skew_ms: int
+    long_ticker_age_ms: int
+    short_ticker_age_ms: int
     funding_times_aligned: bool
+    execution_status: str = "UNVERIFIED_NO_ORDER_BOOK"
 
     def to_dict(self) -> dict[str, object]:
         data = asdict(self)
@@ -68,3 +85,17 @@ class Opportunity:
             if isinstance(value, Decimal):
                 data[key] = str(value)
         return data
+
+
+@dataclass(frozen=True)
+class ScanResult:
+    opportunities: list[Opportunity]
+    rejections: list[CandidateRejection]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "model": "current_funding_snapshot_cashflow_scenario",
+            "executable": False,
+            "opportunities": [item.to_dict() for item in self.opportunities],
+            "rejections": [item.to_dict() for item in self.rejections],
+        }

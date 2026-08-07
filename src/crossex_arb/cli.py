@@ -4,9 +4,12 @@ import argparse
 import json
 import sys
 from decimal import Decimal
+from pathlib import Path
 
 from crossex_arb.client import GateAPIError, GateCrossExClient
 from crossex_arb.config import Settings
+from crossex_arb.history import append_market_snapshot
+from crossex_arb.models import ScanResult
 from crossex_arb.strategy import find_opportunities, split_symbol
 
 
@@ -21,6 +24,7 @@ def _parser() -> argparse.ArgumentParser:
     scan.add_argument("--assets", default="BTC,ETH,SOL", help="逗号分隔的基础币")
     scan.add_argument("--quote", default="USDT", help="计价币，默认 USDT")
     scan.add_argument("--json", action="store_true", help="输出 JSON")
+    scan.add_argument("--snapshot-log", type=Path, help="将原始费率、Ticker 和手续费追加为 UTF-8 JSONL")
     return parser
 
 
@@ -37,7 +41,14 @@ def _print_symbols(client: GateCrossExClient, base: str | None, quote: str) -> i
     return 0
 
 
-def _scan(client: GateCrossExClient, settings: Settings, assets_text: str, quote: str, as_json: bool) -> int:
+def _scan(
+    client: GateCrossExClient,
+    settings: Settings,
+    assets_text: str,
+    quote: str,
+    as_json: bool,
+    snapshot_log: Path | None,
+) -> int:
     assets = {item.strip().upper() for item in assets_text.split(",") if item.strip()}
     rules = [item for item in client.list_symbols() if item.business == "FUTURE"]
     wanted = [item.symbol for item in rules if split_symbol(item.symbol)[2] in assets and split_symbol(item.symbol)[3] == quote.upper()]
@@ -47,31 +58,42 @@ def _scan(client: GateCrossExClient, settings: Settings, assets_text: str, quote
     funding = client.funding_info(wanted)
     tickers = client.tickers(wanted)
     fees = client.fees()
-    rows = find_opportunities(
+    if snapshot_log is not None:
+        append_market_snapshot(snapshot_log, funding, tickers, fees)
+    result = find_opportunities(
         funding=funding, tickers=tickers, fees=fees, rules=rules,
-        holding_hours=Decimal(str(settings.holding_hours)),
+        scenario_horizon_hours=Decimal(str(settings.scenario_horizon_hours)),
         slippage_bps_per_fill=Decimal(str(settings.slippage_bps_per_fill)),
         default_taker_fee=Decimal(str(settings.default_taker_fee)),
         max_mark_divergence=Decimal(str(settings.max_mark_price_divergence)),
         assets=assets, quote=quote.upper(),
+        max_ticker_age_ms=settings.max_ticker_age_ms,
+        max_ticker_skew_ms=settings.max_ticker_skew_ms,
     )
-    threshold = Decimal(str(settings.min_net_annualized))
-    rows = [item for item in rows if item.net_annualized >= threshold]
+    threshold = Decimal(str(settings.min_snapshot_annualized))
+    result = ScanResult(
+        [item for item in result.opportunities if item.snapshot_annualized >= threshold],
+        result.rejections,
+    )
     if as_json:
-        print(json.dumps([item.to_dict() for item in rows], ensure_ascii=False, indent=2))
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return 0
-    if not rows:
-        print("当前没有达到阈值的候选机会。")
+    if result.rejections:
+        print(f"已拒绝 {len(result.rejections)} 个数据不完整或超出风控阈值的候选。")
+    if not result.opportunities:
+        print("当前没有达到阈值的快照情景候选。")
         return 0
-    print("说明：LONG=做多低费率，SHORT=做空高费率；结果未使用盘口深度，不是下单指令。")
-    for item in rows:
+    print("说明：下列是“当前费率在情景期保持不变”的快照外推，不是预期 APR。")
+    print("未使用 ask/bid、盘口深度和双腿成交模型，所有结果均不代表可执行收益。")
+    for item in result.opportunities:
         aligned = "是" if item.funding_times_aligned else "否"
-        divergence = "未知" if item.mark_divergence is None else f"{item.mark_divergence:.3%}"
         print(
-            f"\n{item.asset}/{item.quote}  净年化={item.net_annualized:.2%}  持有期净收益={item.net_return:.4%}\n"
-            f"  LONG  {item.long_symbol}  funding={item.long_rate:.6%}\n"
-            f"  SHORT {item.short_symbol}  funding={item.short_rate:.6%}\n"
-            f"  成本={item.trading_cost:.4%}  标记价偏离={divergence}  结算时间对齐={aligned}"
+            f"\n{item.asset}/{item.quote}  快照情景年化={item.snapshot_annualized:.2%}  "
+            f"情景期净收益={item.net_snapshot_return:.4%}\n"
+            f"  LONG  {item.long_symbol}  funding={item.long_rate:.6%}  结算次数={item.long_funding_events}\n"
+            f"  SHORT {item.short_symbol}  funding={item.short_rate:.6%}  结算次数={item.short_funding_events}\n"
+            f"  成本预算={item.trading_cost_budget:.4%}  标记价偏离={item.mark_divergence:.3%}  "
+            f"行情时差={item.ticker_time_skew_ms}ms  首次结算对齐={aligned}"
         )
     return 0
 
@@ -89,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "scan":
             if not settings.api_key or not settings.api_secret:
                 raise GateAPIError(None, "MISSING_CREDENTIALS", "请在 .env 填写 GATE_API_KEY 和 GATE_API_SECRET")
-            return _scan(client, settings, args.assets, args.quote, args.json)
+            return _scan(client, settings, args.assets, args.quote, args.json, args.snapshot_log)
     except (GateAPIError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2

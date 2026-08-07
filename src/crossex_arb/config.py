@@ -32,9 +32,11 @@ class Settings:
     api_secret: str = ""
     base_url: str = "https://api.gateio.ws"
     live_trading: bool = False
-    holding_hours: float = 24.0
-    min_net_annualized: float = 0.10
+    scenario_horizon_hours: float = 24.0
+    min_snapshot_annualized: float = 0.10
     max_mark_price_divergence: float = 0.003
+    max_ticker_age_ms: int = 10_000
+    max_ticker_skew_ms: int = 2_000
     slippage_bps_per_fill: float = 2.0
     default_taker_fee: float = 0.0005
     timeout_seconds: float = 10.0
@@ -47,15 +49,18 @@ class Settings:
             api_secret=os.getenv("GATE_API_SECRET", "").strip(),
             base_url=os.getenv("GATE_BASE_URL", "https://api.gateio.ws").rstrip("/"),
             live_trading=_as_bool(os.getenv("ENABLE_LIVE_TRADING", "false")),
-            holding_hours=float(os.getenv("ARB_HOLDING_HOURS", "24")),
-            min_net_annualized=float(os.getenv("ARB_MIN_NET_ANNUALIZED", "0.10")),
+            scenario_horizon_hours=float(os.getenv("ARB_SCENARIO_HORIZON_HOURS", os.getenv("ARB_HOLDING_HOURS", "24"))),
+            min_snapshot_annualized=float(os.getenv("ARB_MIN_SNAPSHOT_ANNUALIZED", os.getenv("ARB_MIN_NET_ANNUALIZED", "0.10"))),
             max_mark_price_divergence=float(os.getenv("ARB_MAX_MARK_PRICE_DIVERGENCE", "0.003")),
+            max_ticker_age_ms=int(os.getenv("ARB_MAX_TICKER_AGE_MS", "10000")),
+            max_ticker_skew_ms=int(os.getenv("ARB_MAX_TICKER_SKEW_MS", "2000")),
             slippage_bps_per_fill=float(os.getenv("ARB_SLIPPAGE_BPS_PER_FILL", "2")),
             default_taker_fee=float(os.getenv("ARB_DEFAULT_TAKER_FEE", "0.0005")),
         )
-        if settings.holding_hours <= 0:
-            raise ValueError("ARB_HOLDING_HOURS 必须大于 0")
+        if settings.scenario_horizon_hours <= 0:
+            raise ValueError("ARB_SCENARIO_HORIZON_HOURS 必须大于 0")
+        if settings.max_ticker_age_ms < 0 or settings.max_ticker_skew_ms < 0:
+            raise ValueError("行情时间阈值不能为负数")
         if settings.slippage_bps_per_fill < 0 or settings.default_taker_fee < 0:
             raise ValueError("滑点和手续费不能为负数")
         return settings
-

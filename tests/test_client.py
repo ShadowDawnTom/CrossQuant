@@ -1,7 +1,11 @@
 import hashlib
+import io
+import json
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
-from crossex_arb.client import GateCrossExClient, build_signature, encode_query
+from crossex_arb.client import GateAPIError, GateCrossExClient, build_signature, encode_query
 
 
 class SignatureTests(unittest.TestCase):
@@ -33,6 +37,30 @@ class SignatureTests(unittest.TestCase):
     def test_symbols_query_keeps_commas_for_signature(self) -> None:
         query = encode_query([("symbols", "BINANCE_FUTURE_BTC_USDT,GATE_FUTURE_BTC_USDT")])
         self.assertEqual(query, "symbols=BINANCE_FUTURE_BTC_USDT,GATE_FUTURE_BTC_USDT")
+
+    def test_malformed_api_fields_raise_controlled_error(self) -> None:
+        class StubClient(GateCrossExClient):
+            def _request(self, *args, **kwargs):
+                return [{"symbol": "GATE_FUTURE_BTC_USDT", "funding_rate": "bad"}]
+
+        with self.assertRaises(GateAPIError) as caught:
+            StubClient("https://example.invalid").funding_info()
+        self.assertEqual(caught.exception.label, "INVALID_RESPONSE")
+
+    def test_rate_limit_error_preserves_status_and_label(self) -> None:
+        body = json.dumps({"label": "TOO_MANY_REQUESTS", "message": "rate limit"}).encode("utf-8")
+        error = HTTPError("https://example.invalid", 429, "Too Many Requests", {}, io.BytesIO(body))
+        with patch("crossex_arb.client.urlopen", side_effect=error):
+            with self.assertRaises(GateAPIError) as caught:
+                GateCrossExClient("https://example.invalid").list_symbols()
+        self.assertEqual(caught.exception.status, 429)
+        self.assertEqual(caught.exception.label, "TOO_MANY_REQUESTS")
+
+    def test_network_error_is_normalized(self) -> None:
+        with patch("crossex_arb.client.urlopen", side_effect=URLError("offline")):
+            with self.assertRaises(GateAPIError) as caught:
+                GateCrossExClient("https://example.invalid").list_symbols()
+        self.assertEqual(caught.exception.label, "NETWORK_ERROR")
 
 
 if __name__ == "__main__":

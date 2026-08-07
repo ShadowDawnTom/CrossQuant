@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import json
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -41,6 +41,13 @@ def _decimal(value: Any) -> Decimal | None:
     if value in (None, ""):
         return None
     return Decimal(str(value))
+
+
+def _response_rows(value: Any, endpoint: str) -> list[dict[str, Any]]:
+    """入口统一验证 API 结构，避免字段异常在策略层被当成有效数据。"""
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise GateAPIError(None, "INVALID_RESPONSE", f"{endpoint} 应返回对象数组")
+    return value
 
 
 def encode_query(params: list[tuple[str, str]] | None) -> str:
@@ -88,6 +95,8 @@ class GateCrossExClient:
             raise GateAPIError(exc.code, str(error.get("label", "UNKNOWN")), str(error.get("message", error.get("detail", "")))) from exc
         except URLError as exc:
             raise GateAPIError(None, "NETWORK_ERROR", str(exc.reason)) from exc
+        except (TimeoutError, OSError) as exc:
+            raise GateAPIError(None, "NETWORK_ERROR", str(exc)) from exc
         if not raw:
             return None
         try:
@@ -97,32 +106,53 @@ class GateCrossExClient:
 
     def list_symbols(self, symbols: list[str] | None = None) -> list[SymbolRule]:
         params = [("symbols", ",".join(symbols))] if symbols else None
-        rows = self._request("GET", "/crossex/rule/symbols", params=params, authenticated=False)
-        return [
-            SymbolRule(
-                symbol=row["symbol"], exchange=row["exchange_type"], business=row["business_type"],
-                state=row["state"], min_size=_decimal(row.get("min_size")),
-                min_notional=_decimal(row.get("min_notional")), lot_size=_decimal(row.get("lot_size")),
-            )
-            for row in rows
-        ]
+        rows = _response_rows(self._request("GET", "/crossex/rule/symbols", params=params, authenticated=False), "symbols")
+        try:
+            return [
+                SymbolRule(
+                    symbol=str(row["symbol"]), exchange=str(row["exchange_type"]), business=str(row["business_type"]),
+                    state=str(row["state"]), min_size=_decimal(row.get("min_size")),
+                    min_notional=_decimal(row.get("min_notional")), lot_size=_decimal(row.get("lot_size")),
+                )
+                for row in rows
+            ]
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise GateAPIError(None, "INVALID_RESPONSE", f"symbols 字段异常: {exc}") from exc
 
     def funding_info(self, symbols: list[str] | None = None) -> list[FundingInfo]:
         params = [("symbols", ",".join(symbols))] if symbols else None
-        rows = self._request("GET", "/crossex/market/funding_info", params=params)
-        return [FundingInfo(row["symbol"], Decimal(row["funding_rate"]), int(row["funding_time"]), int(row["funding_interval"])) for row in rows]
+        rows = _response_rows(self._request("GET", "/crossex/market/funding_info", params=params), "funding_info")
+        try:
+            result = [FundingInfo(str(row["symbol"]), Decimal(str(row["funding_rate"])), int(row["funding_time"]), int(row["funding_interval"])) for row in rows]
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise GateAPIError(None, "INVALID_RESPONSE", f"funding_info 字段异常: {exc}") from exc
+        if any(item.interval_seconds <= 0 or item.next_time_ms <= 0 for item in result):
+            raise GateAPIError(None, "INVALID_RESPONSE", "funding_info 包含无效结算时间或周期")
+        return result
 
     def tickers(self, symbols: list[str] | None = None) -> list[Ticker]:
         params = [("symbols", ",".join(symbols))] if symbols else None
-        rows = self._request("GET", "/crossex/market/tickers", params=params)
-        return [Ticker(row["symbol"], _decimal(row.get("last_price")), _decimal(row.get("mark_price")), int(row["timestamp"])) for row in rows]
+        rows = _response_rows(self._request("GET", "/crossex/market/tickers", params=params), "tickers")
+        try:
+            return [Ticker(str(row["symbol"]), _decimal(row.get("last_price")), _decimal(row.get("mark_price")), int(row["timestamp"])) for row in rows]
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise GateAPIError(None, "INVALID_RESPONSE", f"tickers 字段异常: {exc}") from exc
 
     def fees(self) -> dict[str, FeeRate]:
-        rows = self._request("GET", "/crossex/fee")
+        rows = _response_rows(self._request("GET", "/crossex/fee"), "fee")
         result: dict[str, FeeRate] = {}
-        for row in rows:
-            special = {item["symbol"]: Decimal(item["taker_fee_rate"]) for item in row.get("special_fee_list", []) if item.get("taker_fee_rate") not in (None, "")}
-            result[row["exchange_type"]] = FeeRate(row["exchange_type"], Decimal(row["future_taker_fee"]), special)
+        try:
+            for row in rows:
+                special_rows = row.get("special_fee_list", [])
+                if not isinstance(special_rows, list) or any(not isinstance(item, dict) for item in special_rows):
+                    raise TypeError("special_fee_list 不是对象数组")
+                special = {str(item["symbol"]): Decimal(str(item["taker_fee_rate"])) for item in special_rows if item.get("taker_fee_rate") not in (None, "")}
+                exchange = str(row["exchange_type"])
+                if exchange in result:
+                    raise ValueError(f"重复交易所 {exchange}")
+                result[exchange] = FeeRate(exchange, Decimal(str(row["future_taker_fee"])), special)
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise GateAPIError(None, "INVALID_RESPONSE", f"fee 字段异常: {exc}") from exc
         return result
 
     def account(self) -> Any:
