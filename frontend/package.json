@@ -17,6 +17,7 @@
     "test:e2e:run": "playwright test",
     "lint": "eslint .",
     "benchmark:db": "node scripts/benchmark-database.mjs",
+    "watchdog:risk": "node scripts/risk-watchdog.mjs",
     "test:bootstrap": "node --test scripts/bootstrap-installer.test.mjs",
     "test:release": "node --test scripts/release-installer.test.mjs",
     "release:bundle:macos": "node scripts/build-release-bundle.mjs",

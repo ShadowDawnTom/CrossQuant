@@ -405,6 +405,21 @@ afterEach(async () => {
 });
 
 describe('local backend', () => {
+  it('requires explicit intent and exposes the idempotent global kill switch', async () => {
+    const { app } = await createTestApp();
+    const denied = await app.inject({ method: 'POST', url: '/api/risk/kill-switch', headers: { host: '127.0.0.1:17840' } });
+    expect(denied.statusCode).toBe(403);
+    const triggered = await app.inject({
+      method: 'POST', url: '/api/risk/kill-switch',
+      headers: { host: '127.0.0.1:17840', 'x-gct-trading-intent': 'trigger-kill-switch' },
+      payload: { reason: 'test emergency' },
+    });
+    expect(triggered.statusCode).toBe(200);
+    expect(triggered.json()).toEqual({ tripped: true, reason: 'test emergency' });
+    const status = await app.inject({ method: 'GET', url: '/api/risk/kill-switch', headers: { host: '127.0.0.1:17840' } });
+    expect(status.json()).toEqual({ tripped: true, reason: 'test emergency' });
+  });
+
   it('reports live-only mode, migration state, and script-free credential handling', async () => {
     const { app } = await createTestApp();
     const health = await app.inject({ method: 'GET', url: '/health', headers: { host: '127.0.0.1:17840' } });
@@ -440,6 +455,21 @@ describe('local backend', () => {
 
     const snapshot = await app.inject({ method: 'GET', url: '/api/trading/snapshot', headers: { host: '127.0.0.1:17840' } });
     expect(snapshot.json()).toEqual({ mode: 'live', orders: [], positions: [], fills: [], balances: [] });
+  });
+
+  it('allows explicit reduce-only emergency orders while the global trading lock is active', async () => {
+    const { app, vault, gateway } = await createTestApp();
+    await vault.set(DEFAULT_CREDENTIAL_PROFILE, { apiKey: 'risk-key', apiSecret: 'risk-secret' });
+    const response = await app.inject({
+      method: 'POST', url: '/api/trading/orders',
+      headers: { host: '127.0.0.1:17840', 'x-gct-trading-intent': 'place-order' },
+      payload: {
+        symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'SELL', type: 'MARKET', timeInForce: 'IOC',
+        quantity: '0.01', reduceOnly: true, positionSide: 'LONG',
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(gateway.createdOrders[0]).toMatchObject({ symbol: 'BINANCE_FUTURE_BTC_USDT', reduce_only: 'true' });
   });
 
   it('refreshes only open positions when explicit read intent is present', async () => {

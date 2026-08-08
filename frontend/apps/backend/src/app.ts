@@ -70,6 +70,7 @@ import { TradingSession } from './trading-session.js';
 import { TradingRuntime, TradingRuntimeError } from './trading-runtime.js';
 import { CrossExPrivateStream } from './private-stream.js';
 import { LivePortfolioStore, type LivePortfolioSnapshot } from './live-portfolio.js';
+import { evaluateAccountRisk } from './account-risk-guard.js';
 import { readDatabaseStatus } from './database.js';
 import { runDatabaseMaintenance } from './database-maintenance.js';
 import {
@@ -490,6 +491,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     credentialVault.setPreferredProvider?.(DEFAULT_CREDENTIAL_PROFILE, recordedCredentialProvider);
   }
   let positionsRefreshInProgress = false;
+  let latestAdlRanks = new Map<string, number>();
+  let dailyPnlComplete = false;
 
   const fetchTransferCoins = async (): Promise<{ items: CrossExTransferCoinsResponse['items']; fetchedAt: string }> => {
     if (transferCoinCache && Date.now() - Date.parse(transferCoinCache.fetchedAt) < 10 * 60_000) return transferCoinCache;
@@ -596,6 +599,28 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     return definitions !== null && marketHub.ensureMarkets(definitions) && marketHub.market(symbol) !== null;
   };
 
+  const dailyRealizedPnlUsd = (): string => {
+    const start = new Date();
+    start.setUTCHours(0, 0, 0, 0);
+    const rows = database.prepare('SELECT realized_pnl FROM execution_fills WHERE created_at >= ?')
+      .all(start.toISOString()) as Array<{ realized_pnl: string }>;
+    return rows.reduce((sum, row) => sum.plus(new Decimal(row.realized_pnl || '0')), new Decimal(0)).toString();
+  };
+
+  const sendRiskAlert = async (reason: string): Promise<void> => {
+    addAuditEvent(database, 'global_kill_switch_triggered', { reason });
+    app.log.error({ reason }, 'global trading kill switch triggered');
+    if (!config.riskLimits.alertWebhookUrl) return;
+    const response = await fetch(config.riskLimits.alertWebhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({ event: 'gate_crossex_kill_switch', reason, occurredAt: new Date().toISOString() }),
+      redirect: 'error',
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) throw new Error(`risk alert webhook returned ${response.status}`);
+  };
+
   // Strategies may trade catalog-only tickers (e.g. stock perps) that nothing has watched yet, so
   // the engine's market source can register them on demand at launch.
   const strategyEngine = new StrategyEngine(database, tradingSession, tradingRuntime, {
@@ -604,6 +629,18 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     // Unit/injected hubs may deliberately supply static market objects without starting a socket.
     // Production passes startMarketStream=true, where stream health must gate every strategy.
     ...(options.startMarketStream ? { connectionState: () => marketHub.connectionState() } : {}),
+  }, {
+    ...(options.startMarketStream ? {
+      accountRiskCheck: () => evaluateAccountRisk({
+        portfolio: livePortfolio.snapshot(),
+        dailyRealizedPnlUsd: dailyRealizedPnlUsd(),
+        nowMs: Date.now(),
+        requirePrivateStream: true,
+        adlRanks: latestAdlRanks,
+        dailyPnlComplete,
+      }, config.riskLimits),
+      onKillSwitch: sendRiskAlert,
+    } : {}),
   });
 
   const quiesceForCredentialMutation = async (): Promise<void> => {
@@ -729,6 +766,16 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         const previous = readLatestPortfolioSnapshot(database);
         const portfolioCheckpoint = livePortfolio.checkpoint();
         const portfolio = await crossExGateway.queryPortfolio(credentials);
+        const utcDayStart = new Date();
+        utcDayStart.setUTCHours(0, 0, 0, 0);
+        dailyPnlComplete = portfolio.recentTrades.length < 100 || portfolio.recentTrades.some((trade) => {
+          const timestamp = Number(trade.create_time);
+          return Number.isFinite(timestamp) && timestamp <= utcDayStart.getTime();
+        });
+        latestAdlRanks = new Map((portfolio.adlRanks ?? []).flatMap((item) => {
+          const rank = Number(item.crossex_adl_rank);
+          return Number.isInteger(rank) ? [[item.symbol, rank] as const] : [];
+        }));
         const fetchedAt = new Date().toISOString();
         const snapshot = normalizePortfolio(portfolio, fetchedAt);
         const recoveredExecutionFillCount = tradingRuntime.reconcileExecutionFills(snapshot.recentFills);
@@ -855,7 +902,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       environment: 'live',
       database: databaseStatus.state,
       apiDocsRetrievedAt: API_DOCS_RETRIEVED_AT,
-      connectionState: databaseStatus.state === 'ok' ? marketHub.snapshot().connectionState === 'disconnected' ? 'healthy' : marketHub.snapshot().connectionState : 'degraded',
+      connectionState: databaseStatus.state === 'ok' ? marketHub.snapshot().connectionState : 'disconnected',
     };
   });
 
@@ -893,6 +940,20 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   });
 
   app.get('/api/trading-mode', async () => ({ mode: tradingSession.current }));
+  app.get('/api/risk/kill-switch', async () => strategyEngine.killSwitchStatus());
+  app.post('/api/risk/kill-switch', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-trading-intent'] !== 'trigger-kill-switch') {
+        return reply.code(403).send({ error: 'missing_trading_intent' });
+      }
+    },
+  }, async (request) => {
+    const parsed = z.object({ reason: z.string().trim().min(1).max(200).optional() }).safeParse(request.body ?? {});
+    const reason = parsed.success && parsed.data.reason ? parsed.data.reason : 'Manual emergency stop';
+    await strategyEngine.triggerKillSwitch(reason);
+    return strategyEngine.killSwitchStatus();
+  });
 
   app.post('/api/trading-mode', {
     config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
@@ -931,6 +992,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
           profile: DEFAULT_CREDENTIAL_PROFILE,
           accountMode: account.account_mode,
         });
+        await refreshPortfolio();
         await strategyEngine.prepareForLiveActivation();
       } catch (error) {
         if (error instanceof StrategyEngineError || error instanceof TradingRuntimeError) {
@@ -1019,6 +1081,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     const tradingGateway = crossExGateway as Partial<TradingCrossExGateway>;
     if (!tradingGateway.setLeverage) return reply.code(503).send({ error: 'leverage_unavailable' });
     try {
+      await strategyEngine.assertAccountRiskSafe();
       const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
       if (!credentials) return reply.code(409).send({ error: 'credential_not_configured' });
       const result = await tradingGateway.setLeverage(credentials, params.data.symbol, body.data.leverage);
@@ -1039,7 +1102,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     },
   }, async (request, reply) => {
     try {
-      return await tradingRuntime.createOrder(request.body);
+      const reduceOnly = typeof request.body === 'object' && request.body !== null
+        && 'reduceOnly' in request.body && request.body.reduceOnly === true;
+      if (!reduceOnly) await strategyEngine.assertAccountRiskSafe();
+      return await tradingRuntime.createOrder(request.body, reduceOnly ? { riskReducing: true } : undefined);
     } catch (error) {
       if (error instanceof z.ZodError) return reply.code(400).send({ error: 'invalid_order', issues: error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })) });
       if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({ error: error.code });

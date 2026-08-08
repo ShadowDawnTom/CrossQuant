@@ -5,6 +5,7 @@ import type { LiveMarket } from './market-hub.js';
 import type { TradingSession } from './trading-session.js';
 import { GateApiError } from './crossex-client.js';
 import { nativeMarketAsset } from './market-asset-aliases.js';
+import type { AccountRiskDecision } from './account-risk-guard.js';
 import {
   CreateStrategyInputSchema,
   UpdatePremiumTakeProfitInputSchema,
@@ -41,6 +42,10 @@ export interface StrategyEngineOptions {
   futureQuoteToleranceMs?: number;
   /** Cooldown between hedge-repair attempts. */
   repairCooldownMs?: number;
+  /** 账户级风险评估；不安全时会锁定实盘并撤销挂单。 */
+  accountRiskCheck?: () => AccountRiskDecision | Promise<AccountRiskDecision>;
+  /** 熔断后的外部告警回调；告警失败不能阻塞撤单。 */
+  onKillSwitch?: (reason: string) => void | Promise<void>;
   now?: () => number;
 }
 
@@ -239,6 +244,7 @@ export class StrategyEngine {
   private readonly instrumentConstraintsStatement;
   private readonly latestLegOrderStatement;
   private stopped = false;
+  private killSwitchReason: string | null = null;
 
   constructor(
     private readonly database: Database.Database,
@@ -255,6 +261,8 @@ export class StrategyEngine {
       marketPairMaxSkewMs: options.marketPairMaxSkewMs ?? 5_000,
       futureQuoteToleranceMs: options.futureQuoteToleranceMs ?? 2_000,
       repairCooldownMs: options.repairCooldownMs ?? 3_000,
+      accountRiskCheck: options.accountRiskCheck ?? (() => ({ safe: true })),
+      onKillSwitch: options.onKillSwitch ?? (() => undefined),
       now: options.now ?? Date.now,
     };
     this.strategyOrderRowsStatement = database.prepare(`SELECT strategy_leg AS leg, side, quantity, executed_quantity, strategy_clip, reduce_only
@@ -300,6 +308,10 @@ export class StrategyEngine {
   }
 
   async prepareForLiveActivation(): Promise<void> {
+    const risk = await this.accountRiskDecision();
+    if (!risk.safe) {
+      throw new StrategyEngineError('account_risk_check_failed', 409, `${risk.code}: ${risk.reason}`);
+    }
     const quiesced = await this.runtime.quiesceOpenOrders({ timeoutMs: this.options.orderTimeoutMs });
     if (quiesced.unresolved.length > 0) {
       throw new StrategyEngineError('strategy_recovery_unresolved', 409,
@@ -320,6 +332,7 @@ export class StrategyEngine {
         throw new StrategyEngineError('strategy_recovery_unresolved', 409, record.id);
       }
     }
+    this.killSwitchReason = null;
   }
 
   activatePersistedStrategies(): void {
@@ -384,6 +397,7 @@ export class StrategyEngine {
       if (input.leftSide === 'BUY' && takeProfit.lte(entry)) throw new StrategyEngineError('take_profit_must_be_above_entry', 400);
     }
     if (!this.session.liveTradingEnabled) throw new StrategyEngineError('live_trading_locked', 403);
+    await this.assertAccountRiskSafe();
     const running = this.runtime.listStrategies().filter((strategy) => strategy.status === 'RUNNING');
     if (running.length >= 10) throw new StrategyEngineError('too_many_running_strategies', 409);
     const legs = legsOf(input);
@@ -514,10 +528,59 @@ export class StrategyEngine {
   }
 
   private async tickOnce(): Promise<void> {
+    if (this.session.liveTradingEnabled || this.actors.size > 0) {
+      const risk = await this.accountRiskDecision();
+      if (!risk.safe) {
+        await this.triggerKillSwitch(`${risk.code}: ${risk.reason}`);
+        return;
+      }
+    }
     for (const actor of [...this.actors.values()]) {
       this.enqueue(actor, () => actor.suspended ? this.maintainQuiesce(actor) : this.evaluate(actor));
     }
     await Promise.all([...this.actors.values()].map((actor) => actor.queue.catch(() => undefined)));
+  }
+
+  private async accountRiskDecision(): Promise<AccountRiskDecision> {
+    try {
+      return await this.options.accountRiskCheck();
+    } catch (error) {
+      // 风控自身报错时不能默认放行，否则数据库或上游异常会绕过熔断。
+      return {
+        safe: false,
+        code: 'account_risk_check_error',
+        reason: error instanceof Error ? error.message.slice(0, 160) : 'Account risk check failed',
+      };
+    }
+  }
+
+  /**
+   * 全局熔断先锁住新下单，再将每个策略转为可恢复的 PAUSED 状态。
+   * 不盲目市价平掉已对冲仓位，避免风控本身制造新的单腿暴露。
+   */
+  async triggerKillSwitch(reason: string): Promise<void> {
+    if (this.killSwitchReason) return;
+    this.killSwitchReason = reason;
+    this.session.set('readonly');
+    for (const actor of this.actors.values()) {
+      actor.suspended = true;
+      actor.quiesceTarget = 'PAUSED';
+      actor.quiesceReason = `Global kill switch: ${reason}`;
+    }
+    for (const actor of this.actors.values()) this.enqueue(actor, () => this.maintainQuiesce(actor));
+    await Promise.all([...this.actors.values()].map((actor) => actor.queue.catch(() => undefined)));
+    await Promise.resolve(this.options.onKillSwitch(reason)).catch(() => undefined);
+  }
+
+  killSwitchStatus(): { tripped: boolean; reason: string | null } {
+    return { tripped: this.killSwitchReason !== null, reason: this.killSwitchReason };
+  }
+
+  async assertAccountRiskSafe(): Promise<void> {
+    const risk = await this.accountRiskDecision();
+    if (risk.safe) return;
+    await this.triggerKillSwitch(`${risk.code}: ${risk.reason}`);
+    throw new StrategyEngineError('account_risk_check_failed', 409, risk.code);
   }
 
   private attach(record: StrategyRecord, suspended = false): StrategyActor {

@@ -21,6 +21,7 @@ const FEE_ENDPOINT = '/crossex/fee';
 const TRANSFER_COINS_ENDPOINT = '/crossex/transfers/coin';
 const TRANSFERS_ENDPOINT = '/crossex/transfers';
 const ACCOUNT_BOOK_ENDPOINT = '/crossex/account_book';
+const ADL_RANK_ENDPOINT = '/crossex/adl_rank';
 const SPOT_ACCOUNTS_ENDPOINT = '/spot/accounts';
 const IsolatedExchangeTypeSchema = z.enum([
   'BINANCE', 'OKX', 'GATE', 'BYBIT', 'KRAKEN', 'HYPERLIQUID', 'DERIBIT',
@@ -109,6 +110,11 @@ const GatePositionSchema = z.object({
 });
 export type GateCrossExPosition = z.infer<typeof GatePositionSchema>;
 
+const GateAdlRankSchema = z.object({
+  user_id: z.string(), symbol: z.string(), crossex_adl_rank: z.string(), exchange_adl_rank: z.string(),
+});
+export type GateCrossExAdlRank = z.infer<typeof GateAdlRankSchema>;
+
 const GateMarginPositionSchema = z.object({
   position_id: z.string(), symbol: z.string(), position_side: z.string(), initial_margin: z.string(),
   maintenance_margin: z.string(), asset_qty: z.string(), asset_coin: z.string(), position_value: z.string(),
@@ -143,6 +149,7 @@ export interface GateCrossExPortfolio {
   marginPositions: GateCrossExMarginPosition[];
   openOrders: GateCrossExOrder[];
   recentTrades: GateCrossExTrade[];
+  adlRanks?: GateCrossExAdlRank[];
 }
 
 export interface ReadOnlyCrossExGateway {
@@ -382,7 +389,14 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
       this.signedRequest('GET', OPEN_ORDERS_ENDPOINT, '', '', credentials, z.array(GateOrderSchema), 'INVALID_OPEN_ORDERS_RESPONSE', false, 'low'),
       this.signedRequest('GET', HISTORY_TRADES_ENDPOINT, historyQuery, '', credentials, z.array(GateTradeSchema), 'INVALID_TRADES_RESPONSE', false, 'low'),
     ]);
-    return { account, positions, marginPositions, openOrders, recentTrades };
+    const activeSymbols = [...new Set(positions
+      .filter((position) => position.position_qty !== '0')
+      .map((position) => position.symbol))];
+    const adlRanks = (await Promise.all(activeSymbols.map((symbol) => this.signedRequest(
+      'GET', ADL_RANK_ENDPOINT, new URLSearchParams({ symbol }).toString(), '', credentials,
+      z.array(GateAdlRankSchema), 'INVALID_ADL_RANK_RESPONSE', false, 'low',
+    )))).flat();
+    return { account, positions, marginPositions, openOrders, recentTrades, adlRanks };
   }
 
   async createOrder(credentials: GateCredentials, order: CrossExOrderRequest): Promise<GateOrderActionResponse> {

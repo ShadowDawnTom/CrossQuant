@@ -17,6 +17,14 @@ export interface BackendConfig {
   gateRestBaseUrl: string;
   gatePublicWebSocketUrl: string;
   gatePrivateWebSocketUrl: string;
+  riskLimits: {
+    maxGrossExposureUsd: string;
+    minAvailableMarginRatio: string;
+    maxDailyLossUsd: string;
+    maxPortfolioAgeMs: number;
+    maxAdlRank: number | null;
+    alertWebhookUrl: string | null;
+  };
 }
 
 function parsePort(value: string, name: string): number {
@@ -25,6 +33,19 @@ function parsePort(value: string, name: string): number {
     throw new Error(`${name} must be an integer between 1 and 65535`);
   }
   return port;
+}
+
+function parseNonNegativeDecimal(value: string, name: string): string {
+  if (!/^\d+(?:\.\d+)?$/.test(value) || Number(value) < 0) {
+    throw new Error(`${name} must be a non-negative decimal`);
+  }
+  return value;
+}
+
+function parseNonNegativeInteger(value: string, name: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`${name} must be a non-negative integer`);
+  return parsed;
 }
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): BackendConfig {
@@ -59,5 +80,15 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     gateRestBaseUrl: environment.GCT_GATE_REST_URL ?? 'https://api.gateio.ws/api/v4',
     gatePublicWebSocketUrl: environment.GCT_GATE_PUBLIC_WS_URL ?? 'wss://api.gateio.ws/ws/crossex/public',
     gatePrivateWebSocketUrl: environment.GCT_GATE_PRIVATE_WS_URL ?? 'wss://api.gateio.ws/ws/crossex',
+    riskLimits: {
+      maxGrossExposureUsd: parseNonNegativeDecimal(environment.GCT_RISK_MAX_GROSS_EXPOSURE_USD ?? '10000', 'GCT_RISK_MAX_GROSS_EXPOSURE_USD'),
+      minAvailableMarginRatio: parseNonNegativeDecimal(environment.GCT_RISK_MIN_AVAILABLE_MARGIN_RATIO ?? '0.25', 'GCT_RISK_MIN_AVAILABLE_MARGIN_RATIO'),
+      maxDailyLossUsd: parseNonNegativeDecimal(environment.GCT_RISK_MAX_DAILY_LOSS_USD ?? '200', 'GCT_RISK_MAX_DAILY_LOSS_USD'),
+      maxPortfolioAgeMs: parseNonNegativeInteger(environment.GCT_RISK_MAX_PORTFOLIO_AGE_MS ?? '360000', 'GCT_RISK_MAX_PORTFOLIO_AGE_MS'),
+      maxAdlRank: environment.GCT_RISK_MAX_ADL_RANK === undefined
+        ? null
+        : parseNonNegativeInteger(environment.GCT_RISK_MAX_ADL_RANK, 'GCT_RISK_MAX_ADL_RANK'),
+      alertWebhookUrl: environment.GCT_RISK_ALERT_WEBHOOK_URL?.trim() || null,
+    },
   };
 }

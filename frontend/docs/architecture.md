@@ -49,6 +49,7 @@ See [integration boundaries](integration.md) for the external endpoint and chann
 - Ambiguous remote results remain unresolved until reconciliation proves terminal state.
 - Strategies act only on fresh validated quotes, track acknowledged fills, repair leg imbalance, and pause when recovery fails.
 - Locking trading, changing credentials, stopping a strategy, or shutting down quiesces locally tracked open orders.
+- Account-level exposure, margin, daily-loss, authenticated-state, and optional ADL limits trip one global kill switch that locks trading and pauses all strategies.
 
 ## Distribution
 

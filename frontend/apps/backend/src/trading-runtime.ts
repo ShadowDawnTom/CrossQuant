@@ -170,13 +170,13 @@ function isDefinitiveSubmitRejection(error: unknown): boolean {
 }
 
 export interface PlaceOrderMetadata {
-  strategyId: string;
-  strategyLeg: 'left' | 'right';
+  strategyId?: string;
+  strategyLeg?: 'left' | 'right';
   /** Groups the legs of one clip (and its repairs) so per-clip hedge ratios are recoverable. */
   strategyClip?: string;
   /**
-   * Internal-only escape hatch for a hedge/flatten order that reduces risk after the user has
-   * locked ordinary trading. HTTP callers never construct metadata, so they cannot use it.
+   * Escape hatch for a validated reduce-only or hedge order after ordinary trading is locked.
+   * The HTTP boundary may set this only after it has parsed a strict boolean reduceOnly=true.
    */
   riskReducing?: boolean;
 }

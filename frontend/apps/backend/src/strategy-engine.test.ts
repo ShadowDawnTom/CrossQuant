@@ -257,6 +257,34 @@ const takerTakerConfig = {
 } as const;
 
 describe('strategy engine', () => {
+  it('trips the global kill switch and pauses every active strategy', async () => {
+    let safe = true;
+    const { engine, runtime, gateway, markets } = await createHarness({
+      accountRiskCheck: () => safe
+        ? { safe: true }
+        : { safe: false, code: 'daily_loss_exceeded', reason: 'test loss limit' },
+    });
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100150', '100151');
+    markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+    const record = await engine.startStrategy(takerTakerConfig);
+    safe = false;
+    await engine.tick();
+    expect(runtime.getStrategy(record.id).status).toBe('PAUSED');
+    expect(gateway.createdOrders).toHaveLength(0);
+    expect(engine.killSwitchStatus()).toEqual({
+      tripped: true,
+      reason: 'daily_loss_exceeded: test loss limit',
+    });
+  });
+
+  it('fails closed when the account risk checker throws', async () => {
+    const { engine } = await createHarness({
+      accountRiskCheck: () => { throw new Error('risk data unavailable'); },
+    });
+    await expect(engine.startStrategy(takerTakerConfig)).rejects.toMatchObject({ code: 'account_risk_check_failed' });
+    expect(engine.killSwitchStatus()).toMatchObject({ tripped: true, reason: expect.stringContaining('account_risk_check_error') });
+  });
+
   it('routes the canonical SKHYNIX asset through Hyperliquid native SKHX', async () => {
     const { engine, gateway, markets } = await createHarness();
     markets.set('GATE_FUTURE_SKHYNIX_USDT', '1081', '1082');

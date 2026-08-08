@@ -109,7 +109,7 @@ describe('Gate APIv4 signing', () => {
     ]);
   });
 
-  it('uses only the five documented authenticated GETs for a portfolio snapshot', async () => {
+  it('adds the documented ADL rank read for every active portfolio symbol', async () => {
     const account = {
       available_margin: '100', margin_balance: '100', initial_margin: '0', maintenance_margin: '0',
       initial_margin_rate: '0', maintenance_margin_rate: '0', position_mode: 'SINGLE',
@@ -148,16 +148,20 @@ describe('Gate APIv4 signing', () => {
       if (value.endsWith('/crossex/margin_positions')) return new Response('[]');
       if (value.endsWith('/crossex/open_orders')) return new Response(JSON.stringify([order]));
       if (value.endsWith('/crossex/history_trades?page=1&limit=100')) return new Response(JSON.stringify([trade]));
+      if (value.endsWith('/crossex/adl_rank?symbol=BINANCE_FUTURE_BTC_USDT')) return new Response(JSON.stringify([{
+        user_id: 'u1', symbol: 'BINANCE_FUTURE_BTC_USDT', crossex_adl_rank: '2', exchange_adl_rank: '1',
+      }]));
       return new Response('{}', { status: 404 });
     });
     const client = new GateCrossExClient(fetchMock as typeof fetch, () => 1_700_000_000_000);
 
     const portfolio = await client.queryPortfolio({ apiKey: 'test-api-key', apiSecret: 'test-secret' });
 
-    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
     expect(portfolio.positions[0]?.position_id).toBe('p1');
     expect(portfolio.openOrders[0]?.client_order_id).toBe('c1');
     expect(portfolio.recentTrades[0]?.transaction_id).toBe('t1');
+    expect(portfolio.adlRanks?.[0]?.crossex_adl_rank).toBe('2');
   });
 
   it('validates nullable fields from the public CrossEx symbol catalog', async () => {

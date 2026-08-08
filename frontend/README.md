@@ -146,6 +146,8 @@ Report vulnerabilities through [GitHub private vulnerability reporting](SECURITY
 
 - [架构](docs/architecture.md)<br>
   [Architecture](docs/architecture.md)
+- [账户风控、全局熔断与 watchdog](docs/risk-controls.md)<br>
+  [Account risk controls, global kill switch, and watchdog](docs/risk-controls.md)
 - [发布流程](docs/RELEASING.md)<br>
   [Release process](docs/RELEASING.md)
 - [第三方声明](THIRD_PARTY_NOTICES.md)<br>
