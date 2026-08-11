@@ -6,6 +6,7 @@ const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
 export interface BackendConfig {
   host: string;
   port: number;
+  publicReadOnly: boolean;
   dataDir: string;
   databasePath: string;
   credentialEnvPath: string;
@@ -69,6 +70,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
   return {
     host,
     port,
+    publicReadOnly: environment.GCT_PUBLIC_READONLY === '1',
     dataDir,
     databasePath: join(dataDir, 'gate-crossex.sqlite'),
     credentialEnvPath: resolve(environment.GCT_CREDENTIAL_ENV_PATH ?? join(projectRoot, '.env')),

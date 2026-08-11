@@ -892,6 +892,23 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       request.log.warn({ origin, host: request.headers.host }, 'rejected unexpected browser origin');
       return reply.code(403).send({ error: 'unexpected_origin_rejected' });
     }
+
+    if (config.publicReadOnly) {
+      const pathname = request.url.split('?', 1)[0] ?? request.url;
+      const readOnlyPostPaths = new Set([
+        '/api/markets/funding-history',
+        '/api/markets/funding-rankings',
+        '/api/markets/funding-history/series',
+        '/api/trading-mode',
+      ]);
+      const safeMethod = request.method === 'GET' || request.method === 'HEAD' || request.method === 'OPTIONS';
+
+      // 公网研究实例必须在应用层再次兜底，不能只依赖可能被误改的 Nginx 规则。
+      if (pathname.startsWith('/secure/')
+        || (pathname.startsWith('/api/') && !safeMethod && !readOnlyPostPaths.has(pathname))) {
+        return reply.code(403).send({ error: 'public_readonly' });
+      }
+    }
   });
 
   app.get('/health', async (): Promise<HealthResponse> => {
@@ -963,6 +980,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   }, async (request, reply) => {
     const parsed = z.object({ mode: z.enum(['readonly', 'live']), acceptDisclaimer: z.boolean().default(false) }).safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_trading_mode' });
+    if (config.publicReadOnly && parsed.data.mode === 'live') {
+      return reply.code(403).send({ error: 'public_readonly' });
+    }
     // Leaving the boot-time 'unset' state in any direction, or arming live trading from any
     // state, requires a fresh human acknowledgement of the risk disclaimer. The one transition
     // that must never be gated is live → readonly: locking is the safety action.

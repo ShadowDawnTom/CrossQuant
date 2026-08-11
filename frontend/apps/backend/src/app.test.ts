@@ -337,11 +337,12 @@ interface TestContext {
 
 const resources: TestContext[] = [];
 
-async function createTestApp(options: { liveTradingEnabled?: boolean; marketHub?: CrossExMarketHub; startMarketStream?: boolean; directory?: string } = {}): Promise<TestContext> {
+async function createTestApp(options: { liveTradingEnabled?: boolean; publicReadOnly?: boolean; marketHub?: CrossExMarketHub; startMarketStream?: boolean; directory?: string } = {}): Promise<TestContext> {
   const directory = options.directory ?? mkdtempSync(join(tmpdir(), 'gate-crossex-app-'));
   const config = loadConfig({
     GCT_DATA_DIR: directory,
     GCT_MIGRATIONS_DIR: resolve(process.cwd(), '../../migrations'),
+    GCT_PUBLIC_READONLY: options.publicReadOnly ? '1' : '0',
   });
   const database = openDatabase(config.databasePath, config.migrationsDir);
   const vault = new MemoryCredentialVault();
@@ -405,6 +406,37 @@ afterEach(async () => {
 });
 
 describe('local backend', () => {
+  it('enforces the public read-only boundary inside the backend', async () => {
+    const { app, vault } = await createTestApp({ publicReadOnly: true });
+    await vault.set(DEFAULT_CREDENTIAL_PROFILE, { apiKey: 'should-not-arm', apiSecret: 'should-not-arm' });
+    const host = { host: '127.0.0.1:17840' };
+    const intent = { ...host, 'x-gct-trading-intent': 'set-trading-mode' };
+
+    const credentials = await app.inject({ method: 'GET', url: '/secure/credentials', headers: host });
+    expect(credentials.statusCode).toBe(403);
+    expect(credentials.json()).toEqual({ error: 'public_readonly' });
+
+    const preferenceWrite = await app.inject({
+      method: 'PUT', url: '/api/preferences', headers: host, payload: { language: 'zh' },
+    });
+    expect(preferenceWrite.statusCode).toBe(403);
+    expect(preferenceWrite.json()).toEqual({ error: 'public_readonly' });
+
+    const readonly = await app.inject({
+      method: 'POST', url: '/api/trading-mode', headers: intent,
+      payload: { mode: 'readonly', acceptDisclaimer: true },
+    });
+    expect(readonly.statusCode).toBe(200);
+    expect(readonly.json()).toEqual({ mode: 'readonly' });
+
+    const live = await app.inject({
+      method: 'POST', url: '/api/trading-mode', headers: intent,
+      payload: { mode: 'live', acceptDisclaimer: true },
+    });
+    expect(live.statusCode).toBe(403);
+    expect(live.json()).toEqual({ error: 'public_readonly' });
+  });
+
   it('requires explicit intent and exposes the idempotent global kill switch', async () => {
     const { app } = await createTestApp();
     const denied = await app.inject({ method: 'POST', url: '/api/risk/kill-switch', headers: { host: '127.0.0.1:17840' } });
