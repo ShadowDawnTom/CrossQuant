@@ -2,7 +2,7 @@
 
 这是一个安全优先的 Gate CrossEx MVP：读取多个底层交易所的永续合约资金费率、Ticker 和账户实际费率，生成资金费率快照情景候选。它不会把当前费率外推冒充为预期 APR。
 
-当前版本只负责监控、计算和生成交易计划，**不会发送真实订单**。原因是 CrossEx 的 Ticker 接口不提供买一卖一或深度，仅凭最新价无法安全估计滑点，也无法保证双腿同时成交。
+当前版本只负责监控、计算和生成交易计划，**不会发送真实订单**。扫描器可以从底层交易所官方公共接口读取订单簿并验证目标金额 VWAP，但仍无法保证双腿同时成交，也还没有部分成交修复和重启对账。
 
 ## 已实现
 
@@ -13,6 +13,9 @@
 - 扣除双腿开平仓手续费和每次成交的滑点预算
 - 价格缺失、时间戳无效、行情陈旧或跨所时差过大时直接拒绝候选
 - JSON 输出包含拒绝原因；可将原始市场快照追加到 UTF-8 JSONL
+- 可选并发读取 Gate、Binance、OKX、Bybit 官方永续深度，统一成基础币数量后验证多档 VWAP
+- 按目标金额、共同下单步长和最小名义价值验证容量；暂不支持的交易所明确拒绝
+- 盘口缺失、陈旧、跨所时间差过大、买卖盘交叉或深度不足时直接拒绝
 - API Key 缺失时明确报错，`.env` 不会被 Git 跟踪
 - 标准库单元测试，无第三方运行依赖
 
@@ -42,6 +45,9 @@ crossex-arb scan --assets BTC,ETH,SOL --json
 
 # 持续采集时可指定快照日志（data/ 默认不进 Git）
 crossex-arb scan --assets BTC,ETH,SOL --snapshot-log data/market-snapshots.jsonl
+
+# 按每条腿 100 USDT 验证实时盘口 VWAP；仍然只读，不会下单
+crossex-arb scan --assets BTC,ETH --with-order-book --target-notional 100
 ```
 
 也可以不安装，直接运行：
@@ -76,16 +82,20 @@ python -m crossex_arb scan --assets BTC,ETH
 | `ARB_MAX_TICKER_SKEW_MS` | `2000` | 两所 Ticker 最大时间差（毫秒） |
 | `ARB_SLIPPAGE_BPS_PER_FILL` | `2` | 每次成交预留滑点，单位 bp |
 | `ARB_DEFAULT_TAKER_FEE` | `0.0005` | 费率接口缺失时使用的保守兜底值 |
+| `ARB_TARGET_NOTIONAL` | `100` | 每条腿用于盘口容量验证的目标名义价值 |
+| `ARB_MAX_ORDER_BOOK_AGE_MS` | `3000` | 单边盘口最大允许年龄（毫秒） |
+| `ARB_MAX_ORDER_BOOK_SKEW_MS` | `1000` | 两所盘口最大时间差（毫秒） |
+| `ARB_ORDER_BOOK_TIMEOUT_SECONDS` | `8` | 等待所有盘口完整快照的超时 |
 
 ## 上实盘前必须补齐
 
-1. 接入各底层交易所可成交盘口/深度，而不是使用 Ticker 最新价。
-2. 用小额沙盒或人工盯盘完成双腿成交、部分成交、拒单和补偿平仓测试。
+1. 将当前 REST 深度快照升级为长期维护的增量本地订单簿，并监控序列缺口和重连恢复。
+2. 用影子撮合和小额人工盯盘完成双腿成交、部分成交、拒单和补偿平仓测试。
 3. 增加最大名义价值、最大单币敞口、保证金率、ADL、熔断和紧急平仓规则。
 4. 持久化订单状态并处理进程重启，确保不会重复下单。
 5. 对照账户的单向/双向持仓模式验证 `position_side` 与 `reduce_only`。
 
-`--snapshot-log` 只解决从现在开始保存资金费率、Ticker 和手续费快照的问题。它不包含历史实际结算、订单簿、成交回报或基差路径，所以当前仍不能计算可信的实盘 PnL、Sharpe、MDD 和尾部风险。
+使用 `--with-order-book --snapshot-log` 时，快照会升级为 schema v2 并包含订单簿；旧 schema v1 仍可读取。它仍不包含历史实际结算和成交回报，所以当前不能据此计算可信的实盘 PnL、Sharpe、MDD 和尾部风险。
 
 项目即使把 `ENABLE_LIVE_TRADING` 改为 `true` 也不会下单；该变量是为后续执行器预留的第二道开关。
 

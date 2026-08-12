@@ -7,7 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from crossex_arb.models import FeeRate, FundingInfo, Ticker
+from crossex_arb.models import FeeRate, FundingInfo, OrderBook, Ticker
 
 
 def _json_default(value: object) -> str:
@@ -22,17 +22,20 @@ def append_market_snapshot(
     tickers: list[Ticker],
     fees: dict[str, FeeRate],
     *,
+    order_books: list[OrderBook] | None = None,
     collected_at_ms: int | None = None,
 ) -> None:
     """以 UTF-8 JSONL 追加一次原始市场快照，便于后续重放和校验字段变化。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2 if order_books is not None else 1,
         "collected_at_ms": int(time.time() * 1000) if collected_at_ms is None else collected_at_ms,
         "funding": [asdict(item) for item in funding],
         "tickers": [asdict(item) for item in tickers],
         "fees": {exchange: asdict(item) for exchange, item in fees.items()},
     }
+    if order_books is not None:
+        payload["order_books"] = [asdict(item) for item in order_books]
     # newline 显式固定为 LF，避免重放文件在不同平台产生无意义差异。
     with path.open("a", encoding="utf-8", newline="\n") as stream:
         stream.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=_json_default))
@@ -50,7 +53,7 @@ def load_market_snapshots(path: Path) -> list[dict[str, Any]]:
                 value = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{path}:{line_number} 不是有效 JSON") from exc
-            if not isinstance(value, dict) or value.get("schema_version") != 1:
+            if not isinstance(value, dict) or value.get("schema_version") not in {1, 2}:
                 raise ValueError(f"{path}:{line_number} 快照版本不支持")
             rows.append(value)
     return rows

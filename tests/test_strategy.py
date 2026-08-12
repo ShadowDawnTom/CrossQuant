@@ -1,8 +1,8 @@
 import unittest
 from decimal import Decimal
 
-from crossex_arb.models import FeeRate, FundingInfo, SymbolRule, Ticker
-from crossex_arb.strategy import find_opportunities
+from crossex_arb.models import FeeRate, FundingInfo, OrderBook, SymbolRule, Ticker
+from crossex_arb.strategy import find_opportunities, quote_order_book
 
 
 NOW_MS = 1_700_000_000_000
@@ -39,6 +39,22 @@ class StrategyTests(unittest.TestCase):
         return [
             Ticker(self.binance, Decimal("100"), Decimal("100"), first_ms),
             Ticker(self.gate, Decimal("100"), Decimal("100.01"), second_ms),
+        ]
+
+    def valid_books(self, first_ms: int = NOW_MS - 200, second_ms: int = NOW_MS - 300) -> list[OrderBook]:
+        return [
+            OrderBook(
+                self.binance,
+                ((Decimal("99.9"), Decimal("0.6")), (Decimal("99.8"), Decimal("1"))),
+                ((Decimal("100.1"), Decimal("0.5")), (Decimal("100.2"), Decimal("1"))),
+                first_ms,
+            ),
+            OrderBook(
+                self.gate,
+                ((Decimal("100.0"), Decimal("0.4")), (Decimal("99.9"), Decimal("1"))),
+                ((Decimal("100.2"), Decimal("0.7")), (Decimal("100.3"), Decimal("1"))),
+                second_ms,
+            ),
         ]
 
     def test_simulates_each_settlement_event_and_deducts_four_fills(self) -> None:
@@ -143,6 +159,55 @@ class StrategyTests(unittest.TestCase):
         tickers = self.valid_tickers() + [Ticker(self.binance, None, Decimal("100"), NOW_MS - 50)]
         duplicate = scan(normal_funding, tickers)
         self.assertEqual(duplicate.rejections[0].reason, "DUPLICATE_TICKER")
+
+    def test_order_book_vwap_walks_multiple_levels(self) -> None:
+        quote = quote_order_book(self.valid_books()[0], "BUY", Decimal("0.75"))
+        self.assertEqual(quote.quote_amount, Decimal("75.100"))
+        self.assertEqual(quote.average_price, Decimal("100.1333333333333333333333333"))
+        self.assertEqual(quote.levels_used, 2)
+
+    def test_executable_candidate_uses_entry_and_exit_vwap(self) -> None:
+        funding = [
+            FundingInfo(self.binance, Decimal("0"), NOW_MS + 28_800_000, 28_800),
+            FundingInfo(self.gate, Decimal("0.001"), NOW_MS + 28_800_000, 28_800),
+        ]
+        fees = {
+            "BINANCE": FeeRate("BINANCE", Decimal("0.0002"), {}),
+            "GATE": FeeRate("GATE", Decimal("0.0003"), {}),
+        }
+        result = find_opportunities(
+            funding, self.valid_tickers(), fees, [rule(item.symbol) for item in funding],
+            Decimal("24"), Decimal("0"), Decimal("0"), Decimal("0.003"),
+            order_books=self.valid_books(), target_notional=Decimal("100"), now_ms=NOW_MS,
+        )
+        row = result.opportunities[0]
+        self.assertEqual(row.execution_status, "EXECUTABLE_BOOK_VERIFIED")
+        self.assertEqual(row.executable_quantity, Decimal("0.999"))
+        self.assertIsNotNone(row.executable_net_snapshot_return)
+        self.assertTrue(result.to_dict()["executable"])
+
+    def test_missing_stale_and_shallow_books_fail_closed(self) -> None:
+        funding = [
+            FundingInfo(self.binance, Decimal("0"), NOW_MS + 1_000, 3_600),
+            FundingInfo(self.gate, Decimal("0.001"), NOW_MS + 1_000, 3_600),
+        ]
+        kwargs = dict(
+            funding=funding, tickers=self.valid_tickers(), fees={}, rules=[rule(item.symbol) for item in funding],
+            scenario_horizon_hours=Decimal("24"), slippage_bps_per_fill=Decimal("0"),
+            default_taker_fee=Decimal("0"), max_mark_divergence=Decimal("0.003"),
+            target_notional=Decimal("100"), now_ms=NOW_MS,
+        )
+        missing = find_opportunities(order_books=self.valid_books()[:1], **kwargs)
+        self.assertEqual(missing.rejections[-1].reason, "INVALID_ORDER_BOOK")
+        stale = find_opportunities(order_books=self.valid_books(NOW_MS - 3_001, NOW_MS - 100), **kwargs)
+        self.assertEqual(stale.rejections[-1].reason, "STALE_ORDER_BOOK")
+        books = self.valid_books()
+        shallow = [
+            OrderBook(books[0].symbol, ((Decimal("99.9"), Decimal("0.01")),), ((Decimal("100.1"), Decimal("0.01")),), books[0].timestamp_ms),
+            books[1],
+        ]
+        no_depth = find_opportunities(order_books=shallow, **kwargs)
+        self.assertEqual(no_depth.rejections[-1].reason, "INSUFFICIENT_EXECUTABLE_DEPTH")
 
 
 if __name__ == "__main__":

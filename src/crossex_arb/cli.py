@@ -9,6 +9,7 @@ from pathlib import Path
 from crossex_arb.client import GateAPIError, GateCrossExClient
 from crossex_arb.config import Settings
 from crossex_arb.history import append_market_snapshot
+from crossex_arb.market_depth import collect_order_books
 from crossex_arb.models import ScanResult
 from crossex_arb.strategy import find_opportunities, split_symbol
 
@@ -24,6 +25,8 @@ def _parser() -> argparse.ArgumentParser:
     scan.add_argument("--assets", default="BTC,ETH,SOL", help="逗号分隔的基础币")
     scan.add_argument("--quote", default="USDT", help="计价币，默认 USDT")
     scan.add_argument("--json", action="store_true", help="输出 JSON")
+    scan.add_argument("--with-order-book", action="store_true", help="读取底层交易所官方深度并验证目标金额可执行收益")
+    scan.add_argument("--target-notional", type=Decimal, help="每条腿的目标名义金额，默认读取 ARB_TARGET_NOTIONAL")
     scan.add_argument("--snapshot-log", type=Path, help="将原始费率、Ticker 和手续费追加为 UTF-8 JSONL")
     return parser
 
@@ -48,6 +51,8 @@ def _scan(
     quote: str,
     as_json: bool,
     snapshot_log: Path | None,
+    with_order_book: bool,
+    target_notional: Decimal | None,
 ) -> int:
     assets = {item.strip().upper() for item in assets_text.split(",") if item.strip()}
     rules = [item for item in client.list_symbols() if item.business == "FUTURE"]
@@ -58,8 +63,15 @@ def _scan(
     funding = client.funding_info(wanted)
     tickers = client.tickers(wanted)
     fees = client.fees()
+    books = None
+    book_errors: dict[str, str] = {}
+    requested_notional = target_notional or Decimal(str(settings.target_notional))
+    if with_order_book:
+        books, book_errors = collect_order_books(
+            [item.symbol for item in funding], settings.order_book_timeout_seconds
+        )
     if snapshot_log is not None:
-        append_market_snapshot(snapshot_log, funding, tickers, fees)
+        append_market_snapshot(snapshot_log, funding, tickers, fees, order_books=books)
     result = find_opportunities(
         funding=funding, tickers=tickers, fees=fees, rules=rules,
         scenario_horizon_hours=Decimal(str(settings.scenario_horizon_hours)),
@@ -67,12 +79,35 @@ def _scan(
         default_taker_fee=Decimal(str(settings.default_taker_fee)),
         max_mark_divergence=Decimal(str(settings.max_mark_price_divergence)),
         assets=assets, quote=quote.upper(),
+        order_books=books,
+        target_notional=requested_notional if with_order_book else None,
+        max_order_book_age_ms=settings.max_order_book_age_ms,
+        max_order_book_skew_ms=settings.max_order_book_skew_ms,
         max_ticker_age_ms=settings.max_ticker_age_ms,
         max_ticker_skew_ms=settings.max_ticker_skew_ms,
     )
+    if book_errors:
+        from crossex_arb.models import CandidateRejection
+
+        result.rejections.extend(
+            CandidateRejection(split_symbol(symbol)[2], split_symbol(symbol)[3], (symbol,), "ORDER_BOOK_SOURCE_ERROR", detail)
+            for symbol, detail in sorted(book_errors.items())
+        )
     threshold = Decimal(str(settings.min_snapshot_annualized))
     result = ScanResult(
-        [item for item in result.opportunities if item.snapshot_annualized >= threshold],
+        [
+            item for item in result.opportunities
+            if (
+                item.executable_snapshot_annualized
+                if with_order_book
+                else item.snapshot_annualized
+            ) is not None
+            and (
+                item.executable_snapshot_annualized
+                if with_order_book
+                else item.snapshot_annualized
+            ) >= threshold
+        ],
         result.rejections,
     )
     if as_json:
@@ -84,7 +119,10 @@ def _scan(
         print("当前没有达到阈值的快照情景候选。")
         return 0
     print("说明：下列是“当前费率在情景期保持不变”的快照外推，不是预期 APR。")
-    print("未使用 ask/bid、盘口深度和双腿成交模型，所有结果均不代表可执行收益。")
+    if with_order_book:
+        print("已按实时双边盘口和目标金额验证 VWAP；平仓价格仍是假设立即按当前反向盘口成交。")
+    else:
+        print("未使用 ask/bid、盘口深度和双腿成交模型，所有结果均不代表可执行收益。")
     for item in result.opportunities:
         aligned = "是" if item.funding_times_aligned else "否"
         print(
@@ -95,6 +133,13 @@ def _scan(
             f"  成本预算={item.trading_cost_budget:.4%}  标记价偏离={item.mark_divergence:.3%}  "
             f"行情时差={item.ticker_time_skew_ms}ms  首次结算对齐={aligned}"
         )
+        if item.execution_status == "EXECUTABLE_BOOK_VERIFIED":
+            print(
+                f"  可执行数量={item.executable_quantity}  LONG入场VWAP={item.long_entry_vwap}  "
+                f"SHORT入场VWAP={item.short_entry_vwap}\n"
+                f"  盘口净情景收益={item.executable_net_snapshot_return:.4%}  "
+                f"盘口净情景年化={item.executable_snapshot_annualized:.2%}  盘口时差={item.book_time_skew_ms}ms"
+            )
     return 0
 
 
@@ -111,7 +156,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "scan":
             if not settings.api_key or not settings.api_secret:
                 raise GateAPIError(None, "MISSING_CREDENTIALS", "请在 .env 填写 GATE_API_KEY 和 GATE_API_SECRET")
-            return _scan(client, settings, args.assets, args.quote, args.json, args.snapshot_log)
+            return _scan(
+                client, settings, args.assets, args.quote, args.json, args.snapshot_log,
+                args.with_order_book, args.target_notional,
+            )
     except (GateAPIError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2

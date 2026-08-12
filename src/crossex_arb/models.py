@@ -32,6 +32,25 @@ class Ticker:
 
 
 @dataclass(frozen=True)
+class OrderBook:
+    symbol: str
+    bids: tuple[tuple[Decimal, Decimal], ...]
+    asks: tuple[tuple[Decimal, Decimal], ...]
+    timestamp_ms: int
+    source: str = "gate_crossex_websocket"
+
+
+@dataclass(frozen=True)
+class ExecutionQuote:
+    side: str
+    quantity: Decimal
+    average_price: Decimal
+    quote_amount: Decimal
+    worst_price: Decimal
+    levels_used: int
+
+
+@dataclass(frozen=True)
 class FeeRate:
     exchange: str
     future_taker: Decimal
@@ -78,6 +97,21 @@ class Opportunity:
     short_ticker_age_ms: int
     funding_times_aligned: bool
     execution_status: str = "UNVERIFIED_NO_ORDER_BOOK"
+    target_notional: Decimal | None = None
+    executable_quantity: Decimal | None = None
+    long_entry_vwap: Decimal | None = None
+    short_entry_vwap: Decimal | None = None
+    long_exit_vwap_estimate: Decimal | None = None
+    short_exit_vwap_estimate: Decimal | None = None
+    entry_basis_return: Decimal | None = None
+    exit_basis_return_estimate: Decimal | None = None
+    executable_funding_return: Decimal | None = None
+    executable_fee_return: Decimal | None = None
+    executable_net_snapshot_return: Decimal | None = None
+    executable_snapshot_annualized: Decimal | None = None
+    long_book_age_ms: int | None = None
+    short_book_age_ms: int | None = None
+    book_time_skew_ms: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         data = asdict(self)
@@ -93,9 +127,12 @@ class ScanResult:
     rejections: list[CandidateRejection]
 
     def to_dict(self) -> dict[str, object]:
+        executable = bool(self.opportunities) and all(
+            item.execution_status == "EXECUTABLE_BOOK_VERIFIED" for item in self.opportunities
+        )
         return {
             "model": "current_funding_snapshot_cashflow_scenario",
-            "executable": False,
+            "executable": executable,
             "opportunities": [item.to_dict() for item in self.opportunities],
             "rejections": [item.to_dict() for item in self.rejections],
         }
