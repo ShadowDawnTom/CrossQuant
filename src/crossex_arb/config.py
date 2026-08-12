@@ -43,6 +43,11 @@ class Settings:
     max_order_book_age_ms: int = 3_000
     max_order_book_skew_ms: int = 1_000
     order_book_timeout_seconds: float = 8.0
+    preflight_max_notional: float = 100.0
+    preflight_min_initial_margin_rate: float = 1.5
+    preflight_min_maintenance_margin_rate: float = 1.5
+    preflight_limit_slippage_bps: float = 5.0
+    preflight_max_account_age_ms: int = 10_000
     timeout_seconds: float = 10.0
 
     @classmethod
@@ -64,6 +69,11 @@ class Settings:
             max_order_book_age_ms=int(os.getenv("ARB_MAX_ORDER_BOOK_AGE_MS", "3000")),
             max_order_book_skew_ms=int(os.getenv("ARB_MAX_ORDER_BOOK_SKEW_MS", "1000")),
             order_book_timeout_seconds=float(os.getenv("ARB_ORDER_BOOK_TIMEOUT_SECONDS", "8")),
+            preflight_max_notional=float(os.getenv("ARB_PREFLIGHT_MAX_NOTIONAL", "100")),
+            preflight_min_initial_margin_rate=float(os.getenv("ARB_PREFLIGHT_MIN_INITIAL_MARGIN_RATE", "1.5")),
+            preflight_min_maintenance_margin_rate=float(os.getenv("ARB_PREFLIGHT_MIN_MAINTENANCE_MARGIN_RATE", "1.5")),
+            preflight_limit_slippage_bps=float(os.getenv("ARB_PREFLIGHT_LIMIT_SLIPPAGE_BPS", "5")),
+            preflight_max_account_age_ms=int(os.getenv("ARB_PREFLIGHT_MAX_ACCOUNT_AGE_MS", "10000")),
         )
         if settings.scenario_horizon_hours <= 0:
             raise ValueError("ARB_SCENARIO_HORIZON_HOURS 必须大于 0")
@@ -77,4 +87,10 @@ class Settings:
             raise ValueError("盘口时间阈值不能为负数")
         if settings.order_book_timeout_seconds <= 0:
             raise ValueError("ARB_ORDER_BOOK_TIMEOUT_SECONDS 必须大于 0")
+        if settings.preflight_max_notional <= 0:
+            raise ValueError("ARB_PREFLIGHT_MAX_NOTIONAL 必须大于 0")
+        if settings.preflight_min_initial_margin_rate <= 0 or settings.preflight_min_maintenance_margin_rate <= 0:
+            raise ValueError("预检保证金率阈值必须大于 0")
+        if settings.preflight_limit_slippage_bps < 0 or settings.preflight_max_account_age_ms < 0:
+            raise ValueError("预检滑点和账户年龄阈值不能为负数")
         return settings

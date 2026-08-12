@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import unittest
+from decimal import Decimal
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
@@ -61,6 +62,41 @@ class SignatureTests(unittest.TestCase):
             with self.assertRaises(GateAPIError) as caught:
                 GateCrossExClient("https://example.invalid").list_symbols()
         self.assertEqual(caught.exception.label, "NETWORK_ERROR")
+
+    def test_account_positions_orders_and_risk_limits_are_strictly_parsed(self) -> None:
+        class StubClient(GateCrossExClient):
+            def _request(self, method, endpoint, *args, **kwargs):
+                if endpoint == "/crossex/accounts":
+                    return {
+                        "available_margin": "100", "margin_balance": "120", "initial_margin_rate": "2",
+                        "maintenance_margin_rate": "3", "position_mode": "SINGLE",
+                        "account_mode": "CROSS_EXCHANGE", "exchange_type": "CROSSEX", "update_time": "1700000000000",
+                    }
+                if endpoint == "/crossex/positions":
+                    return [{"symbol": "GATE_FUTURE_BTC_USDT", "position_side": "NONE", "position_qty": "0.1", "position_value": "10"}]
+                if endpoint == "/crossex/open_orders":
+                    return [{"order_id": "1", "symbol": "GATE_FUTURE_BTC_USDT", "state": "OPEN", "side": "BUY", "qty": "0.1"}]
+                if endpoint == "/crossex/rule/risk_limits":
+                    return [{"symbol": "GATE_FUTURE_BTC_USDT", "tiers": [{
+                        "min_risk_limit_value": "0", "max_risk_limit_value": "1000",
+                        "leverage_max": "20", "maintenance_rate": "0.005",
+                    }]}]
+                raise AssertionError(endpoint)
+
+        client = StubClient("https://example.invalid")
+        self.assertEqual(client.account_state().available_margin, Decimal("100"))
+        self.assertEqual(client.positions()[0].quantity, Decimal("0.1"))
+        self.assertEqual(client.open_orders()[0].state, "OPEN")
+        self.assertEqual(client.risk_limits(["GATE_FUTURE_BTC_USDT"])[0].tiers[0].max_leverage, Decimal("20"))
+
+    def test_invalid_account_field_fails_closed(self) -> None:
+        class StubClient(GateCrossExClient):
+            def _request(self, *args, **kwargs):
+                return {"available_margin": "bad"}
+
+        with self.assertRaises(GateAPIError) as caught:
+            StubClient("https://example.invalid").account_state()
+        self.assertEqual(caught.exception.label, "INVALID_RESPONSE")
 
 
 if __name__ == "__main__":

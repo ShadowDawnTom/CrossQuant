@@ -13,6 +13,9 @@ class SymbolRule:
     min_size: Decimal | None
     min_notional: Decimal | None
     lot_size: Decimal | None
+    tick_size: Decimal | None = None
+    max_market_size: Decimal | None = None
+    max_limit_size: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,49 @@ class ExecutionQuote:
     quote_amount: Decimal
     worst_price: Decimal
     levels_used: int
+
+
+@dataclass(frozen=True)
+class AccountState:
+    available_margin: Decimal
+    margin_balance: Decimal
+    initial_margin_rate: Decimal
+    maintenance_margin_rate: Decimal
+    position_mode: str
+    account_mode: str
+    exchange_type: str
+    update_time_ms: int
+
+
+@dataclass(frozen=True)
+class PositionState:
+    symbol: str
+    position_side: str
+    quantity: Decimal
+    value: Decimal
+
+
+@dataclass(frozen=True)
+class OpenOrderState:
+    order_id: str
+    symbol: str
+    state: str
+    side: str
+    quantity: Decimal
+
+
+@dataclass(frozen=True)
+class RiskTier:
+    min_value: Decimal
+    max_value: Decimal
+    max_leverage: Decimal
+    maintenance_rate: Decimal
+
+
+@dataclass(frozen=True)
+class RiskLimit:
+    symbol: str
+    tiers: tuple[RiskTier, ...]
 
 
 @dataclass(frozen=True)

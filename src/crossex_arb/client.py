@@ -10,7 +10,17 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from crossex_arb.models import FeeRate, FundingInfo, SymbolRule, Ticker
+from crossex_arb.models import (
+    AccountState,
+    FeeRate,
+    FundingInfo,
+    OpenOrderState,
+    PositionState,
+    RiskLimit,
+    RiskTier,
+    SymbolRule,
+    Ticker,
+)
 
 
 class GateAPIError(RuntimeError):
@@ -113,6 +123,8 @@ class GateCrossExClient:
                     symbol=str(row["symbol"]), exchange=str(row["exchange_type"]), business=str(row["business_type"]),
                     state=str(row["state"]), min_size=_decimal(row.get("min_size")),
                     min_notional=_decimal(row.get("min_notional")), lot_size=_decimal(row.get("lot_size")),
+                    tick_size=_decimal(row.get("tick_size")), max_market_size=_decimal(row.get("max_market_size")),
+                    max_limit_size=_decimal(row.get("max_limit_size")),
                 )
                 for row in rows
             ]
@@ -157,3 +169,71 @@ class GateCrossExClient:
 
     def account(self) -> Any:
         return self._request("GET", "/crossex/accounts")
+
+    def account_state(self) -> AccountState:
+        row = self.account()
+        if not isinstance(row, dict):
+            raise GateAPIError(None, "INVALID_RESPONSE", "accounts 应返回对象")
+        try:
+            return AccountState(
+                available_margin=Decimal(str(row["available_margin"])),
+                margin_balance=Decimal(str(row["margin_balance"])),
+                initial_margin_rate=Decimal(str(row["initial_margin_rate"])),
+                maintenance_margin_rate=Decimal(str(row["maintenance_margin_rate"])),
+                position_mode=str(row["position_mode"]), account_mode=str(row["account_mode"]),
+                exchange_type=str(row["exchange_type"]), update_time_ms=int(row["update_time"]),
+            )
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise GateAPIError(None, "INVALID_RESPONSE", f"accounts 字段异常: {exc}") from exc
+
+    def positions(self) -> list[PositionState]:
+        rows = _response_rows(self._request("GET", "/crossex/positions"), "positions")
+        try:
+            return [
+                PositionState(
+                    str(row["symbol"]), str(row["position_side"]),
+                    Decimal(str(row["position_qty"])), Decimal(str(row["position_value"])),
+                )
+                for row in rows
+            ]
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise GateAPIError(None, "INVALID_RESPONSE", f"positions 字段异常: {exc}") from exc
+
+    def open_orders(self) -> list[OpenOrderState]:
+        rows = _response_rows(self._request("GET", "/crossex/open_orders"), "open_orders")
+        try:
+            return [
+                OpenOrderState(
+                    str(row["order_id"]), str(row["symbol"]), str(row["state"]), str(row["side"]),
+                    Decimal(str(row["qty"])),
+                )
+                for row in rows
+            ]
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise GateAPIError(None, "INVALID_RESPONSE", f"open_orders 字段异常: {exc}") from exc
+
+    def risk_limits(self, symbols: list[str]) -> list[RiskLimit]:
+        params = [("symbols", ",".join(symbols))]
+        rows = _response_rows(
+            self._request("GET", "/crossex/rule/risk_limits", params=params, authenticated=False), "risk_limits"
+        )
+        try:
+            result: list[RiskLimit] = []
+            for row in rows:
+                raw_tiers = row["tiers"]
+                if not isinstance(raw_tiers, list):
+                    raise TypeError("tiers 不是数组")
+                tiers = tuple(
+                    RiskTier(
+                        Decimal(str(tier["min_risk_limit_value"])), Decimal(str(tier["max_risk_limit_value"])),
+                        Decimal(str(tier["leverage_max"])), Decimal(str(tier["maintenance_rate"])),
+                    )
+                    for tier in raw_tiers
+                    if isinstance(tier, dict)
+                )
+                if len(tiers) != len(raw_tiers):
+                    raise TypeError("tiers 包含非对象")
+                result.append(RiskLimit(str(row["symbol"]), tiers))
+            return result
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise GateAPIError(None, "INVALID_RESPONSE", f"risk_limits 字段异常: {exc}") from exc

@@ -17,6 +17,7 @@
 - 按目标金额、共同下单步长和最小名义价值验证容量；暂不支持的交易所明确拒绝
 - 盘口缺失、陈旧、跨所时间差过大、买卖盘交叉或深度不足时直接拒绝
 - SQLite 影子执行账本，支持幂等开仓、双腿部分/拒绝、裸露修复和人工介入状态
+- 账户、仓位、未结订单和风险档位只读预检，只生成 FOK 限价订单草案
 - API Key 缺失时明确报错，`.env` 不会被 Git 跟踪
 - 标准库单元测试，无第三方运行依赖
 
@@ -58,6 +59,9 @@ crossex-arb shadow-list --db data/shadow.db
 
 # 使用最新官方盘口模拟平仓
 crossex-arb shadow-close --db data/shadow.db --trade-id <trade_id>
+
+# 账户只读预检；仅输出 blocker 或双腿 FOK 草案，不发送订单
+crossex-arb scan --assets BTC,ETH --with-order-book --preflight --json
 ```
 
 也可以不安装，直接运行：
@@ -96,6 +100,10 @@ python -m crossex_arb scan --assets BTC,ETH
 | `ARB_MAX_ORDER_BOOK_AGE_MS` | `3000` | 单边盘口最大允许年龄（毫秒） |
 | `ARB_MAX_ORDER_BOOK_SKEW_MS` | `1000` | 两所盘口最大时间差（毫秒） |
 | `ARB_ORDER_BOOK_TIMEOUT_SECONDS` | `8` | 等待所有盘口完整快照的超时 |
+| `ARB_PREFLIGHT_MAX_NOTIONAL` | `100` | 只读实盘预检允许的单腿最大名义价值 |
+| `ARB_PREFLIGHT_MIN_INITIAL_MARGIN_RATE` | `1.5` | 预检最低初始保证金率 |
+| `ARB_PREFLIGHT_MIN_MAINTENANCE_MARGIN_RATE` | `1.5` | 预检最低维持保证金率 |
+| `ARB_PREFLIGHT_LIMIT_SLIPPAGE_BPS` | `5` | FOK 草案相对最差盘口价的保护范围 |
 
 ## 上实盘前必须补齐
 
