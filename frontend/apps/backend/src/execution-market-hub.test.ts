@@ -85,4 +85,29 @@ describe('ExecutionMarketHub certification', () => {
     expect(pair.quality).toBe('LIVE_UNSYNCHRONIZED');
     expect(pair.reasons).toContain('exchange_timestamp_skew');
   });
+
+  it('single-flights failed REST rebuilds and cools down after rate limits', async () => {
+    vi.useFakeTimers();
+    let requests = 0;
+    const fetchImpl = vi.fn(async () => {
+      requests += 1;
+      return new Response('', { status: 418 });
+    });
+    const hub = new ExecutionMarketHub(fetchImpl as typeof fetch, {
+      symbols: ['BTC'], rateLimitCooldownMs: 1_000,
+    });
+    const book = new OrderBookReplica('BINANCE', 'BTC');
+    const generation = book.beginRebuild('test');
+    const internal = hub as unknown as {
+      stopped: boolean;
+      requestBootstrap: (venue: 'BINANCE', base: string, replica: OrderBookReplica, generation: number) => void;
+    };
+    internal.stopped = false;
+    for (let index = 0; index < 100; index += 1) {
+      internal.requestBootstrap('BINANCE', 'BTC', book, generation);
+    }
+    await vi.runOnlyPendingTimersAsync();
+    expect(requests).toBe(2);
+    hub.stop();
+  });
 });

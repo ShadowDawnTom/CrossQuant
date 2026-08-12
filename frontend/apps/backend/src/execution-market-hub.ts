@@ -100,6 +100,8 @@ export interface ExecutionMarketHubOptions {
   maxExchangeSkewMs?: number;
   maxReceiveSkewMs?: number;
   reconnectBaseMs?: number;
+  bootstrapBaseMs?: number;
+  rateLimitCooldownMs?: number;
   endpoints?: Partial<Record<ExecutionVenue, { rest: string; websocket: string }>>;
 }
 
@@ -255,11 +257,16 @@ export class ExecutionMarketHub {
   private readonly books = new Map<string, OrderBookReplica>();
   private readonly connections = new Map<ExecutionVenue, VenueConnection>();
   private readonly multipliers = new Map<string, number>();
+  private readonly bootstrapTasks = new Map<string, Promise<void>>();
+  private readonly bootstrapAttempts = new Map<string, number>();
+  private readonly bootstrapTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly endpoints: Record<ExecutionVenue, { rest: string; websocket: string }>;
   private readonly maxBookAgeMs: number;
   private readonly maxExchangeSkewMs: number;
   private readonly maxReceiveSkewMs: number;
   private readonly reconnectBaseMs: number;
+  private readonly bootstrapBaseMs: number;
+  private readonly rateLimitCooldownMs: number;
   private stopped = true;
 
   constructor(
@@ -272,6 +279,8 @@ export class ExecutionMarketHub {
     this.maxExchangeSkewMs = options.maxExchangeSkewMs ?? 750;
     this.maxReceiveSkewMs = options.maxReceiveSkewMs ?? 750;
     this.reconnectBaseMs = options.reconnectBaseMs ?? 500;
+    this.bootstrapBaseMs = options.bootstrapBaseMs ?? 1_000;
+    this.rateLimitCooldownMs = options.rateLimitCooldownMs ?? 60_000;
     this.endpoints = { ...DEFAULT_ENDPOINTS };
     for (const venue of EXECUTION_VENUES) {
       if (options.endpoints?.[venue]) this.endpoints[venue] = options.endpoints[venue]!;
@@ -303,6 +312,8 @@ export class ExecutionMarketHub {
       connection.heartbeatTimer = null;
       connection.handshakeTimer = null;
     }
+    for (const timer of this.bootstrapTimers.values()) clearTimeout(timer);
+    this.bootstrapTimers.clear();
   }
 
   health(now = Date.now()): ExecutionMarketHealth {
@@ -409,7 +420,7 @@ export class ExecutionMarketHub {
       for (const base of this.symbols) {
         const book = this.books.get(this.key(venue, base))!;
         const generation = book.beginRebuild('connection_opened');
-        void this.bootstrap(venue, base, book, generation);
+        this.requestBootstrap(venue, base, book, generation);
       }
       connection.heartbeatTimer = setInterval(() => {
         if (socket.readyState !== WebSocket.OPEN) return;
@@ -544,7 +555,7 @@ export class ExecutionMarketHub {
       if (!book.state.rebuilding) {
         const generation = book.beginRebuild(book.state.lastError);
         book.buffer(delta);
-        void this.bootstrap(venue, base, book, generation);
+        this.requestBootstrap(venue, base, book, generation);
       } else {
         book.buffer(delta);
       }
@@ -552,7 +563,7 @@ export class ExecutionMarketHub {
     }
     if (!book.apply(delta, mode) && !book.state.rebuilding) {
       const generation = book.beginRebuild(book.state.lastError);
-      void this.bootstrap(venue, base, book, generation);
+      this.requestBootstrap(venue, base, book, generation);
     }
   }
 
@@ -560,8 +571,32 @@ export class ExecutionMarketHub {
     return base ? this.multipliers.get(this.key(venue, base)) ?? 1 : 1;
   }
 
+  private requestBootstrap(venue: ExecutionVenue, base: string, book: OrderBookReplica, generation: number): void {
+    const key = this.key(venue, base);
+    if (this.stopped || this.bootstrapTasks.has(key) || this.bootstrapTimers.has(key)) return;
+    const task = this.bootstrap(venue, base, book, generation)
+      .then(() => { this.bootstrapAttempts.delete(key); })
+      .catch((error: unknown) => {
+        if (this.stopped || book.state.generation !== generation || book.state.synchronized) return;
+        book.state.lastError = error instanceof Error ? error.message : 'snapshot_bootstrap_failed';
+        const attempts = (this.bootstrapAttempts.get(key) ?? 0) + 1;
+        this.bootstrapAttempts.set(key, attempts);
+        // 418/429 表示交易所已限流，必须长冷却；其他故障也使用指数退避，禁止增量触发 REST 风暴。
+        const delay = /snapshot_http_(418|429)/.test(book.state.lastError)
+          ? this.rateLimitCooldownMs
+          : Math.min(30_000, this.bootstrapBaseMs * 2 ** Math.min(attempts - 1, 5));
+        const timer = setTimeout(() => {
+          this.bootstrapTimers.delete(key);
+          this.requestBootstrap(venue, base, book, generation);
+        }, delay);
+        timer.unref?.();
+        this.bootstrapTimers.set(key, timer);
+      })
+      .finally(() => { this.bootstrapTasks.delete(key); });
+    this.bootstrapTasks.set(key, task);
+  }
+
   private async bootstrap(venue: ExecutionVenue, base: string, book: OrderBookReplica, generation: number): Promise<void> {
-    try {
       const snapshot = await this.fetchSnapshot(venue, base);
       if (book.state.generation !== generation) return;
       const buffered = [...book.state.buffered];
@@ -593,13 +628,6 @@ export class ExecutionMarketHub {
         if (!book.apply(delta, 'range')) throw new Error(book.state.lastError ?? 'bootstrap_replay_failed');
       }
       if ((book.state.sequence ?? snapshotSequence) <= snapshotSequence) throw new Error('gate_snapshot_bridge_missing');
-    } catch (error) {
-      // WS snapshot 可能先于较慢的 REST 请求到达；不能让过期的 REST 失败覆盖已经同步的盘口。
-      if (book.state.generation === generation && !book.state.synchronized) {
-        book.state.rebuilding = false;
-        book.state.lastError = error instanceof Error ? error.message : 'snapshot_bootstrap_failed';
-      }
-    }
   }
 
   private async fetchSnapshot(venue: ExecutionVenue, base: string): Promise<{ bids: Level[]; asks: Level[]; sequence: number; exchangeTimestamp: number }> {
