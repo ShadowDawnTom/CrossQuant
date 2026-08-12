@@ -4,12 +4,14 @@ const DAY_MS = 24 * 60 * 60_000;
 const AUDIT_RETENTION_MS = 180 * DAY_MS;
 const EXECUTION_RETENTION_MS = 365 * DAY_MS;
 const MAX_AUDIT_EVENTS = 50_000;
+const MARKET_SAMPLE_RETENTION_MS = 30 * DAY_MS;
 
 export interface DatabaseMaintenanceResult {
   auditEventsDeleted: number;
   strategyLogsDeleted: number;
   fillsDeleted: number;
   ordersDeleted: number;
+  executionMarketSamplesDeleted: number;
 }
 
 /**
@@ -23,6 +25,7 @@ export function runDatabaseMaintenance(
 ): DatabaseMaintenanceResult {
   const auditCutoff = new Date(now - AUDIT_RETENTION_MS).toISOString();
   const executionCutoff = new Date(now - EXECUTION_RETENTION_MS).toISOString();
+  const marketSampleCutoff = new Date(now - MARKET_SAMPLE_RETENTION_MS).toISOString();
   return database.transaction(() => {
     const expiredAudit = database.prepare('DELETE FROM audit_events WHERE created_at < ?').run(auditCutoff).changes;
     const excessAudit = database.prepare(`
@@ -60,11 +63,15 @@ export function runDatabaseMaintenance(
     const ordersDeleted = database.prepare(`
       DELETE FROM execution_orders WHERE ${eligibleOrderFilter}
     `).run(executionCutoff).changes;
+    const executionMarketSamplesDeleted = database.prepare(
+      'DELETE FROM execution_market_samples WHERE sampled_at < ?',
+    ).run(marketSampleCutoff).changes;
     return {
       auditEventsDeleted: expiredAudit + excessAudit,
       strategyLogsDeleted,
       fillsDeleted,
       ordersDeleted,
+      executionMarketSamplesDeleted,
     };
   })();
 }

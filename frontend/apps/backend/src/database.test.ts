@@ -30,8 +30,8 @@ describe('database migrations', () => {
 
     expect(readDatabaseStatus(first)).toEqual({
       state: 'ok',
-      migrationCount: 17,
-      currentMigration: '0017_hyperliquid_perp_metadata.sql',
+      migrationCount: 18,
+      currentMigration: '0018_execution_market_samples.sql',
     });
     const orderColumns = first.prepare('PRAGMA table_info(execution_orders)').all() as Array<{ name: string }>;
     expect(orderColumns.map((column) => column.name)).toContain('failure_reason');
@@ -44,7 +44,7 @@ describe('database migrations', () => {
     first.close();
 
     const reopened = openDatabase(location.path, migrationsDir);
-    expect(readDatabaseStatus(reopened).migrationCount).toBe(17);
+    expect(readDatabaseStatus(reopened).migrationCount).toBe(18);
     reopened.close();
   });
 
@@ -87,7 +87,7 @@ describe('database migrations', () => {
     const database = openDatabase(location.path, resolve(process.cwd(), '../../migrations'));
     const columns = database.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain('correlation_id');
-    expect(readDatabaseStatus(database).currentMigration).toBe('0017_hyperliquid_perp_metadata.sql');
+    expect(readDatabaseStatus(database).currentMigration).toBe('0018_execution_market_samples.sql');
     database.close();
   });
 
@@ -151,6 +151,7 @@ describe('database migrations', () => {
       strategyLogsDeleted: 1,
       fillsDeleted: 2,
       ordersDeleted: 2,
+      executionMarketSamplesDeleted: 0,
     });
     expect(database.prepare('SELECT id FROM execution_strategy_logs ORDER BY id').all())
       .toEqual([{ id: 'log-running' }]);

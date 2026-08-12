@@ -6,6 +6,23 @@ import {
   type HyperliquidPerpMetadataSnapshot,
 } from '@gate-crossex/public-data';
 import { PortfolioSnapshotSchema, ReconciliationReportSchema, UserPreferencesSchema, type CrossExInstrument, type CrossExRiskLimit, type PortfolioSnapshot, type PublicMarketSnapshot, type ReconciliationReport, type UserPreferences } from '@gate-crossex/shared-types';
+import type { ExecutionMarketSample } from './execution-market-hub.js';
+
+export function saveExecutionMarketSamples(database: Database.Database, samples: readonly ExecutionMarketSample[]): void {
+  const insert = database.prepare(`
+    INSERT INTO execution_market_samples (
+      sampled_at, base, long_venue, short_venue, quality, reasons_json,
+      exchange_skew_ms, receive_skew_ms, long_ask, short_bid
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  database.transaction(() => {
+    for (const sample of samples) insert.run(
+      sample.sampledAt, sample.base, sample.longVenue, sample.shortVenue, sample.quality,
+      JSON.stringify(sample.reasons), sample.exchangeSkewMs, sample.receiveSkewMs,
+      sample.longBook.asks[0]?.[0] ?? null, sample.shortBook.bids[0]?.[0] ?? null,
+    );
+  })();
+}
 
 export interface CredentialMetadata {
   id: string;

@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from decimal import Decimal
 
 from crossex_arb.models import FeeRate, FundingInfo, OrderBook, SymbolRule, Ticker
@@ -186,6 +187,23 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(row.executable_quantity, Decimal("0.999"))
         self.assertIsNotNone(row.executable_net_snapshot_return)
         self.assertFalse(result.to_dict()["executable"])
+
+    def test_live_synchronized_books_are_execution_ready(self) -> None:
+        funding = [
+            FundingInfo(self.binance, Decimal("0"), NOW_MS + 28_800_000, 28_800),
+            FundingInfo(self.gate, Decimal("0.001"), NOW_MS + 28_800_000, 28_800),
+        ]
+        books = [
+            replace(book, source="execution_market_hub_live_synchronized") for book in self.valid_books()
+        ]
+        result = find_opportunities(
+            funding, self.valid_tickers(), {}, [rule(item.symbol) for item in funding],
+            Decimal("24"), Decimal("0"), Decimal("0"), Decimal("0.003"),
+            order_books=books, target_notional=Decimal("100"), now_ms=NOW_MS,
+        )
+        self.assertEqual(result.opportunities[0].execution_status, "EXECUTION_READY")
+        self.assertEqual(result.opportunities[0].market_data_quality, "LIVE_SYNCHRONIZED")
+        self.assertTrue(result.to_dict()["executable"])
 
     def test_missing_stale_and_shallow_books_fail_closed(self) -> None:
         funding = [

@@ -2,7 +2,7 @@ import unittest
 from decimal import Decimal
 from unittest.mock import patch
 
-from crossex_arb.market_depth import MarketDepthError, collect_order_books, fetch_order_book
+from crossex_arb.market_depth import MarketDepthError, collect_order_books, fetch_live_pair, fetch_order_book
 
 
 class MarketDepthTests(unittest.TestCase):
@@ -41,6 +41,34 @@ class MarketDepthTests(unittest.TestCase):
         with patch("crossex_arb.market_depth._json_get", side_effect=responses):
             with self.assertRaisesRegex(MarketDepthError, "交叉"):
                 fetch_order_book("BINANCE_FUTURE_BTC_USDT", 1)
+
+    def test_live_pair_requires_synchronized_quality(self):
+        with patch("crossex_arb.market_depth._json_get", return_value={
+            "quality": "LIVE_UNSYNCHRONIZED", "reasons": ["exchange_timestamp_skew"],
+        }):
+            with self.assertRaisesRegex(MarketDepthError, "LIVE_SYNCHRONIZED"):
+                fetch_live_pair(
+                    "http://127.0.0.1:17840", "GATE_FUTURE_BTC_USDT", "BINANCE_FUTURE_BTC_USDT", 1
+                )
+
+    def test_live_pair_parses_atomic_books(self):
+        payload = {
+            "quality": "LIVE_SYNCHRONIZED", "reasons": [],
+            "longBook": {
+                "venue": "GATE", "base": "BTC", "quote": "USDT", "synchronized": True,
+                "exchangeTimestamp": "2026-08-12T04:00:00.000Z", "bids": [["99", "1"]], "asks": [["101", "1"]],
+            },
+            "shortBook": {
+                "venue": "BINANCE", "base": "BTC", "quote": "USDT", "synchronized": True,
+                "exchangeTimestamp": "2026-08-12T04:00:00.010Z", "bids": [["100", "1"]], "asks": [["102", "1"]],
+            },
+        }
+        with patch("crossex_arb.market_depth._json_get", return_value=payload):
+            long_book, short_book = fetch_live_pair(
+                "http://127.0.0.1:17840", "GATE_FUTURE_BTC_USDT", "BINANCE_FUTURE_BTC_USDT", 1
+            )
+        self.assertEqual(long_book.source, "execution_market_hub_live_synchronized")
+        self.assertEqual(short_book.bids[0][0], Decimal("100"))
 
 
 def fetch_order_book_from_fixture():

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -18,6 +19,55 @@ class MarketDepthError(RuntimeError):
 
 
 SUPPORTED_VENUES = frozenset({"GATE", "BINANCE", "OKX", "BYBIT"})
+
+
+def _hub_json(url: str, timeout: float) -> dict[str, Any]:
+    payload = _json_get(url, timeout)
+    if not isinstance(payload, dict):
+        raise MarketDepthError("执行行情服务响应格式错误")
+    return payload
+
+
+def _hub_book(value: object, expected_symbol: str) -> OrderBook:
+    if not isinstance(value, dict) or value.get("synchronized") is not True:
+        raise MarketDepthError(f"{expected_symbol} 尚未通过实时盘口同步认证")
+    venue, _, base, quote = split_symbol(expected_symbol)
+    if value.get("venue") != venue or value.get("base") != base or value.get("quote") != quote:
+        raise MarketDepthError(f"{expected_symbol} 与执行行情响应不一致")
+    try:
+        timestamp_ms = int(datetime.fromisoformat(str(value["exchangeTimestamp"]).replace("Z", "+00:00")).timestamp() * 1000)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MarketDepthError(f"{expected_symbol} 执行行情时间戳无效") from exc
+    return _validated_book(
+        expected_symbol,
+        _levels(value.get("bids"), f"{expected_symbol} bids"),
+        _levels(value.get("asks"), f"{expected_symbol} asks"),
+        timestamp_ms,
+        "execution_market_hub_live_synchronized",
+    )
+
+
+def fetch_live_pair(
+    service_url: str, long_symbol: str, short_symbol: str, timeout: float
+) -> tuple[OrderBook, OrderBook]:
+    """从本机执行行情 Hub 原子读取两腿；质量、方向或时间不同步时直接拒绝。"""
+    long_venue, long_business, long_base, long_quote = split_symbol(long_symbol)
+    short_venue, short_business, short_base, short_quote = split_symbol(short_symbol)
+    if (
+        long_business != "FUTURE" or short_business != "FUTURE"
+        or long_base != short_base or long_quote != short_quote or long_quote != "USDT"
+    ):
+        raise MarketDepthError("实时执行行情只支持同币种 USDT 永续配对")
+    if long_venue not in SUPPORTED_VENUES or short_venue not in SUPPORTED_VENUES:
+        raise MarketDepthError("实时执行行情暂不支持该交易所")
+    root = service_url.rstrip("/")
+    query = urlencode({"longVenue": long_venue, "shortVenue": short_venue})
+    payload = _hub_json(f"{root}/api/execution-market/pairs/{long_base}?{query}", timeout)
+    if payload.get("quality") != "LIVE_SYNCHRONIZED":
+        reasons = payload.get("reasons")
+        detail = ",".join(str(item) for item in reasons) if isinstance(reasons, list) else "unknown"
+        raise MarketDepthError(f"两腿未通过 LIVE_SYNCHRONIZED 认证: {detail}")
+    return _hub_book(payload.get("longBook"), long_symbol), _hub_book(payload.get("shortBook"), short_symbol)
 
 
 def _decimal(value: object, field: str, *, allow_zero: bool = False) -> Decimal:

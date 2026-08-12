@@ -467,7 +467,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 17, currentMigration: '0017_hyperliquid_perp_metadata.sql' },
+      database: { migrationCount: 18, currentMigration: '0018_execution_market_samples.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',
@@ -487,6 +487,25 @@ describe('local backend', () => {
 
     const snapshot = await app.inject({ method: 'GET', url: '/api/trading/snapshot', headers: { host: '127.0.0.1:17840' } });
     expect(snapshot.json()).toEqual({ mode: 'live', orders: [], positions: [], fills: [], balances: [] });
+  });
+
+  it('exposes fail-closed execution market health and atomic pair snapshots', async () => {
+    const { app } = await createTestApp();
+    const headers = { host: '127.0.0.1:17840' };
+    const health = await app.inject({ method: 'GET', url: '/api/execution-market/health', headers });
+    expect(health.statusCode).toBe(200);
+    expect(health.json()).toMatchObject({ state: 'stopped', symbols: ['BTC', 'ETH'] });
+
+    const pair = await app.inject({
+      method: 'GET', url: '/api/execution-market/pairs/BTC?longVenue=GATE&shortVenue=BINANCE', headers,
+    });
+    expect(pair.statusCode).toBe(200);
+    expect(pair.json()).toMatchObject({ quality: 'BOOTSTRAPPING', certifiedAt: null });
+
+    const invalid = await app.inject({
+      method: 'GET', url: '/api/execution-market/pairs/BTC?longVenue=UNKNOWN&shortVenue=BINANCE', headers,
+    });
+    expect(invalid.statusCode).toBe(400);
   });
 
   it('allows explicit reduce-only emergency orders while the global trading lock is active', async () => {

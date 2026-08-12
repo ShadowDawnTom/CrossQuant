@@ -18,6 +18,13 @@ export interface BackendConfig {
   gateRestBaseUrl: string;
   gatePublicWebSocketUrl: string;
   gatePrivateWebSocketUrl: string;
+  executionMarket: {
+    symbols: string[];
+    maxBookAgeMs: number;
+    maxExchangeSkewMs: number;
+    maxReceiveSkewMs: number;
+    endpoints: Partial<Record<'GATE' | 'BINANCE' | 'OKX' | 'BYBIT', { rest: string; websocket: string }>>;
+  };
   riskLimits: {
     maxGrossExposureUsd: string;
     minAvailableMarginRatio: string;
@@ -82,6 +89,31 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     gateRestBaseUrl: environment.GCT_GATE_REST_URL ?? 'https://api.gateio.ws/api/v4',
     gatePublicWebSocketUrl: environment.GCT_GATE_PUBLIC_WS_URL ?? 'wss://api.gateio.ws/ws/crossex/public',
     gatePrivateWebSocketUrl: environment.GCT_GATE_PRIVATE_WS_URL ?? 'wss://api.gateio.ws/ws/crossex',
+    executionMarket: {
+      symbols: [...new Set((environment.GCT_EXECUTION_MARKET_SYMBOLS ?? 'BTC,ETH')
+        .split(',').map((item) => item.trim().toUpperCase()).filter(Boolean))],
+      maxBookAgeMs: parseNonNegativeInteger(environment.GCT_EXECUTION_MAX_BOOK_AGE_MS ?? '1500', 'GCT_EXECUTION_MAX_BOOK_AGE_MS'),
+      maxExchangeSkewMs: parseNonNegativeInteger(environment.GCT_EXECUTION_MAX_EXCHANGE_SKEW_MS ?? '750', 'GCT_EXECUTION_MAX_EXCHANGE_SKEW_MS'),
+      maxReceiveSkewMs: parseNonNegativeInteger(environment.GCT_EXECUTION_MAX_RECEIVE_SKEW_MS ?? '750', 'GCT_EXECUTION_MAX_RECEIVE_SKEW_MS'),
+      endpoints: {
+        GATE: {
+          rest: environment.GCT_GATE_FUTURES_REST_URL ?? 'https://api.gateio.ws/api/v4',
+          websocket: environment.GCT_GATE_FUTURES_WS_URL ?? 'wss://fx-ws.gateio.ws/v4/ws/usdt',
+        },
+        BINANCE: {
+          rest: environment.GCT_BINANCE_FUTURES_REST_URL ?? 'https://fapi.binance.com',
+          websocket: environment.GCT_BINANCE_FUTURES_WS_URL ?? 'wss://fstream.binance.com/public/ws',
+        },
+        OKX: {
+          rest: environment.GCT_OKX_REST_URL ?? 'https://openapi.okx.com',
+          websocket: environment.GCT_OKX_WS_URL ?? 'wss://ws.okx.com:8443/ws/v5/public',
+        },
+        BYBIT: {
+          rest: environment.GCT_BYBIT_REST_URL ?? 'https://api.bybit.com',
+          websocket: environment.GCT_BYBIT_WS_URL ?? 'wss://stream.bybit.com/v5/public/linear',
+        },
+      },
+    },
     riskLimits: {
       maxGrossExposureUsd: parseNonNegativeDecimal(environment.GCT_RISK_MAX_GROSS_EXPOSURE_USD ?? '10000', 'GCT_RISK_MAX_GROSS_EXPOSURE_USD'),
       minAvailableMarginRatio: parseNonNegativeDecimal(environment.GCT_RISK_MIN_AVAILABLE_MARGIN_RATIO ?? '0.25', 'GCT_RISK_MIN_AVAILABLE_MARGIN_RATIO'),

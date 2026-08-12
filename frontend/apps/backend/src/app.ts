@@ -65,6 +65,7 @@ import { FundingHistoryService } from './funding-history.js';
 import { FundingOverviewService } from './funding-overview.js';
 import { canonicalMarketAsset } from './market-asset-aliases.js';
 import { CrossExMarketHub, CANDLE_INTERVALS, type MarketDefinition, type MarketHubMessage } from './market-hub.js';
+import { ExecutionMarketHub, EXECUTION_VENUES, sampleExecutionPairs, type ExecutionMarketReader, type ExecutionVenue } from './execution-market-hub.js';
 import { StrategyEngine, StrategyEngineError } from './strategy-engine.js';
 import { TradingSession } from './trading-session.js';
 import { TradingRuntime, TradingRuntimeError } from './trading-runtime.js';
@@ -91,6 +92,7 @@ import {
   saveReconciliationReport,
   upsertPublicMarketSnapshot,
   upsertCredentialMetadata,
+  saveExecutionMarketSamples,
 } from './repositories.js';
 import {
   renderCredentialDeletedPage,
@@ -197,6 +199,7 @@ export interface BuildAppOptions {
   crossExGateway: ReadOnlyCrossExGateway;
   publicMarketGateway: PublicMarketDataGateway;
   marketHub?: CrossExMarketHub;
+  executionMarketHub?: ExecutionMarketReader;
   tradingSession?: TradingSession;
   startMarketStream?: boolean;
   logger?: boolean;
@@ -448,6 +451,7 @@ function safeCredentialError(error: unknown, language: SecureCredentialLanguage)
 export async function buildApp(options: BuildAppOptions): Promise<FastifyInstance> {
   const { config, database, credentialVault, crossExGateway, publicMarketGateway } = options;
   const marketHub = options.marketHub ?? new CrossExMarketHub(config.gatePublicWebSocketUrl);
+  const executionMarketHub = options.executionMarketHub ?? new ExecutionMarketHub(fetch, config.executionMarket);
   const tradingSession = options.tradingSession ?? new TradingSession();
   const tradingRuntime = new TradingRuntime(database, tradingSession, credentialVault, crossExGateway);
   const privateStream = new CrossExPrivateStream(config.gatePrivateWebSocketUrl, credentialVault);
@@ -835,6 +839,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   let portfolioReconcileTimer: ReturnType<typeof setTimeout> | null = null;
   let databaseMaintenanceTimer: ReturnType<typeof setInterval> | null = null;
+  let executionMarketSampleTimer: ReturnType<typeof setInterval> | null = null;
   const schedulePortfolioReconciliation = () => {
     if (!options.startMarketStream) return;
     const interval = Math.round(5 * 60_000 * (0.9 + Math.random() * 0.2));
@@ -847,6 +852,17 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   if (options.startMarketStream) {
     marketHub.start();
+    executionMarketHub.start();
+    executionMarketSampleTimer = setInterval(() => {
+      try {
+        saveExecutionMarketSamples(database, sampleExecutionPairs(
+          executionMarketHub, config.executionMarket.symbols,
+        ));
+      } catch (error) {
+        app.log.warn({ err: error }, 'failed to persist execution market sample');
+      }
+    }, 60_000);
+    executionMarketSampleTimer.unref?.();
     privateStream.start();
     strategyEngine.start();
     fundingHistoryService.startBackground();
@@ -871,8 +887,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     await strategyEngine.stop();
     if (portfolioReconcileTimer) clearTimeout(portfolioReconcileTimer);
     if (databaseMaintenanceTimer) clearInterval(databaseMaintenanceTimer);
+    if (executionMarketSampleTimer) clearInterval(executionMarketSampleTimer);
     livePortfolio.stop();
     marketHub.stop();
+    executionMarketHub.stop();
     privateStream.stop();
   });
 
@@ -1064,6 +1082,30 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   });
 
   app.get('/api/markets', async () => marketHub.snapshot());
+  app.get('/api/execution-market/health', async () => executionMarketHub.health());
+  app.get('/api/execution-market/books/:venue/:base', async (request, reply) => {
+    const parsed = z.object({ venue: z.enum(EXECUTION_VENUES), base: z.string().regex(/^[A-Z0-9]{2,20}$/) })
+      .safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_execution_market' });
+    try {
+      return executionMarketHub.book(parsed.data.venue as ExecutionVenue, parsed.data.base);
+    } catch {
+      return reply.code(404).send({ error: 'execution_market_not_configured' });
+    }
+  });
+  app.get('/api/execution-market/pairs/:base', async (request, reply) => {
+    const parsed = z.object({
+      base: z.string().regex(/^[A-Z0-9]{2,20}$/),
+      longVenue: z.enum(EXECUTION_VENUES),
+      shortVenue: z.enum(EXECUTION_VENUES),
+    }).safeParse({ ...(request.params as object), ...(request.query as object) });
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_execution_pair' });
+    try {
+      return executionMarketHub.pair(parsed.data.base, parsed.data.longVenue, parsed.data.shortVenue);
+    } catch {
+      return reply.code(404).send({ error: 'execution_market_not_configured' });
+    }
+  });
 
   app.get('/api/trading/snapshot', async () => tradingRuntime.snapshot());
 

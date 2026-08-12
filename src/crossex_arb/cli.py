@@ -9,7 +9,7 @@ from pathlib import Path
 from crossex_arb.client import GateAPIError, GateCrossExClient
 from crossex_arb.config import Settings
 from crossex_arb.history import append_market_snapshot
-from crossex_arb.market_depth import collect_order_books
+from crossex_arb.market_depth import MarketDepthError, collect_order_books, fetch_live_pair
 from crossex_arb.models import ScanResult
 from crossex_arb.preflight import build_preflight_report
 from crossex_arb.shadow import ShadowExecutionEngine, ShadowStore, result_to_dict
@@ -28,6 +28,7 @@ def _parser() -> argparse.ArgumentParser:
     scan.add_argument("--quote", default="USDT", help="计价币，默认 USDT")
     scan.add_argument("--json", action="store_true", help="输出 JSON")
     scan.add_argument("--with-order-book", action="store_true", help="读取底层交易所官方深度并验证目标金额可执行收益")
+    scan.add_argument("--live-order-book", action="store_true", help="从常驻 Hub 读取同步增量盘口；只有此模式可生成 EXECUTION_READY")
     scan.add_argument("--target-notional", type=Decimal, help="每条腿的目标名义金额，默认读取 ARB_TARGET_NOTIONAL")
     scan.add_argument("--snapshot-log", type=Path, help="将原始费率、Ticker 和手续费追加为 UTF-8 JSONL")
     scan.add_argument("--shadow-db", type=Path, help="使用下一份盘口影子开仓排名第一的候选，并写入 SQLite")
@@ -63,17 +64,19 @@ def _scan(
     as_json: bool,
     snapshot_log: Path | None,
     with_order_book: bool,
+    live_order_book: bool,
     target_notional: Decimal | None,
     shadow_db: Path | None,
     shadow_key: str | None,
     preflight: bool,
 ) -> int:
-    if shadow_db is not None and not with_order_book:
-        raise ValueError("--shadow-db 必须和 --with-order-book 一起使用")
+    use_order_book = with_order_book or live_order_book
+    if shadow_db is not None and not use_order_book:
+        raise ValueError("--shadow-db 必须和盘口模式一起使用")
     if shadow_db is not None and not shadow_key:
         raise ValueError("--shadow-db 必须提供非空 --shadow-key，防止重复影子开仓")
-    if preflight and not with_order_book:
-        raise ValueError("--preflight 必须和 --with-order-book 一起使用")
+    if preflight and not live_order_book:
+        raise ValueError("--preflight 必须和 --live-order-book 一起使用，REST 快照不能通过实盘预检")
     assets = {item.strip().upper() for item in assets_text.split(",") if item.strip()}
     rules = [item for item in client.list_symbols() if item.business == "FUTURE"]
     wanted = [item.symbol for item in rules if split_symbol(item.symbol)[2] in assets and split_symbol(item.symbol)[3] == quote.upper()]
@@ -86,7 +89,28 @@ def _scan(
     books = None
     book_errors: dict[str, str] = {}
     requested_notional = target_notional or Decimal(str(settings.target_notional))
-    if with_order_book:
+    if live_order_book:
+        reference = find_opportunities(
+            funding=funding, tickers=tickers, fees=fees, rules=rules,
+            scenario_horizon_hours=Decimal(str(settings.scenario_horizon_hours)),
+            slippage_bps_per_fill=Decimal(str(settings.slippage_bps_per_fill)),
+            default_taker_fee=Decimal(str(settings.default_taker_fee)),
+            max_mark_divergence=Decimal(str(settings.max_mark_price_divergence)),
+            assets=assets, quote=quote.upper(),
+            max_ticker_age_ms=settings.max_ticker_age_ms,
+            max_ticker_skew_ms=settings.max_ticker_skew_ms,
+        )
+        if reference.opportunities:
+            selected = reference.opportunities[0]
+            try:
+                books = list(fetch_live_pair(
+                    settings.execution_market_url, selected.long_symbol, selected.short_symbol,
+                    settings.order_book_timeout_seconds,
+                ))
+            except MarketDepthError as exc:
+                book_errors[selected.long_symbol] = str(exc)
+                books = []
+    elif with_order_book:
         books, book_errors = collect_order_books(
             [item.symbol for item in funding], settings.order_book_timeout_seconds
         )
@@ -100,7 +124,7 @@ def _scan(
         max_mark_divergence=Decimal(str(settings.max_mark_price_divergence)),
         assets=assets, quote=quote.upper(),
         order_books=books,
-        target_notional=requested_notional if with_order_book else None,
+        target_notional=requested_notional if use_order_book else None,
         max_order_book_age_ms=settings.max_order_book_age_ms,
         max_order_book_skew_ms=settings.max_order_book_skew_ms,
         max_ticker_age_ms=settings.max_ticker_age_ms,
@@ -119,12 +143,12 @@ def _scan(
             item for item in result.opportunities
             if (
                 item.executable_snapshot_annualized
-                if with_order_book
+                if use_order_book
                 else item.snapshot_annualized
             ) is not None
             and (
                 item.executable_snapshot_annualized
-                if with_order_book
+                if use_order_book
                 else item.snapshot_annualized
             ) >= threshold
         ],
@@ -134,9 +158,19 @@ def _scan(
     preflight_report = None
     if shadow_db is not None and result.opportunities:
         selected = result.opportunities[0]
-        execution_books, execution_errors = collect_order_books(
-            [selected.long_symbol, selected.short_symbol], settings.order_book_timeout_seconds, workers=2
-        )
+        if live_order_book:
+            try:
+                execution_books = list(fetch_live_pair(
+                    settings.execution_market_url, selected.long_symbol, selected.short_symbol,
+                    settings.order_book_timeout_seconds,
+                ))
+                execution_errors = {}
+            except MarketDepthError as exc:
+                execution_books, execution_errors = [], {selected.long_symbol: str(exc)}
+        else:
+            execution_books, execution_errors = collect_order_books(
+                [selected.long_symbol, selected.short_symbol], settings.order_book_timeout_seconds, workers=2
+            )
         if execution_errors:
             details = "; ".join(f"{symbol}: {detail}" for symbol, detail in sorted(execution_errors.items()))
             raise ValueError(f"影子执行的第二次盘口采集失败: {details}")
@@ -146,9 +180,14 @@ def _scan(
             )
     if preflight and result.opportunities:
         selected = result.opportunities[0]
-        preflight_books, preflight_errors = collect_order_books(
-            [selected.long_symbol, selected.short_symbol], settings.order_book_timeout_seconds, workers=2
-        )
+        try:
+            preflight_books = list(fetch_live_pair(
+                settings.execution_market_url, selected.long_symbol, selected.short_symbol,
+                settings.order_book_timeout_seconds,
+            ))
+            preflight_errors = {}
+        except MarketDepthError as exc:
+            preflight_books, preflight_errors = [], {selected.long_symbol: str(exc)}
         if preflight_errors:
             details = "; ".join(f"{symbol}: {detail}" for symbol, detail in sorted(preflight_errors.items()))
             raise ValueError(f"预检的第二次盘口采集失败: {details}")
@@ -175,8 +214,10 @@ def _scan(
         print("当前没有达到阈值的快照情景候选。")
         return 0
     print("说明：下列是“当前费率在情景期保持不变”的快照外推，不是预期 APR。")
-    if with_order_book:
-        print("已按实时双边盘口和目标金额验证 VWAP；平仓价格仍是假设立即按当前反向盘口成交。")
+    if live_order_book:
+        print("已通过四所常驻增量盘口的 LIVE_SYNCHRONIZED 认证；平仓价格仍是假设立即按当前反向盘口成交。")
+    elif with_order_book:
+        print("已按 REST 双边快照和目标金额验证 VWAP；该模式仅供研究，不能通过实盘预检。")
     else:
         print("未使用 ask/bid、盘口深度和双腿成交模型，所有结果均不代表可执行收益。")
     for item in result.opportunities:
@@ -247,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise GateAPIError(None, "MISSING_CREDENTIALS", "请在 .env 填写 GATE_API_KEY 和 GATE_API_SECRET")
             return _scan(
                 client, settings, args.assets, args.quote, args.json, args.snapshot_log,
-                args.with_order_book, args.target_notional, args.shadow_db, args.shadow_key, args.preflight,
+                args.with_order_book, args.live_order_book, args.target_notional, args.shadow_db, args.shadow_key, args.preflight,
             )
     except (GateAPIError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

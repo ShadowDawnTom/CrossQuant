@@ -43,6 +43,7 @@ class Settings:
     max_order_book_age_ms: int = 3_000
     max_order_book_skew_ms: int = 1_000
     order_book_timeout_seconds: float = 8.0
+    execution_market_url: str = "http://127.0.0.1:17840"
     preflight_max_notional: float = 100.0
     preflight_min_initial_margin_rate: float = 1.5
     preflight_min_maintenance_margin_rate: float = 1.5
@@ -69,6 +70,7 @@ class Settings:
             max_order_book_age_ms=int(os.getenv("ARB_MAX_ORDER_BOOK_AGE_MS", "3000")),
             max_order_book_skew_ms=int(os.getenv("ARB_MAX_ORDER_BOOK_SKEW_MS", "1000")),
             order_book_timeout_seconds=float(os.getenv("ARB_ORDER_BOOK_TIMEOUT_SECONDS", "8")),
+            execution_market_url=os.getenv("ARB_EXECUTION_MARKET_URL", "http://127.0.0.1:17840").rstrip("/"),
             preflight_max_notional=float(os.getenv("ARB_PREFLIGHT_MAX_NOTIONAL", "100")),
             preflight_min_initial_margin_rate=float(os.getenv("ARB_PREFLIGHT_MIN_INITIAL_MARGIN_RATE", "1.5")),
             preflight_min_maintenance_margin_rate=float(os.getenv("ARB_PREFLIGHT_MIN_MAINTENANCE_MARGIN_RATE", "1.5")),

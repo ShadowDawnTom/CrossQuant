@@ -342,8 +342,16 @@ def find_opportunities(
                 executable_net = executable_funding + entry_basis + exit_basis - executable_fees
                 opportunity = replace(
                     opportunity,
-                    execution_status="RESEARCH_DEPTH_VERIFIED",
-                    market_data_quality="REST_SNAPSHOT",
+                    execution_status=(
+                        "EXECUTION_READY"
+                        if long_book.source == short_book.source == "execution_market_hub_live_synchronized"
+                        else "RESEARCH_DEPTH_VERIFIED"
+                    ),
+                    market_data_quality=(
+                        "LIVE_SYNCHRONIZED"
+                        if long_book.source == short_book.source == "execution_market_hub_live_synchronized"
+                        else "REST_SNAPSHOT"
+                    ),
                     target_notional=target_notional,
                     executable_quantity=quantity,
                     long_entry_vwap=long_entry.average_price,
