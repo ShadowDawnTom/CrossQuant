@@ -16,6 +16,7 @@
 - 可选并发读取 Gate、Binance、OKX、Bybit 官方永续深度，统一成基础币数量后验证多档 VWAP
 - 按目标金额、共同下单步长和最小名义价值验证容量；暂不支持的交易所明确拒绝
 - 盘口缺失、陈旧、跨所时间差过大、买卖盘交叉或深度不足时直接拒绝
+- SQLite 影子执行账本，支持幂等开仓、双腿部分/拒绝、裸露修复和人工介入状态
 - API Key 缺失时明确报错，`.env` 不会被 Git 跟踪
 - 标准库单元测试，无第三方运行依赖
 
@@ -48,6 +49,12 @@ crossex-arb scan --assets BTC,ETH,SOL --snapshot-log data/market-snapshots.jsonl
 
 # 按每条腿 100 USDT 验证实时盘口 VWAP；仍然只读，不会下单
 crossex-arb scan --assets BTC,ETH --with-order-book --target-notional 100
+
+# 用第二次实时盘口模拟排名第一的候选，并以幂等键写入 SQLite；不会发送订单
+crossex-arb scan --assets BTC,ETH --with-order-book --shadow-db data/shadow.db --shadow-key manual-001
+
+# 查看影子交易状态、实际匹配数量和残余敞口
+crossex-arb shadow-list --db data/shadow.db
 ```
 
 也可以不安装，直接运行：

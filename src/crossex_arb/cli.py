@@ -11,6 +11,7 @@ from crossex_arb.config import Settings
 from crossex_arb.history import append_market_snapshot
 from crossex_arb.market_depth import collect_order_books
 from crossex_arb.models import ScanResult
+from crossex_arb.shadow import ShadowExecutionEngine, ShadowStore, result_to_dict
 from crossex_arb.strategy import find_opportunities, split_symbol
 
 
@@ -28,6 +29,11 @@ def _parser() -> argparse.ArgumentParser:
     scan.add_argument("--with-order-book", action="store_true", help="读取底层交易所官方深度并验证目标金额可执行收益")
     scan.add_argument("--target-notional", type=Decimal, help="每条腿的目标名义金额，默认读取 ARB_TARGET_NOTIONAL")
     scan.add_argument("--snapshot-log", type=Path, help="将原始费率、Ticker 和手续费追加为 UTF-8 JSONL")
+    scan.add_argument("--shadow-db", type=Path, help="使用下一份盘口影子开仓排名第一的候选，并写入 SQLite")
+    scan.add_argument("--shadow-key", help="影子开仓幂等键；使用 --shadow-db 时必填")
+    shadow_list = sub.add_parser("shadow-list", help="查看本地影子交易账本")
+    shadow_list.add_argument("--db", type=Path, default=Path("data/shadow.db"), help="SQLite 路径")
+    shadow_list.add_argument("--limit", type=int, default=50)
     return parser
 
 
@@ -53,7 +59,13 @@ def _scan(
     snapshot_log: Path | None,
     with_order_book: bool,
     target_notional: Decimal | None,
+    shadow_db: Path | None,
+    shadow_key: str | None,
 ) -> int:
+    if shadow_db is not None and not with_order_book:
+        raise ValueError("--shadow-db 必须和 --with-order-book 一起使用")
+    if shadow_db is not None and not shadow_key:
+        raise ValueError("--shadow-db 必须提供非空 --shadow-key，防止重复影子开仓")
     assets = {item.strip().upper() for item in assets_text.split(",") if item.strip()}
     rules = [item for item in client.list_symbols() if item.business == "FUTURE"]
     wanted = [item.symbol for item in rules if split_symbol(item.symbol)[2] in assets and split_symbol(item.symbol)[3] == quote.upper()]
@@ -110,8 +122,24 @@ def _scan(
         ],
         result.rejections,
     )
+    shadow_result = None
+    if shadow_db is not None and result.opportunities:
+        selected = result.opportunities[0]
+        execution_books, execution_errors = collect_order_books(
+            [selected.long_symbol, selected.short_symbol], settings.order_book_timeout_seconds, workers=2
+        )
+        if execution_errors:
+            details = "; ".join(f"{symbol}: {detail}" for symbol, detail in sorted(execution_errors.items()))
+            raise ValueError(f"影子执行的第二次盘口采集失败: {details}")
+        with ShadowStore(shadow_db) as store:
+            shadow_result = ShadowExecutionEngine(store).open(
+                selected, execution_books, idempotency_key=shadow_key or ""
+            )
     if as_json:
-        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        payload = result.to_dict()
+        if shadow_result is not None:
+            payload["shadow_execution"] = result_to_dict(shadow_result)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     if result.rejections:
         print(f"已拒绝 {len(result.rejections)} 个数据不完整或超出风控阈值的候选。")
@@ -140,6 +168,11 @@ def _scan(
                 f"  盘口净情景收益={item.executable_net_snapshot_return:.4%}  "
                 f"盘口净情景年化={item.executable_snapshot_annualized:.2%}  盘口时差={item.book_time_skew_ms}ms"
             )
+    if shadow_result is not None:
+        print(
+            f"\n影子交易 {shadow_result.trade_id}  状态={shadow_result.state}  "
+            f"持仓数量={shadow_result.open_quantity}  净敞口={shadow_result.net_base_exposure}"
+        )
     return 0
 
 
@@ -153,12 +186,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "account":
             print(json.dumps(client.account(), ensure_ascii=False, indent=2))
             return 0
+        if args.command == "shadow-list":
+            with ShadowStore(args.db) as store:
+                print(json.dumps(store.list_trades(args.limit), ensure_ascii=False, indent=2))
+            return 0
         if args.command == "scan":
             if not settings.api_key or not settings.api_secret:
                 raise GateAPIError(None, "MISSING_CREDENTIALS", "请在 .env 填写 GATE_API_KEY 和 GATE_API_SECRET")
             return _scan(
                 client, settings, args.assets, args.quote, args.json, args.snapshot_log,
-                args.with_order_book, args.target_notional,
+                args.with_order_book, args.target_notional, args.shadow_db, args.shadow_key,
             )
     except (GateAPIError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
