@@ -34,6 +34,7 @@ class ShadowTradeResult:
     fills: tuple[ShadowFill, ...]
     net_base_exposure: Decimal
     open_quantity: Decimal
+    gross_execution_cashflow: Decimal
 
 
 class ShadowStore:
@@ -199,6 +200,10 @@ class ShadowStore:
         return ShadowTradeResult(
             str(trade["trade_id"]), str(trade["state"]), fills, Decimal(str(trade["net_base_exposure"])),
             Decimal(str(trade["open_quantity"])),
+            sum(
+                (item.quote_amount if item.side == "SELL" else -item.quote_amount for item in fills),
+                Decimal(0),
+            ),
         )
 
     def list_trades(self, limit: int = 50) -> list[dict[str, object]]:
@@ -246,7 +251,14 @@ class ShadowExecutionEngine:
             if ratio < 0 or ratio > 1:
                 raise ValueError("模拟成交比例必须在 0 到 1 之间")
         timestamp = int(time.time() * 1000) if now_ms is None else now_ms
-        trade_id = self.store.create(opportunity, idempotency_key, timestamp)
+        try:
+            trade_id = self.store.create(opportunity, idempotency_key, timestamp)
+        except sqlite3.IntegrityError:
+            # 两个进程同时使用同一幂等键时，唯一约束是最终防线；输掉竞态的一方只读已有结果。
+            existing = self.store.existing(idempotency_key)
+            if existing is None:
+                raise
+            return existing
         quantity = opportunity.executable_quantity
         assert quantity is not None
         book_map = {item.symbol: item for item in books}
@@ -371,5 +383,6 @@ def result_to_dict(result: ShadowTradeResult) -> dict[str, object]:
         "state": result.state,
         "net_base_exposure": str(result.net_base_exposure),
         "open_quantity": str(result.open_quantity),
+        "gross_execution_cashflow": str(result.gross_execution_cashflow),
         "fills": [fill_to_dict(item) for item in result.fills],
     }

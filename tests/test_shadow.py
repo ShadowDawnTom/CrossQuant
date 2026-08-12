@@ -41,6 +41,7 @@ class ShadowExecutionTests(unittest.TestCase):
             closed = engine.close(first.trade_id, books(), now_ms=300)
             self.assertEqual(closed.state, "CLOSED")
             self.assertEqual(closed.open_quantity, Decimal(0))
+            self.assertEqual(closed.gross_execution_cashflow, Decimal("-2"))
 
     def test_partial_leg_repairs_exposure_and_keeps_matched_position(self):
         with tempfile.TemporaryDirectory() as directory, ShadowStore(Path(directory) / "shadow.db") as store:

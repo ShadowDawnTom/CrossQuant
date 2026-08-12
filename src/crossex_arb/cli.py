@@ -34,6 +34,9 @@ def _parser() -> argparse.ArgumentParser:
     shadow_list = sub.add_parser("shadow-list", help="查看本地影子交易账本")
     shadow_list.add_argument("--db", type=Path, default=Path("data/shadow.db"), help="SQLite 路径")
     shadow_list.add_argument("--limit", type=int, default=50)
+    shadow_close = sub.add_parser("shadow-close", help="用最新官方盘口模拟关闭一笔影子仓位")
+    shadow_close.add_argument("--db", type=Path, default=Path("data/shadow.db"), help="SQLite 路径")
+    shadow_close.add_argument("--trade-id", required=True)
     return parser
 
 
@@ -189,6 +192,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "shadow-list":
             with ShadowStore(args.db) as store:
                 print(json.dumps(store.list_trades(args.limit), ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "shadow-close":
+            with ShadowStore(args.db) as store:
+                _, long_symbol, short_symbol, _ = store.trade_position(args.trade_id)
+                close_books, close_errors = collect_order_books(
+                    [long_symbol, short_symbol], settings.order_book_timeout_seconds, workers=2
+                )
+                if close_errors:
+                    details = "; ".join(
+                        f"{symbol}: {detail}" for symbol, detail in sorted(close_errors.items())
+                    )
+                    raise ValueError(f"影子平仓盘口采集失败: {details}")
+                result = ShadowExecutionEngine(store).close(args.trade_id, close_books)
+            print(json.dumps(result_to_dict(result), ensure_ascii=False, indent=2))
             return 0
         if args.command == "scan":
             if not settings.api_key or not settings.api_secret:

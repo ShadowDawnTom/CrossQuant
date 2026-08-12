@@ -55,6 +55,9 @@ crossex-arb scan --assets BTC,ETH --with-order-book --shadow-db data/shadow.db -
 
 # 查看影子交易状态、实际匹配数量和残余敞口
 crossex-arb shadow-list --db data/shadow.db
+
+# 使用最新官方盘口模拟平仓
+crossex-arb shadow-close --db data/shadow.db --trade-id <trade_id>
 ```
 
 也可以不安装，直接运行：
