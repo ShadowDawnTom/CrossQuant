@@ -119,6 +119,20 @@ const DEFAULT_ENDPOINTS: Record<ExecutionVenue, { rest: string; websocket: strin
 const MAX_BUFFERED_DELTAS = 10_000;
 const MAX_PUBLISHED_LEVELS = 200;
 
+class SnapshotHttpError extends Error {
+  constructor(readonly status: number, readonly retryAfterMs: number | null) {
+    super(`snapshot_http_${status}`);
+  }
+}
+
+function retryAfterMs(value: string | null): number | null {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : null;
+}
+
 function finiteInteger(value: unknown): number | null {
   const parsed = typeof value === 'string' || typeof value === 'number' ? Number(value) : Number.NaN;
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
@@ -282,7 +296,7 @@ export class ExecutionMarketHub {
     this.maxReceiveSkewMs = options.maxReceiveSkewMs ?? 750;
     this.reconnectBaseMs = options.reconnectBaseMs ?? 500;
     this.bootstrapBaseMs = options.bootstrapBaseMs ?? 1_000;
-    this.rateLimitCooldownMs = options.rateLimitCooldownMs ?? 60_000;
+    this.rateLimitCooldownMs = options.rateLimitCooldownMs ?? 15 * 60_000;
     this.endpoints = { ...DEFAULT_ENDPOINTS };
     for (const venue of EXECUTION_VENUES) {
       if (options.endpoints?.[venue]) this.endpoints[venue] = options.endpoints[venue]!;
@@ -584,8 +598,8 @@ export class ExecutionMarketHub {
         const attempts = (this.bootstrapAttempts.get(key) ?? 0) + 1;
         this.bootstrapAttempts.set(key, attempts);
         // 418/429 表示交易所已限流，必须长冷却；其他故障也使用指数退避，禁止增量触发 REST 风暴。
-        const delay = /snapshot_http_(418|429)/.test(book.state.lastError)
-          ? this.rateLimitCooldownMs
+        const delay = error instanceof SnapshotHttpError && (error.status === 418 || error.status === 429)
+          ? Math.max(this.rateLimitCooldownMs, error.retryAfterMs ?? 0)
           : Math.min(30_000, this.bootstrapBaseMs * 2 ** Math.min(attempts - 1, 5));
         const timer = setTimeout(() => {
           this.bootstrapTimers.delete(key);
@@ -640,7 +654,7 @@ export class ExecutionMarketHub {
     else if (venue === 'OKX') url = `${this.endpoints.OKX.rest}/api/v5/market/books?instId=${encodeURIComponent(symbol)}&sz=400`;
     else url = `${this.endpoints.BYBIT.rest}/v5/market/orderbook?category=linear&symbol=${symbol}&limit=200`;
     const response = await this.fetchImpl(url, { signal: AbortSignal.timeout(8_000) });
-    if (!response.ok) throw new Error(`snapshot_http_${response.status}`);
+    if (!response.ok) throw new SnapshotHttpError(response.status, retryAfterMs(response.headers.get('retry-after')));
     const payload = object(await response.json());
     if (!payload) throw new Error('snapshot_schema_invalid');
     let bids: Level[] | null = null; let asks: Level[] | null = null;
