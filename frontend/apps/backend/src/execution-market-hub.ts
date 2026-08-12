@@ -454,7 +454,8 @@ export class ExecutionMarketHub {
     if (venue === 'GATE') {
       for (const base of this.symbols) socket.send(JSON.stringify({
         time: Math.floor(Date.now() / 1_000), channel: 'futures.order_book_update', event: 'subscribe',
-        payload: [nativeSymbol(venue, base), '100ms', '100'],
+        // Gate 的 level 过滤会漏掉范围外变化，但 update id 仍覆盖完整盘口，进而制造假断序。
+        payload: [nativeSymbol(venue, base), '100ms'],
       }));
     } else if (venue === 'BINANCE') {
       socket.send(JSON.stringify({ method: 'SUBSCRIBE', params: this.symbols.map((base) => `${nativeSymbol(venue, base).toLowerCase()}@depth@100ms`), id: Date.now() }));
