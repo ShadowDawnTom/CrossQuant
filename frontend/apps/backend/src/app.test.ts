@@ -337,12 +337,26 @@ interface TestContext {
 
 const resources: TestContext[] = [];
 
-async function createTestApp(options: { liveTradingEnabled?: boolean; publicReadOnly?: boolean; marketHub?: CrossExMarketHub; startMarketStream?: boolean; directory?: string } = {}): Promise<TestContext> {
+async function createTestApp(options: {
+  liveTradingEnabled?: boolean;
+  publicReadOnly?: boolean;
+  marketHub?: CrossExMarketHub;
+  startMarketStream?: boolean;
+  directory?: string;
+  browserAuth?: boolean;
+  authFetch?: typeof fetch;
+} = {}): Promise<TestContext> {
   const directory = options.directory ?? mkdtempSync(join(tmpdir(), 'gate-crossex-app-'));
   const config = loadConfig({
     GCT_DATA_DIR: directory,
     GCT_MIGRATIONS_DIR: resolve(process.cwd(), '../../migrations'),
     GCT_PUBLIC_READONLY: options.publicReadOnly ? '1' : '0',
+    ...(options.browserAuth ? {
+      GCT_AUTH_ENABLED: '1', GCT_AUTH_BASE_URL: 'https://crossquant.shadowdawn.xyz',
+      GCT_GOOGLE_CLIENT_ID: 'test-client-id', GCT_GOOGLE_CLIENT_SECRET: 'test-client-secret',
+      GCT_AUTH_SESSION_SECRET: '0123456789abcdef0123456789abcdef',
+      GCT_AUTH_ALLOWED_EMAILS: 'owner@example.com,operator@example.com',
+    } : {}),
   });
   const database = openDatabase(config.databasePath, config.migrationsDir);
   const vault = new MemoryCredentialVault();
@@ -362,6 +376,7 @@ async function createTestApp(options: { liveTradingEnabled?: boolean; publicRead
     tradingSession,
     marketHub: options.marketHub,
     startMarketStream: options.startMarketStream,
+    authFetch: options.authFetch,
     logger: false,
   });
   const context = { app, database, vault, gateway, publicMarketGateway, tradingSession, directory };
@@ -406,6 +421,22 @@ afterEach(async () => {
 });
 
 describe('local backend', () => {
+  it('protects frontend pages and API routes with the configured browser authentication', async () => {
+    const { app } = await createTestApp({ browserAuth: true });
+    const page = await app.inject({ method: 'GET', url: '/', headers: { host: '127.0.0.1:17840' } });
+    expect(page.statusCode).toBe(302);
+    expect(page.headers.location).toBe('/auth/login');
+
+    const api = await app.inject({ method: 'GET', url: '/api/execution-market/health', headers: { host: '127.0.0.1:17840' } });
+    expect(api.statusCode).toBe(401);
+    expect(api.json()).toEqual({ error: 'authentication_required' });
+
+    const login = await app.inject({ method: 'GET', url: '/auth/login', headers: { host: '127.0.0.1:17840' } });
+    expect(login.statusCode).toBe(200);
+    expect(login.headers['cache-control']).toBe('no-store');
+    expect(login.body).toContain('使用 Google 登录');
+  });
+
   it('enforces the public read-only boundary inside the backend', async () => {
     const { app, vault } = await createTestApp({ publicReadOnly: true });
     await vault.set(DEFAULT_CREDENTIAL_PROFILE, { apiKey: 'should-not-arm', apiSecret: 'should-not-arm' });

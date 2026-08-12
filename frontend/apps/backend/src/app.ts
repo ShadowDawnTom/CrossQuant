@@ -59,6 +59,7 @@ import {
   type SelectableCredentialStorageProvider,
 } from './credential-vault.js';
 import { OneTimeCsrfTokens } from './csrf.js';
+import { BrowserAuth } from './browser-auth.js';
 import { GateApiError, type GateCrossExAccount, type GateCrossExPortfolio, type GateCrossExPosition, type GateCrossExRiskLimit, type GateCrossExSymbol, type GateTransferRecord, type GateAccountBookRecord, type PortfolioOperationsCrossExGateway, type ReadOnlyCrossExGateway, type TradingCrossExGateway } from './crossex-client.js';
 import { CandleStore } from './candle-store.js';
 import { FundingHistoryService } from './funding-history.js';
@@ -204,6 +205,7 @@ export interface BuildAppOptions {
   startMarketStream?: boolean;
   logger?: boolean;
   rateLimitMax?: number;
+  authFetch?: typeof fetch;
 }
 
 function noControlCharacters(value: string): boolean {
@@ -704,6 +706,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
           },
   });
 
+  const browserAuth = new BrowserAuth(config.browserAuth, options.authFetch);
   const maintenanceResult = runDatabaseMaintenance(database);
   if (Object.values(maintenanceResult).some((deleted) => deleted > 0)) {
     app.log.info(maintenanceResult, 'pruned expired local database records');
@@ -714,6 +717,15 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   await app.register(cors, { origin: [...config.allowedOrigins], credentials: false });
   await app.register(formbody, { bodyLimit: 16 * 1024 });
   await app.register(websocket);
+
+  // 必须先挂全局鉴权，再注册静态页、REST 和 WebSocket，防止早注册路由绕过登录。
+  app.addHook('onRequest', async (request, reply) => browserAuth.guard(request, reply));
+  if (config.browserAuth.enabled) {
+    app.get('/auth/login', async (_request, reply) => browserAuth.renderLogin(reply));
+    app.get('/auth/google', async (_request, reply) => browserAuth.begin(reply));
+    app.get('/auth/google/callback', async (request, reply) => browserAuth.complete(request, reply));
+    app.post('/auth/logout', async (_request, reply) => browserAuth.logout(reply));
+  }
 
   const frontendIndexPath = join(config.frontendDistPath, 'index.html');
   const frontendAssetsPath = join(config.frontendDistPath, 'assets');

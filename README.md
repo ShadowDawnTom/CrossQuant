@@ -94,6 +94,17 @@ python -m crossex_arb scan --assets BTC,ETH
 
 ## 配置
 
+### 公网登录保护
+
+公网部署可启用后端 Google OAuth。启用后，网页、REST API 和 WebSocket 都必须携带有效的服务端签名会话；邮箱不在白名单时，即使 Google 登录成功也会被拒绝。
+
+1. 在 Google Cloud Console 创建 OAuth 2.0 Web Client。
+2. 将授权重定向 URI 设置为 `https://crossquant.shadowdawn.xyz/auth/google/callback`。
+3. 在服务器受控环境中配置 `GCT_GOOGLE_CLIENT_ID`、`GCT_GOOGLE_CLIENT_SECRET` 和至少 32 字节的随机 `GCT_AUTH_SESSION_SECRET`。
+4. 配置 `GCT_AUTH_ALLOWED_EMAILS`，确认至少有一个账号能完成登录后，再设置 `GCT_AUTH_ENABLED=1` 并重启。
+
+不要把 OAuth Client Secret 或 Session Secret 提交到 Git。会话 Cookie 使用 `HttpOnly`、`Secure`、`SameSite=Lax`，默认有效期为 12 小时。
+
 | 变量 | 默认值 | 含义 |
 |---|---:|---|
 | `ARB_SCENARIO_HORIZON_HOURS` | `24` | 当前费率快照情景的计算时长 |

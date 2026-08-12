@@ -15,6 +15,14 @@ export interface BackendConfig {
   allowedOrigin: string;
   allowedOrigins: ReadonlySet<string>;
   allowedHosts: ReadonlySet<string>;
+  browserAuth: {
+    enabled: boolean;
+    baseUrl: string;
+    googleClientId: string;
+    googleClientSecret: string;
+    sessionSecret: string;
+    allowedEmails: ReadonlySet<string>;
+  };
   gateRestBaseUrl: string;
   gatePublicWebSocketUrl: string;
   gatePrivateWebSocketUrl: string;
@@ -67,6 +75,19 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     .filter(Boolean);
 
   const allowedOrigin = environment.GCT_FRONTEND_ORIGIN ?? `http://127.0.0.1:${frontendPort}`;
+  const authEnabled = environment.GCT_AUTH_ENABLED === '1';
+  const authBaseUrl = (environment.GCT_AUTH_BASE_URL ?? allowedOrigin).replace(/\/$/, '');
+  const googleClientId = environment.GCT_GOOGLE_CLIENT_ID?.trim() ?? '';
+  const googleClientSecret = environment.GCT_GOOGLE_CLIENT_SECRET?.trim() ?? '';
+  const sessionSecret = environment.GCT_AUTH_SESSION_SECRET?.trim() ?? '';
+  const allowedEmails = new Set((environment.GCT_AUTH_ALLOWED_EMAILS ?? '')
+    .split(',').map((email) => email.trim().toLowerCase()).filter(Boolean));
+  if (authEnabled) {
+    if (!authBaseUrl.startsWith('https://')) throw new Error('GCT_AUTH_BASE_URL must use https when authentication is enabled');
+    if (!googleClientId || !googleClientSecret) throw new Error('Google OAuth credentials are required when authentication is enabled');
+    if (Buffer.byteLength(sessionSecret, 'utf8') < 32) throw new Error('GCT_AUTH_SESSION_SECRET must contain at least 32 bytes');
+    if (allowedEmails.size === 0) throw new Error('GCT_AUTH_ALLOWED_EMAILS must contain at least one email');
+  }
   // Browsers send the loopback host the user actually typed; localhost, 127.0.0.1, and [::1]
   // variants of the local UI and backend are all the same trust domain.
   const loopbackOrigins = [frontendPort, port].flatMap((loopbackPort) => [
@@ -86,6 +107,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     allowedOrigin,
     allowedOrigins: new Set([allowedOrigin, ...loopbackOrigins]),
     allowedHosts: new Set(['127.0.0.1', 'localhost', '::1', ...configuredHosts]),
+    browserAuth: {
+      enabled: authEnabled, baseUrl: authBaseUrl, googleClientId, googleClientSecret, sessionSecret, allowedEmails,
+    },
     gateRestBaseUrl: environment.GCT_GATE_REST_URL ?? 'https://api.gateio.ws/api/v4',
     gatePublicWebSocketUrl: environment.GCT_GATE_PUBLIC_WS_URL ?? 'wss://api.gateio.ws/ws/crossex/public',
     gatePrivateWebSocketUrl: environment.GCT_GATE_PRIVATE_WS_URL ?? 'wss://api.gateio.ws/ws/crossex',
