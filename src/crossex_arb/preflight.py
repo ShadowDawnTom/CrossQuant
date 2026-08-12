@@ -74,8 +74,10 @@ def build_preflight_report(
     symbols = (opportunity.long_symbol, opportunity.short_symbol)
     blockers: list[str] = []
     checks: list[str] = []
-    if opportunity.execution_status != "EXECUTABLE_BOOK_VERIFIED" or opportunity.executable_quantity is None:
-        blockers.append("候选尚未通过可执行盘口校验")
+    if opportunity.execution_status != "EXECUTION_READY" or opportunity.market_data_quality != "LIVE_SYNCHRONIZED":
+        blockers.append("候选行情不是持续维护且双腿同步的 execution-ready 订单簿")
+    if opportunity.executable_quantity is None:
+        blockers.append("候选缺少已验证的下单数量")
     target = opportunity.target_notional
     if target is None or target <= 0:
         blockers.append("候选缺少有效目标名义价值")

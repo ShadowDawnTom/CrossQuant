@@ -189,13 +189,14 @@ def _scan(
             f"  成本预算={item.trading_cost_budget:.4%}  标记价偏离={item.mark_divergence:.3%}  "
             f"行情时差={item.ticker_time_skew_ms}ms  首次结算对齐={aligned}"
         )
-        if item.execution_status == "EXECUTABLE_BOOK_VERIFIED":
+        if item.execution_status in {"RESEARCH_DEPTH_VERIFIED", "EXECUTION_READY"}:
             print(
                 f"  可执行数量={item.executable_quantity}  LONG入场VWAP={item.long_entry_vwap}  "
                 f"SHORT入场VWAP={item.short_entry_vwap}\n"
                 f"  盘口净情景收益={item.executable_net_snapshot_return:.4%}  "
                 f"盘口净情景年化={item.executable_snapshot_annualized:.2%}  盘口时差={item.book_time_skew_ms}ms"
             )
+            print(f"  行情质量={item.market_data_quality}  执行状态={item.execution_status}")
     if shadow_result is not None:
         print(
             f"\n影子交易 {shadow_result.trade_id}  状态={shadow_result.state}  "

@@ -19,7 +19,7 @@ def opportunity():
         net_snapshot_return=Decimal("0.002"), snapshot_annualized=Decimal("0.73"),
         scenario_horizon_hours=Decimal(24), mark_divergence=Decimal(0), ticker_time_skew_ms=0,
         long_ticker_age_ms=0, short_ticker_age_ms=0, funding_times_aligned=True,
-        execution_status="EXECUTABLE_BOOK_VERIFIED", target_notional=Decimal(100),
+        execution_status="EXECUTION_READY", market_data_quality="LIVE_SYNCHRONIZED", target_notional=Decimal(100),
         executable_quantity=Decimal("0.999"),
     )
 
@@ -61,6 +61,15 @@ class PreflightTests(unittest.TestCase):
         self.assertFalse(value.approved)
         self.assertEqual(value.orders, ())
         self.assertGreaterEqual(len(value.blockers), 4)
+
+    def test_rest_snapshot_can_never_approve_live_preflight(self):
+        from dataclasses import replace
+
+        value = report(opportunity=replace(
+            opportunity(), execution_status="RESEARCH_DEPTH_VERIFIED", market_data_quality="REST_SNAPSHOT"
+        ))
+        self.assertFalse(value.approved)
+        self.assertIn("execution-ready", value.blockers[0])
 
 
 if __name__ == "__main__":

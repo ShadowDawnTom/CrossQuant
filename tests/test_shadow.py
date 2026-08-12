@@ -16,7 +16,8 @@ def opportunity() -> Opportunity:
         trading_cost_budget=Decimal("0.001"), net_snapshot_return=Decimal("0.002"),
         snapshot_annualized=Decimal("0.73"), scenario_horizon_hours=Decimal("24"),
         mark_divergence=Decimal("0"), ticker_time_skew_ms=10, long_ticker_age_ms=10,
-        short_ticker_age_ms=10, funding_times_aligned=True, execution_status="EXECUTABLE_BOOK_VERIFIED",
+        short_ticker_age_ms=10, funding_times_aligned=True, execution_status="RESEARCH_DEPTH_VERIFIED",
+        market_data_quality="REST_SNAPSHOT",
         executable_quantity=Decimal("1"), target_notional=Decimal("100"),
     )
 

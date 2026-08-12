@@ -14,6 +14,7 @@
 - 价格缺失、时间戳无效、行情陈旧或跨所时差过大时直接拒绝候选
 - JSON 输出包含拒绝原因；可将原始市场快照追加到 UTF-8 JSONL
 - 可选并发读取 Gate、Binance、OKX、Bybit 官方永续深度，统一成基础币数量后验证多档 VWAP
+- REST 多档深度明确标记为 `REST_SNAPSHOT / RESEARCH_DEPTH_VERIFIED`，不会冒充低延迟可执行行情
 - 按目标金额、共同下单步长和最小名义价值验证容量；暂不支持的交易所明确拒绝
 - 盘口缺失、陈旧、跨所时间差过大、买卖盘交叉或深度不足时直接拒绝
 - SQLite 影子执行账本，支持幂等开仓、双腿部分/拒绝、裸露修复和人工介入状态
@@ -60,7 +61,7 @@ crossex-arb shadow-list --db data/shadow.db
 # 使用最新官方盘口模拟平仓
 crossex-arb shadow-close --db data/shadow.db --trade-id <trade_id>
 
-# 账户只读预检；仅输出 blocker 或双腿 FOK 草案，不发送订单
+# 账户只读预检；当前 REST 深度会被 execution-ready 门槛阻断，不发送订单
 crossex-arb scan --assets BTC,ETH --with-order-book --preflight --json
 ```
 

@@ -181,10 +181,11 @@ class StrategyTests(unittest.TestCase):
             order_books=self.valid_books(), target_notional=Decimal("100"), now_ms=NOW_MS,
         )
         row = result.opportunities[0]
-        self.assertEqual(row.execution_status, "EXECUTABLE_BOOK_VERIFIED")
+        self.assertEqual(row.execution_status, "RESEARCH_DEPTH_VERIFIED")
+        self.assertEqual(row.market_data_quality, "REST_SNAPSHOT")
         self.assertEqual(row.executable_quantity, Decimal("0.999"))
         self.assertIsNotNone(row.executable_net_snapshot_return)
-        self.assertTrue(result.to_dict()["executable"])
+        self.assertFalse(result.to_dict()["executable"])
 
     def test_missing_stale_and_shallow_books_fail_closed(self) -> None:
         funding = [

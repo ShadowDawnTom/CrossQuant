@@ -245,8 +245,8 @@ class ShadowExecutionEngine:
         existing = self.store.existing(idempotency_key)
         if existing is not None:
             return existing
-        if opportunity.execution_status != "EXECUTABLE_BOOK_VERIFIED":
-            raise ValueError("只有通过盘口校验的候选才能进入影子执行")
+        if opportunity.execution_status not in {"RESEARCH_DEPTH_VERIFIED", "EXECUTION_READY"}:
+            raise ValueError("只有通过盘口深度校验的候选才能进入影子执行")
         for ratio in (long_fill_ratio, short_fill_ratio):
             if ratio < 0 or ratio > 1:
                 raise ValueError("模拟成交比例必须在 0 到 1 之间")

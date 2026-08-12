@@ -143,6 +143,7 @@ class Opportunity:
     short_ticker_age_ms: int
     funding_times_aligned: bool
     execution_status: str = "UNVERIFIED_NO_ORDER_BOOK"
+    market_data_quality: str = "REFERENCE_ONLY"
     target_notional: Decimal | None = None
     executable_quantity: Decimal | None = None
     long_entry_vwap: Decimal | None = None
@@ -174,7 +175,7 @@ class ScanResult:
 
     def to_dict(self) -> dict[str, object]:
         executable = bool(self.opportunities) and all(
-            item.execution_status == "EXECUTABLE_BOOK_VERIFIED" for item in self.opportunities
+            item.execution_status == "EXECUTION_READY" for item in self.opportunities
         )
         return {
             "model": "current_funding_snapshot_cashflow_scenario",
