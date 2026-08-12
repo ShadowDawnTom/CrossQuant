@@ -38,10 +38,12 @@ function harness(states: string[] = ['FILLED', 'FILLED']) {
   let sequence = 0;
   const orders = new Map<string, ExecutionOrder>();
   const runtime = {
-    createOrder: async (input: { side: 'BUY' | 'SELL'; quantity: string }, metadata: { clientOrderId: string }) => {
+    createOrder: async (input: { side: 'BUY' | 'SELL'; quantity: string; type: 'LIMIT' | 'MARKET'; price?: string }, metadata: { clientOrderId: string }) => {
       sequence += 1;
       if (states[sequence - 1] === 'THROW') throw new Error('definitive submit rejection');
       const created = order(String(sequence), input.side, input.quantity, states[sequence - 1] ?? 'FILLED');
+      created.type = input.type;
+      created.price = input.price ?? null;
       created.clientOrderId = metadata.clientOrderId;
       created.executedQuantity = created.state === 'FILLED' ? input.quantity : '0';
       orders.set(created.id, created);
@@ -87,6 +89,7 @@ describe('FundingArbitrageEngine', () => {
     expect(opened.openQuantity).toBe('0.1');
     expect((await engine.start(input)).id).toBe(opened.id);
     expect(orders.size).toBe(2);
+    expect([...orders.values()].every((item) => item.type === 'LIMIT' && item.price !== null)).toBe(true);
   });
 
   it('一腿未成交时用 reduce-only IOC 反向清掉已成交腿', async () => {

@@ -313,16 +313,20 @@ export class FundingArbitrageEngine {
       quality: pair.quality, exchangeSkewMs: pair.exchangeSkewMs, receiveSkewMs: pair.receiveSkewMs,
     });
     this.busy = true;
-    try { return await this.executeEntry(id); } finally { this.busy = false; }
+    try { return await this.executeEntry(id, pair); } finally { this.busy = false; }
   }
 
-  private async submitLeg(trade: FundingTradeRecord, leg: 'long' | 'short', phase: 'entry' | 'exit', quantity: string): Promise<ExecutionOrder> {
+  private async submitLeg(trade: FundingTradeRecord, leg: 'long' | 'short', phase: 'entry' | 'exit', quantity: string,
+    protectedPrice?: string): Promise<ExecutionOrder> {
     const isLong = leg === 'long';
     const venue = isLong ? trade.longVenue : trade.shortVenue;
     const entry = phase === 'entry';
     const side = isLong ? (entry ? 'BUY' : 'SELL') : (entry ? 'SELL' : 'BUY');
-    return this.runtime.createOrder({ symbol: symbol(venue, trade.asset), side, type: 'MARKET',
-      timeInForce: trade.executionMode, quantity, reduceOnly: !entry }, {
+    // FOK 用本次原子盘口能完全成交的最差价做保护限价；平仓固定 IOC，避免不支持 Market+FOK 的交易所语义差异。
+    const protectedFok = entry && trade.executionMode === 'FOK';
+    return this.runtime.createOrder({ symbol: symbol(venue, trade.asset), side,
+      type: protectedFok ? 'LIMIT' : 'MARKET', timeInForce: entry ? trade.executionMode : 'IOC',
+      quantity, ...(protectedFok ? { price: protectedPrice } : {}), reduceOnly: !entry }, {
       strategyId: trade.id, strategyLeg: isLong ? 'left' : 'right', riskReducing: !entry,
       clientOrderId: clientOrderId(trade.id, phase, leg),
     });
@@ -343,13 +347,17 @@ export class FundingArbitrageEngine {
     return await this.runtime.awaitTerminalOrder(settled.id, this.orderTimeoutMs);
   }
 
-  private async executeEntry(id: string): Promise<FundingTradeRecord> {
+  private async executeEntry(id: string, pair: ExecutionPairSnapshot): Promise<FundingTradeRecord> {
     let trade = this.update(id, { state: 'SUBMITTING', phase: 'ENTRY' });
+    const quantity = new Decimal(trade.requestedQuantity);
+    const longProtection = executablePrice(pair.longBook.asks, quantity)?.last.toString();
+    const shortProtection = executablePrice(pair.shortBook.bids, quantity)?.last.toString();
+    if (!longProtection || !shortProtection) return this.manual(id, 'protected_price_unavailable', {});
     const longClient = clientOrderId(id, 'entry', 'long');
     const shortClient = clientOrderId(id, 'entry', 'short');
     const submitted = await Promise.allSettled([
-      this.submitLeg(trade, 'long', 'entry', trade.requestedQuantity),
-      this.submitLeg(trade, 'short', 'entry', trade.requestedQuantity),
+      this.submitLeg(trade, 'long', 'entry', trade.requestedQuantity, longProtection),
+      this.submitLeg(trade, 'short', 'entry', trade.requestedQuantity, shortProtection),
     ]);
     const [longInitial, shortInitial] = await Promise.all([
       this.resolveSubmitted(longClient, submitted[0]!), this.resolveSubmitted(shortClient, submitted[1]!),

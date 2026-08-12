@@ -881,6 +881,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   let fundingArbitrageMonitorTimer: ReturnType<typeof setInterval> | null = null;
   let executionHealthMonitorTimer: ReturnType<typeof setInterval> | null = null;
   let previousExecutionHealth = executionMarketHub.health();
+  const previousBookCounters = new Map<string, { rebuilds: number; sequenceGaps: number }>();
   const schedulePortfolioReconciliation = () => {
     if (!options.startMarketStream) return;
     const interval = Math.round(5 * 60_000 * (0.9 + Math.random() * 0.2));
@@ -927,6 +928,19 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
           void alertDispatcher.emit({ eventType: 'websocket_reconnect_storm', severity: 'warning',
             message: `${venue.venue} WebSocket 短期重连过多`, details: { previous: previous.reconnects, current: venue.reconnects },
             dedupKey: `reconnect-storm:${venue.venue}:${venue.reconnects}` });
+        }
+        for (const base of current.symbols) {
+          try {
+            const book = executionMarketHub.book(venue.venue, base);
+            const key = `${venue.venue}:${base}`;
+            const previousBook = previousBookCounters.get(key);
+            if (previousBook && (book.sequenceGaps > previousBook.sequenceGaps || book.rebuilds > previousBook.rebuilds)) {
+              void alertDispatcher.emit({ eventType: 'order_book_rebuild', severity: 'warning',
+                message: `${key} 订单簿断序后重建`, details: { rebuilds: book.rebuilds, sequenceGaps: book.sequenceGaps,
+                  lastError: book.lastError }, dedupKey: `book-rebuild:${key}:${book.rebuilds}:${book.sequenceGaps}` });
+            }
+            previousBookCounters.set(key, { rebuilds: book.rebuilds, sequenceGaps: book.sequenceGaps });
+          } catch { /* 未配置的盘口由整体 health 告警处理。 */ }
         }
       }
       previousExecutionHealth = current;
