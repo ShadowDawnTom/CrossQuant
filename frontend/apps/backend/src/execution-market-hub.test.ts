@@ -52,6 +52,27 @@ describe('OrderBookReplica', () => {
   });
 });
 
+describe('venue payload parsing', () => {
+  it('accepts Gate object levels without dropping sequence updates', () => {
+    const hub = new ExecutionMarketHub(fetch, { symbols: ['BTC'] });
+    const internal = hub as unknown as {
+      books: Map<string, OrderBookReplica>;
+      multipliers: Map<string, number>;
+      onGate: (message: Record<string, unknown>) => void;
+    };
+    internal.multipliers.set('GATE:BTC', 0.001);
+    const book = internal.books.get('GATE:BTC')!;
+    book.seed([['99', '1']], [['102', '1']], 10, 1_800_000_000_000, Date.now());
+    internal.onGate({
+      channel: 'futures.order_book_update', event: 'update',
+      result: { s: 'BTC_USDT', U: 11, u: 12, t: 1_800_000_000_100, b: [{ p: '100', s: 2000 }], a: [{ p: '101', s: 3000 }] },
+    });
+    expect(book.state.sequence).toBe(12);
+    expect(book.state.bids.get('100')).toBe('2');
+    expect(book.state.asks.get('101')).toBe('3');
+  });
+});
+
 describe('ExecutionMarketHub certification', () => {
   it('fails closed on stale books and certifies only synchronized, time-aligned pairs', () => {
     const now = 1_800_000_000_000;

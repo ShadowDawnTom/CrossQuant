@@ -135,9 +135,11 @@ function levels(value: unknown, multiplier = 1): Level[] | null {
   if (!Array.isArray(value)) return null;
   const parsed: Level[] = [];
   for (const row of value) {
-    if (!Array.isArray(row) || row.length < 2) return null;
-    const price = positiveText(row[0]);
-    const rawQuantity = typeof row[1] === 'string' || typeof row[1] === 'number' ? Number(row[1]) : Number.NaN;
+    const item = object(row);
+    const rawPrice = Array.isArray(row) && row.length >= 2 ? row[0] : item?.p;
+    const rawSize = Array.isArray(row) && row.length >= 2 ? row[1] : item?.s;
+    const price = positiveText(rawPrice);
+    const rawQuantity = typeof rawSize === 'string' || typeof rawSize === 'number' ? Number(rawSize) : Number.NaN;
     if (!price || !Number.isFinite(rawQuantity) || rawQuantity < 0) return null;
     parsed.push([price, String(rawQuantity * multiplier)]);
   }
