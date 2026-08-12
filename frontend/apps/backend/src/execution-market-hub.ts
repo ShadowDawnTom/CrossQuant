@@ -626,13 +626,17 @@ export class ExecutionMarketHub {
   private async bootstrap(venue: ExecutionVenue, base: string, book: OrderBookReplica, generation: number): Promise<void> {
       const snapshot = await this.fetchSnapshot(venue, base);
       if (book.state.generation !== generation) return;
-      const buffered = [...book.state.buffered];
       if (venue === 'OKX' || venue === 'BYBIT') {
         // REST 快照与这两所的 WS 序列没有官方桥接规则，只能等 WS snapshot 后才能认证。
         if (!book.state.synchronized) book.state.rebuilding = true;
         return;
       }
       if (venue === 'BINANCE') {
+        // REST 响应可能比对应的 WS 增量先到，短暂等待同一份快照被增量追上，避免反复请求最新快照。
+        await this.waitForSnapshotBridge(book, generation, (delta) => (
+          delta.last >= snapshot.sequence && delta.first <= snapshot.sequence
+        ));
+        const buffered = [...book.state.buffered];
         const firstIndex = buffered.findIndex((delta) => delta.last >= snapshot.sequence
           && delta.first <= snapshot.sequence && delta.last >= snapshot.sequence);
         if (firstIndex === -1) throw new Error('binance_snapshot_bridge_missing');
@@ -650,6 +654,10 @@ export class ExecutionMarketHub {
         }
         return;
       }
+      await this.waitForSnapshotBridge(book, generation, (delta) => (
+        delta.first <= snapshot.sequence + 1 && delta.last >= snapshot.sequence + 1
+      ));
+      const buffered = [...book.state.buffered];
       const firstIndex = buffered.findIndex(
         (delta) => delta.first <= snapshot.sequence + 1 && delta.last >= snapshot.sequence + 1,
       );
@@ -658,6 +666,22 @@ export class ExecutionMarketHub {
       for (const delta of buffered.slice(firstIndex)) {
         if (!book.apply(delta, 'range')) throw new Error(book.state.lastError ?? 'bootstrap_replay_failed');
       }
+  }
+
+  /**
+   * 等待 WS 增量覆盖刚拿到的 REST 快照序号。
+   * 只等当前重建代次，超时仍然失败关闭，不能拿不连续的盘口通过认证。
+   */
+  private async waitForSnapshotBridge(
+    book: OrderBookReplica,
+    generation: number,
+    matches: (delta: Delta) => boolean,
+  ): Promise<void> {
+    const deadline = Date.now() + 3_000;
+    while (book.state.generation === generation && !book.state.buffered.some(matches)) {
+      if (Date.now() >= deadline) return;
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
   }
 
   private async fetchSnapshot(venue: ExecutionVenue, base: string): Promise<{ bids: Level[]; asks: Level[]; sequence: number; exchangeTimestamp: number }> {

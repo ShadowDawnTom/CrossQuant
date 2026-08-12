@@ -74,6 +74,31 @@ describe('venue payload parsing', () => {
 });
 
 describe('ExecutionMarketHub certification', () => {
+  it('waits for a websocket delta that bridges the REST snapshot', async () => {
+    vi.useFakeTimers();
+    const hub = new ExecutionMarketHub(fetch, { symbols: ['BTC'] });
+    const book = new OrderBookReplica('GATE', 'BTC');
+    const generation = book.beginRebuild('test');
+    book.buffer(delta(8, 10));
+    const internal = hub as unknown as {
+      waitForSnapshotBridge: (
+        replica: OrderBookReplica,
+        currentGeneration: number,
+        matches: (update: ReturnType<typeof delta>) => boolean,
+      ) => Promise<void>;
+    };
+    const waiting = internal.waitForSnapshotBridge(
+      book,
+      generation,
+      (update) => update.first <= 11 && update.last >= 11,
+    );
+    setTimeout(() => book.buffer(delta(11, 12)), 100);
+    await vi.advanceTimersByTimeAsync(100);
+    await waiting;
+    expect(book.state.buffered.some((update) => update.first <= 11 && update.last >= 11)).toBe(true);
+    hub.stop();
+  });
+
   it('fails closed on stale books and certifies only synchronized, time-aligned pairs', () => {
     const now = 1_800_000_000_000;
     const hub = new ExecutionMarketHub(fetch, { symbols: ['BTC'], maxBookAgeMs: 1_000, maxExchangeSkewMs: 100, maxReceiveSkewMs: 100 });
