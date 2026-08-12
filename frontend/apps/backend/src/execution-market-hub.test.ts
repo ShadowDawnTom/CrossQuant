@@ -57,10 +57,10 @@ describe('venue payload parsing', () => {
     const hub = new ExecutionMarketHub(fetch, { symbols: ['BTC'] });
     const internal = hub as unknown as {
       books: Map<string, OrderBookReplica>;
-      multipliers: Map<string, number>;
+      multipliers: Map<string, string>;
       onGate: (message: Record<string, unknown>) => void;
     };
-    internal.multipliers.set('GATE:BTC', 0.001);
+    internal.multipliers.set('GATE:BTC', '0.001');
     const book = internal.books.get('GATE:BTC')!;
     book.seed([['99', '1']], [['102', '1']], 10, 1_800_000_000_000, Date.now());
     internal.onGate({

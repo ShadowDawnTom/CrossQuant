@@ -1,4 +1,5 @@
 import WebSocket from 'ws';
+import { Decimal } from 'decimal.js';
 
 export const EXECUTION_VENUES = ['GATE', 'BINANCE', 'OKX', 'BYBIT'] as const;
 export type ExecutionVenue = typeof EXECUTION_VENUES[number];
@@ -145,7 +146,7 @@ function positiveText(value: unknown): string | null {
   return Number.isFinite(parsed) && parsed > 0 ? text : null;
 }
 
-function levels(value: unknown, multiplier = 1): Level[] | null {
+function levels(value: unknown, multiplier = '1'): Level[] | null {
   if (!Array.isArray(value)) return null;
   const parsed: Level[] = [];
   for (const row of value) {
@@ -153,9 +154,14 @@ function levels(value: unknown, multiplier = 1): Level[] | null {
     const rawPrice = Array.isArray(row) && row.length >= 2 ? row[0] : item?.p;
     const rawSize = Array.isArray(row) && row.length >= 2 ? row[1] : item?.s;
     const price = positiveText(rawPrice);
-    const rawQuantity = typeof rawSize === 'string' || typeof rawSize === 'number' ? Number(rawSize) : Number.NaN;
-    if (!price || !Number.isFinite(rawQuantity) || rawQuantity < 0) return null;
-    parsed.push([price, String(rawQuantity * multiplier)]);
+    if (!price || (typeof rawSize !== 'string' && typeof rawSize !== 'number')) return null;
+    try {
+      const quantity = new Decimal(String(rawSize));
+      if (!quantity.isFinite() || quantity.isNegative()) return null;
+      parsed.push([price, quantity.mul(multiplier).toString()]);
+    } catch {
+      return null;
+    }
   }
   return parsed;
 }
@@ -272,7 +278,7 @@ export class ExecutionMarketHub {
   private readonly symbols: string[];
   private readonly books = new Map<string, OrderBookReplica>();
   private readonly connections = new Map<ExecutionVenue, VenueConnection>();
-  private readonly multipliers = new Map<string, number>();
+  private readonly multipliers = new Map<string, string>();
   private readonly bootstrapTasks = new Map<string, Promise<void>>();
   private readonly bootstrapAttempts = new Map<string, number>();
   private readonly bootstrapTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -583,8 +589,8 @@ export class ExecutionMarketHub {
     }
   }
 
-  private multiplier(venue: ExecutionVenue, base: string | undefined): number {
-    return base ? this.multipliers.get(this.key(venue, base)) ?? 1 : 1;
+  private multiplier(venue: ExecutionVenue, base: string | undefined): string {
+    return base ? this.multipliers.get(this.key(venue, base)) ?? '1' : '1';
   }
 
   private requestBootstrap(venue: ExecutionVenue, base: string, book: OrderBookReplica, generation: number): void {
@@ -603,12 +609,17 @@ export class ExecutionMarketHub {
           : Math.min(30_000, this.bootstrapBaseMs * 2 ** Math.min(attempts - 1, 5));
         const timer = setTimeout(() => {
           this.bootstrapTimers.delete(key);
-          this.requestBootstrap(venue, base, book, generation);
+          this.requestBootstrap(venue, base, book, book.state.generation);
         }, delay);
         timer.unref?.();
         this.bootstrapTimers.set(key, timer);
       })
-      .finally(() => { this.bootstrapTasks.delete(key); });
+      .finally(() => {
+        this.bootstrapTasks.delete(key);
+        if (!this.stopped && !book.state.synchronized && !this.bootstrapTimers.has(key)) {
+          this.requestBootstrap(venue, base, book, book.state.generation);
+        }
+      });
     this.bootstrapTasks.set(key, task);
   }
 
@@ -621,11 +632,11 @@ export class ExecutionMarketHub {
         if (!book.state.synchronized) book.state.rebuilding = true;
         return;
       }
-      book.seed(snapshot.bids, snapshot.asks, snapshot.sequence, snapshot.exchangeTimestamp, Date.now());
       if (venue === 'BINANCE') {
         const firstIndex = buffered.findIndex((delta) => delta.last >= snapshot.sequence
           && delta.first <= snapshot.sequence && delta.last >= snapshot.sequence);
         if (firstIndex === -1) throw new Error('binance_snapshot_bridge_missing');
+        book.seed(snapshot.bids, snapshot.asks, snapshot.sequence, snapshot.exchangeTimestamp, Date.now());
         if (firstIndex >= 0) {
           const first = buffered[firstIndex]!;
           applyLevels(book.state.bids, first.bids);
@@ -639,11 +650,14 @@ export class ExecutionMarketHub {
         }
         return;
       }
-      const snapshotSequence = snapshot.sequence;
-      for (const delta of buffered) {
+      const firstIndex = buffered.findIndex(
+        (delta) => delta.first <= snapshot.sequence + 1 && delta.last >= snapshot.sequence + 1,
+      );
+      if (firstIndex === -1) throw new Error('gate_snapshot_bridge_missing');
+      book.seed(snapshot.bids, snapshot.asks, snapshot.sequence, snapshot.exchangeTimestamp, Date.now());
+      for (const delta of buffered.slice(firstIndex)) {
         if (!book.apply(delta, 'range')) throw new Error(book.state.lastError ?? 'bootstrap_replay_failed');
       }
-      if ((book.state.sequence ?? snapshotSequence) <= snapshotSequence) throw new Error('gate_snapshot_bridge_missing');
   }
 
   private async fetchSnapshot(venue: ExecutionVenue, base: string): Promise<{ bids: Level[]; asks: Level[]; sequence: number; exchangeTimestamp: number }> {
@@ -693,9 +707,14 @@ export class ExecutionMarketHub {
     if (!response.ok) throw new Error(`contract_metadata_http_${response.status}`);
     const payload = object(await response.json());
     const row = venue === 'GATE' ? payload : Array.isArray(payload?.data) ? object(payload.data[0]) : null;
-    const multiplier = Number(venue === 'GATE' ? row?.quanto_multiplier : row?.ctVal);
-    if (!Number.isFinite(multiplier) || multiplier <= 0) throw new Error('contract_multiplier_invalid');
-    this.multipliers.set(this.key(venue, base), multiplier);
+    const rawMultiplier = venue === 'GATE' ? row?.quanto_multiplier : row?.ctVal;
+    try {
+      const multiplier = new Decimal(String(rawMultiplier));
+      if (!multiplier.isFinite() || !multiplier.isPositive()) throw new Error('contract_multiplier_invalid');
+      this.multipliers.set(this.key(venue, base), multiplier.toString());
+    } catch {
+      throw new Error('contract_multiplier_invalid');
+    }
   }
 }
 
