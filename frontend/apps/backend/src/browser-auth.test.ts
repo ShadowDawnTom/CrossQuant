@@ -9,6 +9,7 @@ const config: BrowserAuthConfig = {
   googleClientSecret: 'google-client-secret',
   sessionSecret: '0123456789abcdef0123456789abcdef',
   allowedEmails: new Set(['owner@example.com', 'operator@example.com']),
+  traderEmails: new Set(['owner@example.com']),
 };
 
 function cookieValue(header: string | string[] | undefined, name: string): string {

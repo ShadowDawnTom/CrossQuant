@@ -16,6 +16,7 @@ export interface BrowserAuthConfig {
   googleClientSecret: string;
   sessionSecret: string;
   allowedEmails: ReadonlySet<string>;
+  traderEmails: ReadonlySet<string>;
 }
 
 function encode(value: string): string {
@@ -84,6 +85,13 @@ export class BrowserAuth {
     const payload = verifySignedValue(cookies(request).get(SESSION_COOKIE), this.config.sessionSecret);
     const email = payload?.email.toLowerCase();
     return email && this.config.allowedEmails.has(email) ? email : null;
+  }
+
+  /** 未开启网页登录时保留本地开发能力；生产开启鉴权后必须在交易员白名单内。 */
+  canTrade(request: FastifyRequest): boolean {
+    if (!this.config.enabled) return true;
+    const email = this.currentEmail(request);
+    return email !== null && this.config.traderEmails.has(email);
   }
 
   guard(request: FastifyRequest, reply: FastifyReply): FastifyReply | void {

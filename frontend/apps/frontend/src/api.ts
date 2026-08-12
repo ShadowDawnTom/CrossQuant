@@ -129,9 +129,48 @@ export type {
 };
 export type Position = ExecutionPosition;
 
+export interface FundingCandidateExecution {
+  id: string; asset: string; longVenue: string; shortVenue: string; quantity: string;
+  longRate: string; shortRate: string; netAnnualized: string; confirmationCount: number;
+  state: 'OBSERVING' | 'CONFIRMED' | 'CONSUMED'; lastSeenAt: string;
+}
+export interface FundingArbitrageTrade {
+  id: string; asset: string; longVenue: string; shortVenue: string; requestedQuantity: string;
+  openQuantity: string; state: string; phase: string; feesPaid: string; realizedPnl: string;
+  manualReason: string | null; createdAt: string; updatedAt: string;
+}
+
 interface RuntimeSchema<T> {
   safeParse(value: unknown): { success: true; data: T } | { success: false };
 }
+
+const FundingCandidateSchema: RuntimeSchema<FundingCandidateExecution> = {
+  safeParse(value) {
+    const row = value as Partial<FundingCandidateExecution> | null;
+    return row && typeof row.id === 'string' && typeof row.asset === 'string' && typeof row.state === 'string'
+      ? { success: true, data: row as FundingCandidateExecution } : { success: false };
+  },
+};
+const FundingTradeSchema: RuntimeSchema<FundingArbitrageTrade> = {
+  safeParse(value) {
+    const row = value as Partial<FundingArbitrageTrade> | null;
+    return row && typeof row.id === 'string' && typeof row.asset === 'string' && typeof row.state === 'string'
+      ? { success: true, data: row as FundingArbitrageTrade } : { success: false };
+  },
+};
+const FundingCandidatesSchema: RuntimeSchema<{ candidates: FundingCandidateExecution[] }> = {
+  safeParse(value) {
+    const data = value as { candidates?: unknown } | null;
+    return data && Array.isArray(data.candidates) ? { success: true, data: { candidates: data.candidates as FundingCandidateExecution[] } } : { success: false };
+  },
+};
+const FundingTradesSchema: RuntimeSchema<{ enabled: boolean; trades: FundingArbitrageTrade[] }> = {
+  safeParse(value) {
+    const data = value as { enabled?: unknown; trades?: unknown } | null;
+    return data && typeof data.enabled === 'boolean' && Array.isArray(data.trades)
+      ? { success: true, data: { enabled: data.enabled, trades: data.trades as FundingArbitrageTrade[] } } : { success: false };
+  },
+};
 
 export class ApiError extends Error {
   constructor(
@@ -260,6 +299,19 @@ export const api = {
       headers: { 'x-gct-read-intent': 'funding-history' },
       body: JSON.stringify({ symbols, durationDays }),
     }),
+  fundingExecutionCandidates: () => request(FundingCandidatesSchema, '/api/funding-arbitrage/candidates'),
+  fundingExecutionTrades: () => request(FundingTradesSchema, '/api/funding-arbitrage/trades'),
+  observeFundingCandidate: (body: { asset: string; longVenue: string; shortVenue: string; quantity: string;
+    longRate: string; shortRate: string; netAnnualized: string }) => request(FundingCandidateSchema, '/api/funding-arbitrage/candidates/observe', {
+    method: 'POST', headers: { 'x-gct-trading-intent': 'observe-funding-candidate' }, body: JSON.stringify(body),
+  }),
+  startFundingArbitrage: (body: { idempotencyKey: string; candidateId: string; asset: string; longVenue: string;
+    shortVenue: string; quantity: string; timeInForce: 'FOK' | 'IOC' }) => request(FundingTradeSchema, '/api/funding-arbitrage/trades', {
+    method: 'POST', headers: { 'x-gct-trading-intent': 'start-funding-arbitrage' }, body: JSON.stringify(body),
+  }),
+  closeFundingArbitrage: (id: string) => request(FundingTradeSchema, `/api/funding-arbitrage/trades/${encodeURIComponent(id)}/close`, {
+    method: 'POST', headers: { 'x-gct-trading-intent': 'close-funding-arbitrage' },
+  }),
   tradingSnapshot: () => request(TradingSnapshotSchema, '/api/trading/snapshot'),
   positionsSnapshot: () => request(TradingSnapshotSchema, '/api/crossex/positions-snapshot', {
     headers: { 'x-gct-read-intent': 'positions-snapshot' },

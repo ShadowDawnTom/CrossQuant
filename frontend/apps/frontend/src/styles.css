@@ -1398,6 +1398,26 @@ html[data-theme='light'] .portfolio-view .transfer-note.warn { color: #7b5d10 !i
   }
 }
 
+.funding-execution-panel { margin-bottom: 18px; padding: 18px; }
+.funding-execution-panel > header { display:flex; justify-content:space-between; align-items:center; gap:16px; }
+.funding-execution-panel h2 { margin: 2px 0 0; font-size:18px; }
+.funding-live-armed,.funding-live-locked { padding:6px 10px; border-radius:999px; font-size:10px; font-weight:700; }
+.funding-live-armed { color:#14d8ad; background:#0d3b32; }
+.funding-live-locked { color:#f2ae64; background:#392918; }
+.funding-execution-warning { color:var(--muted); font-size:11px; }
+.funding-execution-form { display:grid; grid-template-columns:repeat(7,minmax(110px,1fr)); gap:8px; }
+.funding-execution-form label { display:grid; gap:5px; color:var(--muted); font-size:10px; }
+.funding-execution-form input,.funding-execution-form select { min-width:0; padding:8px; border:1px solid var(--line); border-radius:6px; color:var(--text); background:var(--panel); }
+.funding-execution-actions { display:flex; align-items:center; gap:8px; margin-top:12px; }
+.funding-execution-actions button,.funding-execution-ledger button { padding:7px 10px; border:1px solid var(--line); border-radius:6px; color:var(--text); background:var(--panel); cursor:pointer; }
+.funding-execution-actions .danger { border-color:#a85151; color:#ffb8b8; }
+.funding-execution-actions button:disabled { opacity:.45; cursor:not-allowed; }
+.funding-execution-actions output { color:var(--muted); font-size:10px; }
+.funding-execution-ledger { margin-top:14px; border-top:1px solid var(--line); }
+.funding-execution-ledger h3 { font-size:12px; }
+.funding-execution-ledger article { display:grid; grid-template-columns:1fr auto auto; gap:12px; align-items:center; padding:7px 0; border-top:1px solid var(--line); font-size:10px; }
+@media (max-width:1000px) { .funding-execution-form { grid-template-columns:repeat(2,minmax(130px,1fr)); } }
+
 .system-banner {
   min-height: 42px;
   display: flex;

@@ -73,6 +73,8 @@ import { TradingRuntime, TradingRuntimeError } from './trading-runtime.js';
 import { CrossExPrivateStream } from './private-stream.js';
 import { LivePortfolioStore, type LivePortfolioSnapshot } from './live-portfolio.js';
 import { evaluateAccountRisk } from './account-risk-guard.js';
+import { AlertDispatcher } from './alert-dispatcher.js';
+import { FundingArbitrageEngine, FundingArbitrageError } from './funding-arbitrage-engine.js';
 import { readDatabaseStatus } from './database.js';
 import { runDatabaseMaintenance } from './database-maintenance.js';
 import {
@@ -613,6 +615,17 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     return rows.reduce((sum, row) => sum.plus(new Decimal(row.realized_pnl || '0')), new Decimal(0)).toString();
   };
 
+  const accountRiskDecision = () => evaluateAccountRisk({
+    portfolio: livePortfolio.snapshot(),
+    dailyRealizedPnlUsd: dailyRealizedPnlUsd(),
+    nowMs: Date.now(),
+    requirePrivateStream: true,
+    adlRanks: latestAdlRanks,
+    dailyPnlComplete,
+  }, config.riskLimits);
+
+  const alertDispatcher = new AlertDispatcher(database, { webhookUrl: config.riskLimits.alertWebhookUrl });
+
   const sendRiskAlert = async (reason: string): Promise<void> => {
     addAuditEvent(database, 'global_kill_switch_triggered', { reason });
     app.log.error({ reason }, 'global trading kill switch triggered');
@@ -637,16 +650,29 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     ...(options.startMarketStream ? { connectionState: () => marketHub.connectionState() } : {}),
   }, {
     ...(options.startMarketStream ? {
-      accountRiskCheck: () => evaluateAccountRisk({
-        portfolio: livePortfolio.snapshot(),
-        dailyRealizedPnlUsd: dailyRealizedPnlUsd(),
-        nowMs: Date.now(),
-        requirePrivateStream: true,
-        adlRanks: latestAdlRanks,
-        dailyPnlComplete,
-      }, config.riskLimits),
+      accountRiskCheck: accountRiskDecision,
       onKillSwitch: sendRiskAlert,
     } : {}),
+  });
+
+  const fundingArbitrageEngine = new FundingArbitrageEngine(database, tradingRuntime, executionMarketHub, {
+    limits: config.fundingArbitrage,
+    accountRiskCheck: accountRiskDecision,
+    alertDispatcher,
+    onKillSwitch: async (reason) => strategyEngine.triggerKillSwitch(reason),
+    executionGuard: () => {
+      const status = strategyEngine.killSwitchStatus();
+      return status.tripped ? { safe: false, reason: status.reason ?? 'kill_switch_tripped' } : { safe: true };
+    },
+  });
+  privateStream.subscribeStatus((status) => {
+    if (status.state === 'live') return;
+    void alertDispatcher.emit({
+      eventType: 'private_stream_degraded', severity: status.state === 'authentication_failed' ? 'critical' : 'warning',
+      message: `CrossEx 私有 WebSocket 状态变为 ${status.state}`,
+      details: { reason: status.lastError, reconnectAttempt: status.retryAttempt },
+      dedupKey: `private-stream:${status.state}:${status.lastError ?? 'unknown'}`,
+    });
   });
 
   const quiesceForCredentialMutation = async (): Promise<void> => {
@@ -852,6 +878,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   let portfolioReconcileTimer: ReturnType<typeof setTimeout> | null = null;
   let databaseMaintenanceTimer: ReturnType<typeof setInterval> | null = null;
   let executionMarketSampleTimer: ReturnType<typeof setInterval> | null = null;
+  let fundingArbitrageMonitorTimer: ReturnType<typeof setInterval> | null = null;
+  let executionHealthMonitorTimer: ReturnType<typeof setInterval> | null = null;
+  let previousExecutionHealth = executionMarketHub.health();
   const schedulePortfolioReconciliation = () => {
     if (!options.startMarketStream) return;
     const interval = Math.round(5 * 60_000 * (0.9 + Math.random() * 0.2));
@@ -877,6 +906,32 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     executionMarketSampleTimer.unref?.();
     privateStream.start();
     strategyEngine.start();
+    fundingArbitrageMonitorTimer = setInterval(() => {
+      void fundingArbitrageEngine.monitorHoldingLimits().catch((error) => {
+        app.log.error({ err: error }, 'funding arbitrage holding monitor failed');
+      });
+    }, 5_000);
+    fundingArbitrageMonitorTimer.unref?.();
+    void alertDispatcher.emit({ eventType: 'service_started', severity: 'info',
+      message: 'CrossQuant 服务已启动', details: { fundingLiveEnabled: config.fundingArbitrage.enabled } });
+    executionHealthMonitorTimer = setInterval(() => {
+      const current = executionMarketHub.health();
+      if (current.state !== 'healthy' && previousExecutionHealth.state === 'healthy') {
+        void alertDispatcher.emit({ eventType: 'execution_market_degraded', severity: 'critical',
+          message: `持续行情服务从 healthy 降级为 ${current.state}`,
+          details: { state: current.state, updatedAt: current.updatedAt, symbols: current.symbols, venues: current.venues } });
+      }
+      for (const venue of current.venues) {
+        const previous = previousExecutionHealth.venues.find((item) => item.venue === venue.venue);
+        if (previous && venue.reconnects - previous.reconnects >= 3) {
+          void alertDispatcher.emit({ eventType: 'websocket_reconnect_storm', severity: 'warning',
+            message: `${venue.venue} WebSocket 短期重连过多`, details: { previous: previous.reconnects, current: venue.reconnects },
+            dedupKey: `reconnect-storm:${venue.venue}:${venue.reconnects}` });
+        }
+      }
+      previousExecutionHealth = current;
+    }, 10_000);
+    executionHealthMonitorTimer.unref?.();
     fundingHistoryService.startBackground();
     databaseMaintenanceTimer = setInterval(() => {
       try {
@@ -900,6 +955,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     if (portfolioReconcileTimer) clearTimeout(portfolioReconcileTimer);
     if (databaseMaintenanceTimer) clearInterval(databaseMaintenanceTimer);
     if (executionMarketSampleTimer) clearInterval(executionMarketSampleTimer);
+    if (fundingArbitrageMonitorTimer) clearInterval(fundingArbitrageMonitorTimer);
+    if (executionHealthMonitorTimer) clearInterval(executionHealthMonitorTimer);
     livePortfolio.stop();
     marketHub.stop();
     executionMarketHub.stop();
@@ -1044,6 +1101,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         });
         await refreshPortfolio();
         await strategyEngine.prepareForLiveActivation();
+        if (await fundingArbitrageEngine.recover()) {
+          return reply.code(409).send({ error: 'funding_manual_intervention_required' });
+        }
       } catch (error) {
         if (error instanceof StrategyEngineError || error instanceof TradingRuntimeError) {
           return reply.code(error.statusCode).send({ error: error.code, ...(error.label ? { label: error.label } : {}) });
@@ -1116,6 +1176,109 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       return executionMarketHub.pair(parsed.data.base, parsed.data.longVenue, parsed.data.shortVenue);
     } catch {
       return reply.code(404).send({ error: 'execution_market_not_configured' });
+    }
+  });
+
+  app.get('/api/funding-arbitrage/trades', async () => ({
+    enabled: config.fundingArbitrage.enabled,
+    trades: fundingArbitrageEngine.list(),
+  }));
+
+  app.get('/api/funding-arbitrage/candidates', async () => ({ candidates: fundingArbitrageEngine.listCandidates() }));
+
+  app.post('/api/funding-arbitrage/candidates/observe', {
+    config: { rateLimit: { max: 120, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (!browserAuth.canTrade(request)) return reply.code(403).send({ error: 'trader_role_required' });
+      if (request.headers['x-gct-trading-intent'] !== 'observe-funding-candidate') {
+        return reply.code(403).send({ error: 'missing_trading_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    try { return await fundingArbitrageEngine.observeCandidate(request.body); }
+    catch (error) {
+      if (error instanceof z.ZodError) return reply.code(400).send({ error: 'invalid_funding_candidate' });
+      if (error instanceof FundingArbitrageError) return reply.code(error.statusCode).send({ error: error.code });
+      return reply.code(500).send({ error: 'funding_candidate_observation_failed' });
+    }
+  });
+
+  app.post('/api/funding-arbitrage/trades', {
+    config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (!browserAuth.canTrade(request)) return reply.code(403).send({ error: 'trader_role_required' });
+      if (request.headers['x-gct-trading-intent'] !== 'start-funding-arbitrage') {
+        return reply.code(403).send({ error: 'missing_trading_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    if (!tradingSession.liveTradingEnabled) return reply.code(403).send({ error: 'live_trading_locked' });
+    try { return await fundingArbitrageEngine.start(request.body); }
+    catch (error) {
+      if (error instanceof z.ZodError) return reply.code(400).send({ error: 'invalid_funding_trade', issues: error.issues });
+      if (error instanceof FundingArbitrageError) return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+      if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({ error: error.code });
+      if (error instanceof GateApiError) return reply.code(502).send({ error: 'gate_order_rejected', label: error.label });
+      request.log.error({ error }, 'funding arbitrage start failed');
+      return reply.code(500).send({ error: 'funding_arbitrage_start_failed' });
+    }
+  });
+
+  app.post('/api/funding-arbitrage/trades/:id/close', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (!browserAuth.canTrade(request)) return reply.code(403).send({ error: 'trader_role_required' });
+      if (request.headers['x-gct-trading-intent'] !== 'close-funding-arbitrage') {
+        return reply.code(403).send({ error: 'missing_trading_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const parsed = z.object({ id: z.string().uuid() }).safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_funding_trade_id' });
+    try { return await fundingArbitrageEngine.close(parsed.data.id); }
+    catch (error) {
+      if (error instanceof FundingArbitrageError) return reply.code(error.statusCode).send({ error: error.code });
+      if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({ error: error.code });
+      request.log.error({ error }, 'funding arbitrage close failed');
+      return reply.code(500).send({ error: 'funding_arbitrage_close_failed' });
+    }
+  });
+
+  app.post('/api/funding-arbitrage/trades/:id/funding-observation', {
+    config: { rateLimit: { max: 120, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (!browserAuth.canTrade(request)) return reply.code(403).send({ error: 'trader_role_required' });
+      if (request.headers['x-gct-trading-intent'] !== 'observe-funding-arbitrage') {
+        return reply.code(403).send({ error: 'missing_trading_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const parsed = z.object({ id: z.string().uuid() }).safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_funding_trade_id' });
+    try { return await fundingArbitrageEngine.observeFundingRates(parsed.data.id, request.body); }
+    catch (error) {
+      if (error instanceof z.ZodError) return reply.code(400).send({ error: 'invalid_funding_observation' });
+      if (error instanceof FundingArbitrageError) return reply.code(error.statusCode).send({ error: error.code });
+      return reply.code(500).send({ error: 'funding_observation_failed' });
+    }
+  });
+
+  app.post('/api/funding-arbitrage/trades/:id/funding-settlement', {
+    config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (!browserAuth.canTrade(request)) return reply.code(403).send({ error: 'trader_role_required' });
+      if (request.headers['x-gct-trading-intent'] !== 'reconcile-funding-settlement') {
+        return reply.code(403).send({ error: 'missing_trading_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const parsed = z.object({ id: z.string().uuid() }).safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_funding_trade_id' });
+    try { return await fundingArbitrageEngine.reconcileFundingSettlement(parsed.data.id, request.body); }
+    catch (error) {
+      if (error instanceof z.ZodError) return reply.code(400).send({ error: 'invalid_funding_settlement' });
+      if (error instanceof FundingArbitrageError) return reply.code(error.statusCode).send({ error: error.code });
+      return reply.code(500).send({ error: 'funding_settlement_failed' });
     }
   });
 

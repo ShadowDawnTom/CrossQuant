@@ -16,6 +16,17 @@ Before enabling authenticated or live use:
 3. Use a dedicated least-privilege Gate APIv4 key without withdrawal permission.
 4. Review and intentionally replace the read-only Nginx policy.
 
+The current production-safe deployment should keep these values even after the funding state machine is installed:
+
+```dotenv
+GCT_PUBLIC_READONLY=1
+GCT_FUNDING_LIVE_ENABLED=0
+GCT_FUNDING_MAX_NOTIONAL_PER_LEG_USD=0
+GCT_FUNDING_MAX_CONCURRENT_TRADES=0
+```
+
+Do not place `GATE_API_KEY` or `GATE_API_SECRET` in systemd unit text or in the repository. The service's credential path must be an owner-only environment file. After deployment, verify migrations, `/health`, authentication redirects, public read-only rejection, and the funding trade list before considering any controlled canary.
+
 The service uses `/home/ubuntu/.local/share/crossquant` for runtime state. Removing the
 Nginx site and stopping `crossquant.service` rolls back the deployment without affecting
 the existing Crypto-Trader service.

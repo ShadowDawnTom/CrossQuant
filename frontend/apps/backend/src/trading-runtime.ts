@@ -179,6 +179,21 @@ export interface PlaceOrderMetadata {
    * The HTTP boundary may set this only after it has parsed a strict boolean reduceOnly=true.
    */
   riskReducing?: boolean;
+  /**
+   * 由上层状态机生成的稳定幂等号。相同 ID 重试时直接返回原订单，避免网络抖动后重复下单。
+   */
+  clientOrderId?: string;
+}
+
+export interface LiveExecutionPosition {
+  symbol: string;
+  venue: string;
+  quantity: string;
+  entryPrice: string;
+  markPrice: string;
+  realizedPnl: string;
+  fundingFee: string | null;
+  updatedAt: string;
 }
 
 export interface TradingRuntimeOptions {
@@ -685,7 +700,12 @@ export class TradingRuntime {
     if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
     const tradingGateway = this.gateway as Partial<TradingCrossExGateway>;
     if (!tradingGateway.createOrder) throw new TradingRuntimeError('live_gateway_unavailable', 503);
-    const clientOrderId = `gct-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    const clientOrderId = metadata?.clientOrderId ?? `gct-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(clientOrderId)) {
+      throw new TradingRuntimeError('invalid_client_order_id', 400);
+    }
+    const existing = this.getOrderByClientOrderId(clientOrderId);
+    if (existing) return existing;
     const gateInput = CrossExOrderRequestSchema.parse({ text: clientOrderId, symbol: input.symbol, side: input.side,
       type: input.type, time_in_force: input.timeInForce, qty: input.quantity, price: input.price,
       reduce_only: input.reduceOnly ? 'true' : 'false', position_side: input.positionSide });
@@ -949,6 +969,20 @@ export class TradingRuntime {
     const row = this.statement("SELECT * FROM execution_orders WHERE id = ? AND environment = 'live'").get(id) as OrderRow | undefined;
     if (!row) throw new TradingRuntimeError('order_not_found', 404);
     return orderFromRow(row);
+  }
+
+  listLivePositions(): LiveExecutionPosition[] {
+    const rows = this.statement(`SELECT symbol, venue, quantity, entry_price, mark_price,
+      realized_pnl, funding_fee, updated_at FROM live_positions ORDER BY symbol`).all() as Array<Record<string, string | null>>;
+    return rows.map((row) => ({ symbol: row.symbol!, venue: row.venue!, quantity: row.quantity!,
+      entryPrice: row.entry_price!, markPrice: row.mark_price!, realizedPnl: row.realized_pnl!,
+      fundingFee: row.funding_fee, updatedAt: row.updated_at! }));
+  }
+
+  getOrderByClientOrderId(clientOrderId: string): ExecutionOrder | null {
+    const row = this.statement("SELECT * FROM execution_orders WHERE client_order_id = ? AND environment = 'live'")
+      .get(clientOrderId) as OrderRow | undefined;
+    return row ? orderFromRow(row) : null;
   }
 
   getStrategy(id: string): StrategyRecord {

@@ -22,6 +22,7 @@ export interface BackendConfig {
     googleClientSecret: string;
     sessionSecret: string;
     allowedEmails: ReadonlySet<string>;
+    traderEmails: ReadonlySet<string>;
   };
   gateRestBaseUrl: string;
   gatePublicWebSocketUrl: string;
@@ -40,6 +41,19 @@ export interface BackendConfig {
     maxPortfolioAgeMs: number;
     maxAdlRank: number | null;
     alertWebhookUrl: string | null;
+  };
+  fundingArbitrage: {
+    enabled: boolean;
+    maxNotionalPerLegUsd: string;
+    maxConcurrentTrades: number;
+    maxUnhedgedMs: number;
+    maxNetBaseExposure: string;
+    maxEntrySlippageBps: string;
+    maxBasisBps: string;
+    maxHoldingMs: number;
+    confirmationCount: number;
+    confirmationWindowMs: number;
+    minNetAnnualized: string;
   };
 }
 
@@ -82,11 +96,16 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
   const sessionSecret = environment.GCT_AUTH_SESSION_SECRET?.trim() ?? '';
   const allowedEmails = new Set((environment.GCT_AUTH_ALLOWED_EMAILS ?? '')
     .split(',').map((email) => email.trim().toLowerCase()).filter(Boolean));
+  const traderEmails = new Set((environment.GCT_AUTH_TRADER_EMAILS ?? '')
+    .split(',').map((email) => email.trim().toLowerCase()).filter(Boolean));
   if (authEnabled) {
     if (!authBaseUrl.startsWith('https://')) throw new Error('GCT_AUTH_BASE_URL must use https when authentication is enabled');
     if (!googleClientId || !googleClientSecret) throw new Error('Google OAuth credentials are required when authentication is enabled');
     if (Buffer.byteLength(sessionSecret, 'utf8') < 32) throw new Error('GCT_AUTH_SESSION_SECRET must contain at least 32 bytes');
     if (allowedEmails.size === 0) throw new Error('GCT_AUTH_ALLOWED_EMAILS must contain at least one email');
+    for (const email of traderEmails) {
+      if (!allowedEmails.has(email)) throw new Error('GCT_AUTH_TRADER_EMAILS must be a subset of GCT_AUTH_ALLOWED_EMAILS');
+    }
   }
   // Browsers send the loopback host the user actually typed; localhost, 127.0.0.1, and [::1]
   // variants of the local UI and backend are all the same trust domain.
@@ -108,7 +127,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     allowedOrigins: new Set([allowedOrigin, ...loopbackOrigins]),
     allowedHosts: new Set(['127.0.0.1', 'localhost', '::1', ...configuredHosts]),
     browserAuth: {
-      enabled: authEnabled, baseUrl: authBaseUrl, googleClientId, googleClientSecret, sessionSecret, allowedEmails,
+      enabled: authEnabled, baseUrl: authBaseUrl, googleClientId, googleClientSecret, sessionSecret, allowedEmails, traderEmails,
     },
     gateRestBaseUrl: environment.GCT_GATE_REST_URL ?? 'https://api.gateio.ws/api/v4',
     gatePublicWebSocketUrl: environment.GCT_GATE_PUBLIC_WS_URL ?? 'wss://api.gateio.ws/ws/crossex/public',
@@ -147,6 +166,20 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
         ? null
         : parseNonNegativeInteger(environment.GCT_RISK_MAX_ADL_RANK, 'GCT_RISK_MAX_ADL_RANK'),
       alertWebhookUrl: environment.GCT_RISK_ALERT_WEBHOOK_URL?.trim() || null,
+    },
+    fundingArbitrage: {
+      // 新状态机即使部署到生产也默认关闭，必须由运维显式设置开关和所有额度。
+      enabled: environment.GCT_FUNDING_LIVE_ENABLED === '1',
+      maxNotionalPerLegUsd: parseNonNegativeDecimal(environment.GCT_FUNDING_MAX_NOTIONAL_PER_LEG_USD ?? '0', 'GCT_FUNDING_MAX_NOTIONAL_PER_LEG_USD'),
+      maxConcurrentTrades: parseNonNegativeInteger(environment.GCT_FUNDING_MAX_CONCURRENT_TRADES ?? '0', 'GCT_FUNDING_MAX_CONCURRENT_TRADES'),
+      maxUnhedgedMs: parseNonNegativeInteger(environment.GCT_FUNDING_MAX_UNHEDGED_MS ?? '1500', 'GCT_FUNDING_MAX_UNHEDGED_MS'),
+      maxNetBaseExposure: parseNonNegativeDecimal(environment.GCT_FUNDING_MAX_NET_BASE_EXPOSURE ?? '0', 'GCT_FUNDING_MAX_NET_BASE_EXPOSURE'),
+      maxEntrySlippageBps: parseNonNegativeDecimal(environment.GCT_FUNDING_MAX_ENTRY_SLIPPAGE_BPS ?? '5', 'GCT_FUNDING_MAX_ENTRY_SLIPPAGE_BPS'),
+      maxBasisBps: parseNonNegativeDecimal(environment.GCT_FUNDING_MAX_BASIS_BPS ?? '30', 'GCT_FUNDING_MAX_BASIS_BPS'),
+      maxHoldingMs: parseNonNegativeInteger(environment.GCT_FUNDING_MAX_HOLDING_MS ?? '28800000', 'GCT_FUNDING_MAX_HOLDING_MS'),
+      confirmationCount: parseNonNegativeInteger(environment.GCT_FUNDING_CONFIRMATION_COUNT ?? '3', 'GCT_FUNDING_CONFIRMATION_COUNT'),
+      confirmationWindowMs: parseNonNegativeInteger(environment.GCT_FUNDING_CONFIRMATION_WINDOW_MS ?? '10000', 'GCT_FUNDING_CONFIRMATION_WINDOW_MS'),
+      minNetAnnualized: parseNonNegativeDecimal(environment.GCT_FUNDING_MIN_NET_ANNUALIZED ?? '0.10', 'GCT_FUNDING_MIN_NET_ANNUALIZED'),
     },
   };
 }
