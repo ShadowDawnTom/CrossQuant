@@ -34,10 +34,13 @@ The backend evaluates account risk before live activation, before risk-increasin
 | `GCT_FUNDING_SCAN_TARGET_NOTIONAL_USD` | `5` | 后端自动扫描时的单腿目标金额 |
 | `GCT_FUNDING_SCAN_HORIZON_HOURS` | `24` | 当前费率快照的现金流情景期，不是预测 |
 | `GCT_FUNDING_SCAN_INTERVAL_MS` | `60000` | 后端自动候选扫描周期；禁止重叠请求，避免占满 Gate 鉴权限频 |
+| `GCT_FUNDING_RETENTION_FACTOR` | `0.5` | 正向当前资金费快照在保守情景中只保留的比例 |
+| `GCT_FUNDING_STRESS_SLIPPAGE_BPS` | `5` | 当前多档盘口以外额外扣除的下单延迟/滑点压力 |
+| `GCT_FUNDING_ADVERSE_EXIT_BASIS_BPS` | `10` | 未来退出基差逆向变化缓冲 |
 
 只有 `LIVE_SYNCHRONIZED` 盘口可以通过入场预检。缺价格、深度不足、行情陈旧、跨所时间差过大、账户快照不完整、私有流断线和 Kill Switch 已触发都会 fail-closed。
 
-候选只由后端读取 Gate 已认证 `funding_info` 和账户手续费生成，浏览器不能提交资金费率或年化。扫描器按各所实际结算事件计算现金流并扣除开平仓四次 taker 手续费；入场还会重新校验合约状态、`min_size`、`min_notional`、`lot_size`、`tick_size`、预计总敞口和可用保证金。
+候选只由后端读取 Gate 已认证 `funding_info` 和账户手续费生成，浏览器不能提交资金费率或年化。接口值只用于“当前费率不变”的快照情景，不代表未来确定收益。扫描器按各所结算事件计数，用当前多档盘口计算立即往返价格损益，扣除开平仓四次 taker 手续费，并对正向资金费打折、额外扣除滑点和未来退出基差压力缓冲；入场还会重新校验合约状态、`min_size`、`min_notional`、`lot_size`、`tick_size`、预计总敞口和可用保证金。
 
 `GCT_AUTH_TRADER_EMAILS` 是交易员白名单，必须是 `GCT_AUTH_ALLOWED_EMAILS` 的子集。只在访问白名单而不在交易员白名单的账号可以看页面，但资金费入场和平仓接口都会返回 `trader_role_required`。
 

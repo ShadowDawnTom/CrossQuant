@@ -61,6 +61,9 @@ export interface BackendConfig {
     scanTargetNotionalUsd: string;
     scanHorizonHours: number;
     scanIntervalMs: number;
+    fundingRetentionFactor: string;
+    stressSlippageBps: string;
+    adverseExitBasisBps: string;
   };
 }
 
@@ -88,6 +91,12 @@ function parseNonNegativeInteger(value: string, name: string): number {
 function parsePositiveDecimal(value: string, name: string): string {
   const parsed = parseNonNegativeDecimal(value, name);
   if (Number(parsed) <= 0) throw new Error(`${name} must be greater than zero`);
+  return parsed;
+}
+
+function parseUnitInterval(value: string, name: string): string {
+  const parsed = parseNonNegativeDecimal(value, name);
+  if (Number(parsed) > 1) throw new Error(`${name} must be between zero and one`);
   return parsed;
 }
 
@@ -212,6 +221,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       scanTargetNotionalUsd: parsePositiveDecimal(environment.GCT_FUNDING_SCAN_TARGET_NOTIONAL_USD ?? '5', 'GCT_FUNDING_SCAN_TARGET_NOTIONAL_USD'),
       scanHorizonHours: parsePositiveInteger(environment.GCT_FUNDING_SCAN_HORIZON_HOURS ?? '24', 'GCT_FUNDING_SCAN_HORIZON_HOURS'),
       scanIntervalMs: parsePositiveInteger(environment.GCT_FUNDING_SCAN_INTERVAL_MS ?? '60000', 'GCT_FUNDING_SCAN_INTERVAL_MS'),
+      fundingRetentionFactor: parseUnitInterval(environment.GCT_FUNDING_RETENTION_FACTOR ?? '0.5', 'GCT_FUNDING_RETENTION_FACTOR'),
+      stressSlippageBps: parseNonNegativeDecimal(environment.GCT_FUNDING_STRESS_SLIPPAGE_BPS ?? '5', 'GCT_FUNDING_STRESS_SLIPPAGE_BPS'),
+      adverseExitBasisBps: parseNonNegativeDecimal(environment.GCT_FUNDING_ADVERSE_EXIT_BASIS_BPS ?? '10', 'GCT_FUNDING_ADVERSE_EXIT_BASIS_BPS'),
     },
   };
 }

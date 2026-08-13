@@ -44,18 +44,21 @@ describe('FundingCandidateScanner', () => {
     const observe = vi.fn(async (input: { quantity: string; netAnnualized: string }) => { candidates.push(input); });
     const scanner = new FundingCandidateScanner(gateway(), async () => ({ apiKey: 'key', apiSecret: 'secret' }), market(),
       { observeAuthoritativeCandidate: observe } as unknown as FundingArbitrageEngine,
-      { assets: ['SOL'], targetNotionalUsd: '5', horizonHours: 24, now: () => NOW });
+      { assets: ['SOL'], targetNotionalUsd: '5', horizonHours: 24, fundingRetentionFactor: '0.5',
+        stressSlippageBps: '5', adverseExitBasisBps: '10', now: () => NOW });
     expect(await scanner.scan()).toBe(1);
     expect(observe).toHaveBeenCalledOnce();
     expect(candidates[0]).toMatchObject({ quantity: '0.05' });
-    expect(Number(candidates[0]?.netAnnualized)).toBeGreaterThan(0);
+    // 当前盘口立即往返亏 0.1 USDT；资金费只保留 50%，再扣 15bp 压力缓冲和四笔手续费。
+    expect(Number(candidates[0]?.netAnnualized)).toBeCloseTo(45.7512, 3);
   });
 
   it('目标数量的任一进出场盘口深度不足时不生成候选', async () => {
     const observe = vi.fn(async () => undefined);
     const scanner = new FundingCandidateScanner(gateway(), async () => ({ apiKey: 'key', apiSecret: 'secret' }), market('0.01'),
       { observeAuthoritativeCandidate: observe } as unknown as FundingArbitrageEngine,
-      { assets: ['SOL'], targetNotionalUsd: '5', horizonHours: 24, now: () => NOW });
+      { assets: ['SOL'], targetNotionalUsd: '5', horizonHours: 24, fundingRetentionFactor: '0.5',
+        stressSlippageBps: '5', adverseExitBasisBps: '10', now: () => NOW });
     expect(await scanner.scan()).toBe(0);
     expect(observe).not.toHaveBeenCalled();
   });

@@ -676,6 +676,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         assets: config.executionMarket.symbols,
         targetNotionalUsd: config.fundingArbitrage.scanTargetNotionalUsd,
         horizonHours: config.fundingArbitrage.scanHorizonHours,
+        fundingRetentionFactor: config.fundingArbitrage.fundingRetentionFactor,
+        stressSlippageBps: config.fundingArbitrage.stressSlippageBps,
+        adverseExitBasisBps: config.fundingArbitrage.adverseExitBasisBps,
       })
     : null;
   privateStream.subscribeStatus((status) => {

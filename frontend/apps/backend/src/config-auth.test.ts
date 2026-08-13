@@ -40,4 +40,9 @@ describe('browser authentication config', () => {
     expect(() => loadConfig({ TELEGRAM_BOT_TOKEN: 'token-only' })).toThrow('must be configured together');
     expect(loadConfig({ TELEGRAM_ALERT_ENABLED: '0', TELEGRAM_BOT_TOKEN: 'ignored' }).riskLimits.telegramBotToken).toBeNull();
   });
+
+  it('资金费保留系数只能在零到一之间', () => {
+    expect(() => loadConfig({ GCT_FUNDING_RETENTION_FACTOR: '1.1' })).toThrow('must be between zero and one');
+    expect(loadConfig({ GCT_FUNDING_RETENTION_FACTOR: '0.5' }).fundingArbitrage.fundingRetentionFactor).toBe('0.5');
+  });
 });

@@ -11,6 +11,9 @@ export interface FundingCandidateScannerOptions {
   assets: string[];
   targetNotionalUsd: string;
   horizonHours: number;
+  fundingRetentionFactor: string;
+  stressSlippageBps: string;
+  adverseExitBasisBps: string;
   now?: () => number;
 }
 
@@ -58,8 +61,8 @@ function executableNotional(levels: ReadonlyArray<readonly [string, string]>, qu
 }
 
 /**
- * 资金费候选只从 Gate 已认证接口生成。扫描器按实际结算事件计数，并用多档盘口估算
- * 进出场基差与四次 taker 手续费；它只记录候选，永远不直接下单。
+ * 资金费候选只从 Gate 已认证接口生成。扫描器按实际结算事件做“当前费率不变”情景，
+ * 再扣除多档盘口往返损益、四次 taker 手续费和额外压力缓冲；它永远不直接下单。
  */
 export class FundingCandidateScanner {
   private readonly now: () => number;
@@ -143,12 +146,18 @@ export class FundingCandidateScanner {
         if (!longEntry || !shortEntry || !longExit || !shortExit) continue;
         const capital = longEntry.plus(shortEntry).div(2);
         if (!capital.gt(0)) continue;
-        const fundingPnl = shortEntry.mul(short.funding_rate).mul(shortEvents)
+        const snapshotFundingPnl = shortEntry.mul(short.funding_rate).mul(shortEvents)
           .minus(longEntry.mul(long.funding_rate).mul(longEvents));
-        const basisPnl = shortEntry.minus(longEntry).plus(longExit).minus(shortExit);
+        // q[(P_long_exit_bid-P_long_entry_ask)+(P_short_entry_bid-P_short_exit_ask)]。
+        // 这里用当前盘口模拟立即往返，只估算此刻交易摩擦，不预测未来退出时的基差。
+        const immediateRoundTripPnl = longExit.minus(longEntry).plus(shortEntry).minus(shortExit);
         const tradingFees = longEntry.plus(longExit).mul(feeFor(fees, longVenue, long.symbol))
           .plus(shortEntry.plus(shortExit).mul(feeFor(fees, shortVenue, short.symbol)));
-        const netAnnualized = fundingPnl.plus(basisPnl).minus(tradingFees)
+        const retention = new Decimal(this.options.fundingRetentionFactor);
+        const conservativeFundingPnl = snapshotFundingPnl.gt(0) ? snapshotFundingPnl.mul(retention) : snapshotFundingPnl;
+        const stressBuffer = capital.mul(new Decimal(this.options.stressSlippageBps)
+          .plus(this.options.adverseExitBasisBps)).div(10_000);
+        const netAnnualized = conservativeFundingPnl.plus(immediateRoundTripPnl).minus(tradingFees).minus(stressBuffer)
           .div(capital).mul(8760).div(this.options.horizonHours);
         try {
           await this.engine.observeAuthoritativeCandidate({ asset, longVenue, shortVenue, quantity: quantity.toString(),
