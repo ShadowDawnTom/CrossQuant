@@ -18,6 +18,7 @@ const HISTORY_TRADES_ENDPOINT = '/crossex/history_trades';
 const ORDERS_ENDPOINT = '/crossex/orders';
 const LEVERAGE_ENDPOINT = '/crossex/positions/leverage';
 const FEE_ENDPOINT = '/crossex/fee';
+const FUNDING_INFO_ENDPOINT = '/crossex/market/funding_info';
 const TRANSFER_COINS_ENDPOINT = '/crossex/transfers/coin';
 const TRANSFERS_ENDPOINT = '/crossex/transfers';
 const ACCOUNT_BOOK_ENDPOINT = '/crossex/account_book';
@@ -198,6 +199,14 @@ const GateFeeRateSchema = z.object({
 });
 export type GateFeeRate = z.infer<typeof GateFeeRateSchema>;
 
+const GateFundingInfoSchema = z.object({
+  symbol: z.string(),
+  funding_rate: z.string(),
+  funding_time: z.string(),
+  funding_interval: z.string(),
+});
+export type GateFundingInfo = z.infer<typeof GateFundingInfoSchema>;
+
 const GateTransferCoinSchema = z.object({
   coin: z.string(),
   min_trans_amount: z.string().regex(/^\d+(?:\.\d+)?$/),
@@ -245,6 +254,7 @@ export interface TradingCrossExGateway extends ReadOnlyCrossExGateway {
   queryLeverages(credentials: GateCredentials, symbols: string[]): Promise<Record<string, string>>;
   setLeverage(credentials: GateCredentials, symbol: string, leverage: string): Promise<GateLeverageResponse>;
   queryFeeRates(credentials: GateCredentials): Promise<GateFeeRate[]>;
+  queryFundingInfo?(credentials: GateCredentials, symbols: string[]): Promise<GateFundingInfo[]>;
 }
 
 export interface PortfolioOperationsCrossExGateway {
@@ -437,6 +447,18 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
 
   async queryFeeRates(credentials: GateCredentials): Promise<GateFeeRate[]> {
     return this.signedRequest('GET', FEE_ENDPOINT, '', '', credentials, z.array(GateFeeRateSchema), 'INVALID_FEE_RESPONSE');
+  }
+
+  async queryFundingInfo(credentials: GateCredentials, symbols: string[]): Promise<GateFundingInfo[]> {
+    if (symbols.length < 1 || symbols.length > 100 || symbols.some((symbol) => !/^[A-Z0-9_]{3,120}$/.test(symbol))) {
+      throw new GateApiError(0, 'INVALID_FUNDING_SYMBOLS');
+    }
+    // Gate 对该新接口的签名示例保留 symbols 中的逗号；URLSearchParams 编成 %2C 会验签失败。
+    const queryString = `symbols=${symbols.join(',')}`;
+    return this.signedRequest(
+      'GET', FUNDING_INFO_ENDPOINT, queryString, '', credentials,
+      z.array(GateFundingInfoSchema), 'INVALID_FUNDING_INFO_RESPONSE', false, 'low',
+    );
   }
 
   async createTransfer(credentials: GateCredentials, transfer: CrossExTransferRequest): Promise<GateTransferResponse> {

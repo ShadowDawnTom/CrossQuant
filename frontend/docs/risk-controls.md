@@ -28,12 +28,18 @@ The backend evaluates account risk before live activation, before risk-increasin
 | `GCT_FUNDING_MAX_BASIS_BPS` | `30` | 两腿可执行均价的最大基差 |
 | `GCT_FUNDING_MAX_HOLDING_MS` | `28800000` | 最长持仓时间，默认 8 小时 |
 | `GCT_FUNDING_CONFIRMATION_COUNT` | `3` | 同一候选连续通过检查的次数 |
-| `GCT_FUNDING_CONFIRMATION_WINDOW_MS` | `10000` | 两次确认之间允许的最长间隔 |
+| `GCT_FUNDING_CONFIRMATION_WINDOW_MS` | `180000` | 连续确认窗口；需覆盖三轮 60 秒扫描及少量接口延迟 |
 | `GCT_FUNDING_MIN_NET_ANNUALIZED` | `0.10` | 扣除模型成本后的最低年化收益，小数表示 |
+| `GCT_FUNDING_LEVERAGE` | `1` | 两腿保证金预检和下单前确认的杠杆 |
+| `GCT_FUNDING_SCAN_TARGET_NOTIONAL_USD` | `5` | 后端自动扫描时的单腿目标金额 |
+| `GCT_FUNDING_SCAN_HORIZON_HOURS` | `24` | 当前费率快照的现金流情景期，不是预测 |
+| `GCT_FUNDING_SCAN_INTERVAL_MS` | `60000` | 后端自动候选扫描周期；禁止重叠请求，避免占满 Gate 鉴权限频 |
 
 只有 `LIVE_SYNCHRONIZED` 盘口可以通过入场预检。缺价格、深度不足、行情陈旧、跨所时间差过大、账户快照不完整、私有流断线和 Kill Switch 已触发都会 fail-closed。
 
-`GCT_AUTH_TRADER_EMAILS` 是交易员白名单，必须是 `GCT_AUTH_ALLOWED_EMAILS` 的子集。只在访问白名单而不在交易员白名单的账号可以看页面，但资金费入场、平仓和资金费观察接口都会返回 `trader_role_required`。
+候选只由后端读取 Gate 已认证 `funding_info` 和账户手续费生成，浏览器不能提交资金费率或年化。扫描器按各所实际结算事件计算现金流并扣除开平仓四次 taker 手续费；入场还会重新校验合约状态、`min_size`、`min_notional`、`lot_size`、`tick_size`、预计总敞口和可用保证金。
+
+`GCT_AUTH_TRADER_EMAILS` 是交易员白名单，必须是 `GCT_AUTH_ALLOWED_EMAILS` 的子集。只在访问白名单而不在交易员白名单的账号可以看页面，但资金费入场和平仓接口都会返回 `trader_role_required`。
 
 建议 10 USDT 验收阶段保持开关关闭，只跑影子交易。通过至少 24 小时影子验收后，再按交易所最小下单规则选择币对；不要直接照抄以下示例数值：
 

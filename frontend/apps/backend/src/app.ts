@@ -75,6 +75,7 @@ import { LivePortfolioStore, type LivePortfolioSnapshot } from './live-portfolio
 import { evaluateAccountRisk } from './account-risk-guard.js';
 import { AlertDispatcher } from './alert-dispatcher.js';
 import { FundingArbitrageEngine, FundingArbitrageError } from './funding-arbitrage-engine.js';
+import { FundingCandidateScanner, fundingRule } from './funding-candidate-scanner.js';
 import { readDatabaseStatus } from './database.js';
 import { runDatabaseMaintenance } from './database-maintenance.js';
 import {
@@ -615,13 +616,14 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     return rows.reduce((sum, row) => sum.plus(new Decimal(row.realized_pnl || '0')), new Decimal(0)).toString();
   };
 
-  const accountRiskDecision = () => evaluateAccountRisk({
+  const accountRiskDecision = (plannedGrossExposureUsd = '0') => evaluateAccountRisk({
     portfolio: livePortfolio.snapshot(),
     dailyRealizedPnlUsd: dailyRealizedPnlUsd(),
     nowMs: Date.now(),
     requirePrivateStream: true,
     adlRanks: latestAdlRanks,
     dailyPnlComplete,
+    plannedGrossExposureUsd,
   }, config.riskLimits);
 
   const alertDispatcher = new AlertDispatcher(database, { webhookUrl: config.riskLimits.alertWebhookUrl });
@@ -658,6 +660,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   const fundingArbitrageEngine = new FundingArbitrageEngine(database, tradingRuntime, executionMarketHub, {
     limits: config.fundingArbitrage,
     accountRiskCheck: accountRiskDecision,
+    loadInstrumentRules: async (symbols) => {
+      const requested = new Set(symbols);
+      return (await crossExGateway.querySymbols()).filter((item) => requested.has(item.symbol)).map(fundingRule);
+    },
     alertDispatcher,
     onKillSwitch: async (reason) => strategyEngine.triggerKillSwitch(reason),
     executionGuard: () => {
@@ -665,6 +671,15 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       return status.tripped ? { safe: false, reason: status.reason ?? 'kill_switch_tripped' } : { safe: true };
     },
   });
+  const tradingGateway = crossExGateway as Partial<TradingCrossExGateway>;
+  const fundingCandidateScanner = tradingGateway.queryFundingInfo && tradingGateway.queryFeeRates
+    ? new FundingCandidateScanner(tradingGateway as TradingCrossExGateway,
+      () => credentialVault.get(DEFAULT_CREDENTIAL_PROFILE), executionMarketHub, fundingArbitrageEngine, {
+        assets: config.executionMarket.symbols,
+        targetNotionalUsd: config.fundingArbitrage.scanTargetNotionalUsd,
+        horizonHours: config.fundingArbitrage.scanHorizonHours,
+      })
+    : null;
   privateStream.subscribeStatus((status) => {
     if (status.state === 'live') return;
     void alertDispatcher.emit({
@@ -879,6 +894,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   let databaseMaintenanceTimer: ReturnType<typeof setInterval> | null = null;
   let executionMarketSampleTimer: ReturnType<typeof setInterval> | null = null;
   let fundingArbitrageMonitorTimer: ReturnType<typeof setInterval> | null = null;
+  let fundingCandidateScanTimer: ReturnType<typeof setInterval> | null = null;
   let executionHealthMonitorTimer: ReturnType<typeof setInterval> | null = null;
   let previousExecutionHealth = executionMarketHub.health();
   const previousBookCounters = new Map<string, { rebuilds: number; sequenceGaps: number }>();
@@ -913,6 +929,15 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       });
     }, 5_000);
     fundingArbitrageMonitorTimer.unref?.();
+    fundingCandidateScanTimer = setInterval(() => {
+      void fundingCandidateScanner?.scan().catch((error) => {
+        app.log.warn({ err: error }, 'authoritative funding candidate scan failed');
+      });
+    }, config.fundingArbitrage.scanIntervalMs);
+    fundingCandidateScanTimer.unref?.();
+    setTimeout(() => void fundingCandidateScanner?.scan().catch((error) => {
+      app.log.warn({ err: error }, 'initial authoritative funding candidate scan failed');
+    }), 5_000).unref?.();
     void alertDispatcher.emit({ eventType: 'service_started', severity: 'info',
       message: 'CrossQuant 服务已启动', details: { fundingLiveEnabled: config.fundingArbitrage.enabled } });
     executionHealthMonitorTimer = setInterval(() => {
@@ -970,6 +995,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     if (databaseMaintenanceTimer) clearInterval(databaseMaintenanceTimer);
     if (executionMarketSampleTimer) clearInterval(executionMarketSampleTimer);
     if (fundingArbitrageMonitorTimer) clearInterval(fundingArbitrageMonitorTimer);
+    if (fundingCandidateScanTimer) clearInterval(fundingCandidateScanTimer);
     if (executionHealthMonitorTimer) clearInterval(executionHealthMonitorTimer);
     livePortfolio.stop();
     marketHub.stop();
@@ -1199,23 +1225,6 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   }));
 
   app.get('/api/funding-arbitrage/candidates', async () => ({ candidates: fundingArbitrageEngine.listCandidates() }));
-
-  app.post('/api/funding-arbitrage/candidates/observe', {
-    config: { rateLimit: { max: 120, timeWindow: '1 minute' } },
-    preHandler: async (request, reply) => {
-      if (!browserAuth.canTrade(request)) return reply.code(403).send({ error: 'trader_role_required' });
-      if (request.headers['x-gct-trading-intent'] !== 'observe-funding-candidate') {
-        return reply.code(403).send({ error: 'missing_trading_intent' });
-      }
-    },
-  }, async (request, reply) => {
-    try { return await fundingArbitrageEngine.observeCandidate(request.body); }
-    catch (error) {
-      if (error instanceof z.ZodError) return reply.code(400).send({ error: 'invalid_funding_candidate' });
-      if (error instanceof FundingArbitrageError) return reply.code(error.statusCode).send({ error: error.code });
-      return reply.code(500).send({ error: 'funding_candidate_observation_failed' });
-    }
-  });
 
   app.post('/api/funding-arbitrage/trades', {
     config: { rateLimit: { max: 5, timeWindow: '1 minute' } },

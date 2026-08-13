@@ -54,6 +54,10 @@ export interface BackendConfig {
     confirmationCount: number;
     confirmationWindowMs: number;
     minNetAnnualized: string;
+    leverage: string;
+    scanTargetNotionalUsd: string;
+    scanHorizonHours: number;
+    scanIntervalMs: number;
   };
 }
 
@@ -75,6 +79,18 @@ function parseNonNegativeDecimal(value: string, name: string): string {
 function parseNonNegativeInteger(value: string, name: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`${name} must be a non-negative integer`);
+  return parsed;
+}
+
+function parsePositiveDecimal(value: string, name: string): string {
+  const parsed = parseNonNegativeDecimal(value, name);
+  if (Number(parsed) <= 0) throw new Error(`${name} must be greater than zero`);
+  return parsed;
+}
+
+function parsePositiveInteger(value: string, name: string): number {
+  const parsed = parseNonNegativeInteger(value, name);
+  if (parsed <= 0) throw new Error(`${name} must be greater than zero`);
   return parsed;
 }
 
@@ -178,8 +194,12 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       maxBasisBps: parseNonNegativeDecimal(environment.GCT_FUNDING_MAX_BASIS_BPS ?? '30', 'GCT_FUNDING_MAX_BASIS_BPS'),
       maxHoldingMs: parseNonNegativeInteger(environment.GCT_FUNDING_MAX_HOLDING_MS ?? '28800000', 'GCT_FUNDING_MAX_HOLDING_MS'),
       confirmationCount: parseNonNegativeInteger(environment.GCT_FUNDING_CONFIRMATION_COUNT ?? '3', 'GCT_FUNDING_CONFIRMATION_COUNT'),
-      confirmationWindowMs: parseNonNegativeInteger(environment.GCT_FUNDING_CONFIRMATION_WINDOW_MS ?? '10000', 'GCT_FUNDING_CONFIRMATION_WINDOW_MS'),
+      confirmationWindowMs: parseNonNegativeInteger(environment.GCT_FUNDING_CONFIRMATION_WINDOW_MS ?? '180000', 'GCT_FUNDING_CONFIRMATION_WINDOW_MS'),
       minNetAnnualized: parseNonNegativeDecimal(environment.GCT_FUNDING_MIN_NET_ANNUALIZED ?? '0.10', 'GCT_FUNDING_MIN_NET_ANNUALIZED'),
+      leverage: parsePositiveDecimal(environment.GCT_FUNDING_LEVERAGE ?? '1', 'GCT_FUNDING_LEVERAGE'),
+      scanTargetNotionalUsd: parsePositiveDecimal(environment.GCT_FUNDING_SCAN_TARGET_NOTIONAL_USD ?? '5', 'GCT_FUNDING_SCAN_TARGET_NOTIONAL_USD'),
+      scanHorizonHours: parsePositiveInteger(environment.GCT_FUNDING_SCAN_HORIZON_HOURS ?? '24', 'GCT_FUNDING_SCAN_HORIZON_HOURS'),
+      scanIntervalMs: parsePositiveInteger(environment.GCT_FUNDING_SCAN_INTERVAL_MS ?? '60000', 'GCT_FUNDING_SCAN_INTERVAL_MS'),
     },
   };
 }

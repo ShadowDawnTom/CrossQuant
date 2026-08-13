@@ -47,6 +47,12 @@ async function shutdown(signal: string): Promise<void> {
   if (closing) return;
   closing = true;
   app.log.info({ signal }, 'shutting down local backend');
+  // 上游限频冷却可能让某个认证请求暂时挂起。给撤单和落盘留足时间，但不能让 systemd 永久卡在 stopping。
+  const shutdownDeadline = setTimeout(() => {
+    app.log.fatal({ signal }, 'graceful shutdown deadline exceeded');
+    process.exit(1);
+  }, 30_000);
+  shutdownDeadline.unref();
   try {
     await app.close();
     prepareDatabaseForClose(database);
@@ -54,6 +60,7 @@ async function shutdown(signal: string): Promise<void> {
   } catch (error) {
     app.log.error(error, 'shutdown cleanup failed');
   } finally {
+    clearTimeout(shutdownDeadline);
     stopServiceParentMonitor?.();
     processLock.release();
   }

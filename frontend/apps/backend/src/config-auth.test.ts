@@ -30,4 +30,9 @@ describe('browser authentication config', () => {
     });
     expect([...config.browserAuth.allowedEmails]).toEqual(['owner@example.com', 'operator@example.com']);
   });
+
+  it('rejects zero-valued funding scanner intervals and leverage', () => {
+    expect(() => loadConfig({ GCT_FUNDING_SCAN_INTERVAL_MS: '0' })).toThrow('must be greater than zero');
+    expect(() => loadConfig({ GCT_FUNDING_LEVERAGE: '0' })).toThrow('must be greater than zero');
+  });
 });

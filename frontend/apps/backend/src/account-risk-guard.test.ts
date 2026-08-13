@@ -82,6 +82,14 @@ describe('account risk guard', () => {
     expect(decision).toMatchObject({ safe: false, code: 'adl_rank_missing' });
   });
 
+  it('adds planned entry exposure before enforcing the gross limit', () => {
+    const decision = evaluateAccountRisk({
+      portfolio: portfolio({ value: '9990' }), dailyRealizedPnlUsd: '0', dailyPnlComplete: true,
+      plannedGrossExposureUsd: '20', nowMs: now, requirePrivateStream: true,
+    }, limits);
+    expect(decision).toMatchObject({ safe: false, code: 'gross_exposure_exceeded' });
+  });
+
   it('fails closed when the daily trade page may be truncated', () => {
     expect(evaluateAccountRisk({
       portfolio: portfolio(), dailyRealizedPnlUsd: '0', dailyPnlComplete: false,

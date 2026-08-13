@@ -16,6 +16,8 @@ export interface AccountRiskContext {
   adlRanks?: ReadonlyMap<string, number>;
   nowMs: number;
   requirePrivateStream: boolean;
+  /** 即将新增的两腿名义敞口；入场前必须和现有仓位一起检查。 */
+  plannedGrossExposureUsd?: string;
 }
 
 export type AccountRiskDecision = { safe: true } | { safe: false; code: string; reason: string };
@@ -54,8 +56,9 @@ export function evaluateAccountRisk(context: AccountRiskContext, limits: Account
 
   const grossExposure = portfolio.snapshot.futuresPositions
     .reduce((sum, position) => sum.plus(new Decimal(position.value).abs()), new Decimal(0));
-  if (!grossExposure.isFinite() || grossExposure.gt(limits.maxGrossExposureUsd)) {
-    return { safe: false, code: 'gross_exposure_exceeded', reason: `Gross futures exposure is ${grossExposure.toString()} USD` };
+  const projectedGrossExposure = grossExposure.plus(new Decimal(context.plannedGrossExposureUsd ?? '0'));
+  if (!projectedGrossExposure.isFinite() || projectedGrossExposure.gt(limits.maxGrossExposureUsd)) {
+    return { safe: false, code: 'gross_exposure_exceeded', reason: `Projected gross futures exposure is ${projectedGrossExposure.toString()} USD` };
   }
 
   const unrealizedPnl = portfolio.snapshot.balances

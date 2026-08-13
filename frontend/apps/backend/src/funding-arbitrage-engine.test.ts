@@ -31,13 +31,15 @@ function market(): ExecutionMarketReader {
   };
 }
 
-function harness(states: string[] = ['FILLED', 'FILLED']) {
+function harness(states: string[] = ['FILLED', 'FILLED'], minimumNotional = '5') {
   const directory = mkdtempSync(join(tmpdir(), 'funding-engine-'));
   const database = openDatabase(join(directory, 'test.sqlite'), resolve(process.cwd(), '../../migrations'));
   harnesses.push({ directory, database });
   let sequence = 0;
+  let plannedGrossExposure: string | undefined;
   const orders = new Map<string, ExecutionOrder>();
   const runtime = {
+    prepareStrategyMargin: async () => ({ requiredMargin: '1', availableMargin: '100' }),
     createOrder: async (input: { side: 'BUY' | 'SELL'; quantity: string; type: 'LIMIT' | 'MARKET'; price?: string }, metadata: { clientOrderId: string }) => {
       sequence += 1;
       if (states[sequence - 1] === 'THROW') throw new Error('definitive submit rejection');
@@ -58,18 +60,20 @@ function harness(states: string[] = ['FILLED', 'FILLED']) {
   const engine = new FundingArbitrageEngine(database, runtime, market(), {
     limits: { enabled: true, maxNotionalPerLegUsd: '20', maxConcurrentTrades: 1, maxUnhedgedMs: 20,
       maxNetBaseExposure: '1', maxEntrySlippageBps: '5', maxBasisBps: '30', maxHoldingMs: 60_000,
-      confirmationCount: 2, confirmationWindowMs: 10_000, minNetAnnualized: '0.1' },
-    accountRiskCheck: () => ({ safe: true }), alertDispatcher: new AlertDispatcher(database, { webhookUrl: null }),
+      confirmationCount: 2, confirmationWindowMs: 10_000, minNetAnnualized: '0.1', leverage: '1' },
+    accountRiskCheck: (planned) => { plannedGrossExposure = planned; return { safe: true }; }, alertDispatcher: new AlertDispatcher(database, { webhookUrl: null }),
+    loadInstrumentRules: async (symbols) => symbols.map((symbol) => ({ symbol, state: 'live', minSize: '0.01',
+      minNotional: minimumNotional, lotSize: '0.01', tickSize: '0.01', maxMarketSize: '1000', maxLimitSize: '1000' })),
     onKillSwitch: (reason) => { killReasons.push(reason); }, orderTimeoutMs: 20,
   });
-  return { engine, database, killReasons, orders };
+  return { engine, database, killReasons, orders, plannedGrossExposure: () => plannedGrossExposure };
 }
 
 async function confirmed(engine: FundingArbitrageEngine) {
   const observation = { asset: 'SOL', longVenue: 'BINANCE', shortVenue: 'OKX', quantity: '0.1',
     longRate: '0.0001', shortRate: '0.0003', netAnnualized: '0.2' };
-  await engine.observeCandidate(observation);
-  return engine.observeCandidate(observation);
+  await engine.observeAuthoritativeCandidate(observation);
+  return engine.observeAuthoritativeCandidate(observation);
 }
 
 afterEach(() => {
@@ -119,5 +123,34 @@ describe('FundingArbitrageEngine', () => {
     expect(result.state).toBe('REJECTED');
     expect([...orders.values()].at(-1)?.side).toBe('SELL');
     expect(killReasons).toEqual([]);
+  });
+
+  it('入场前把两腿预计名义敞口传给账户硬风控', async () => {
+    const { engine, plannedGrossExposure } = harness();
+    const candidate = await confirmed(engine);
+    await engine.start({ idempotencyKey: 'funding:test:risk', candidateId: candidate.id,
+      asset: 'SOL', longVenue: 'BINANCE', shortVenue: 'OKX', quantity: '0.1' });
+    expect(plannedGrossExposure()).toBe('19.99');
+  });
+
+  it('任一腿不满足最小名义金额时在创建订单前拒绝', async () => {
+    const { engine, orders } = harness(['FILLED', 'FILLED'], '50');
+    const candidate = await confirmed(engine);
+    await expect(engine.start({ idempotencyKey: 'funding:test:min-notional', candidateId: candidate.id,
+      asset: 'SOL', longVenue: 'BINANCE', shortVenue: 'OKX', quantity: '0.1' }))
+      .rejects.toMatchObject({ code: 'order_below_minimum_notional' });
+    expect(orders.size).toBe(0);
+  });
+
+  it('重启后无法确认的入场状态转人工并触发 Kill Switch', async () => {
+    const { engine, database, killReasons } = harness();
+    const now = new Date().toISOString();
+    database.prepare(`INSERT INTO funding_arbitrage_trades
+      (id, idempotency_key, asset, long_venue, short_venue, requested_quantity, state, phase, execution_mode, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run('restart-uncertain', 'funding:restart:uncertain', 'SOL', 'BINANCE', 'OKX', '0.1', 'SUBMITTING', 'ENTRY', 'FOK', now, now);
+    expect(await engine.recover()).toBe(true);
+    expect(engine.get('restart-uncertain').state).toBe('MANUAL_INTERVENTION');
+    expect(killReasons).toEqual(['funding_arbitrage:restart-uncertain:restart_reconciliation_uncertain']);
   });
 });

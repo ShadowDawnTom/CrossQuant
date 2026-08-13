@@ -61,6 +61,18 @@ export interface FundingArbitrageLimits {
   confirmationCount: number;
   confirmationWindowMs: number;
   minNetAnnualized: string;
+  leverage: string;
+}
+
+export interface FundingInstrumentRule {
+  symbol: string;
+  state: string;
+  minSize: string;
+  minNotional: string | null;
+  lotSize: string;
+  tickSize: string;
+  maxMarketSize: string | null;
+  maxLimitSize: string | null;
 }
 
 export interface FundingTradeRecord {
@@ -106,7 +118,8 @@ interface FundingTradeRow {
 
 export interface FundingArbitrageEngineOptions {
   limits: FundingArbitrageLimits;
-  accountRiskCheck: () => AccountRiskDecision | Promise<AccountRiskDecision>;
+  accountRiskCheck: (plannedGrossExposureUsd?: string) => AccountRiskDecision | Promise<AccountRiskDecision>;
+  loadInstrumentRules: (symbols: string[]) => Promise<FundingInstrumentRule[]>;
   alertDispatcher: AlertDispatcher;
   onKillSwitch: (reason: string) => void | Promise<void>;
   executionGuard?: () => { safe: true } | { safe: false; reason: string };
@@ -154,6 +167,13 @@ function executablePrice(levels: readonly (readonly [string, string])[], quantit
   return null;
 }
 
+function roundToStep(value: Decimal, stepText: string, direction: 'up' | 'down'): Decimal {
+  const step = new Decimal(stepText);
+  if (!step.isFinite() || !step.gt(0)) throw new FundingArbitrageError('invalid_instrument_step', 409);
+  const units = value.div(step);
+  return (direction === 'up' ? units.ceil() : units.floor()).mul(step);
+}
+
 /**
  * 资金费套利的持久化执行器。普通入场严格 fail-closed；异常修复只能减仓，无法确认时锁死新单并转人工。
  */
@@ -189,15 +209,13 @@ export class FundingArbitrageEngine {
   }
 
   /** 同一候选必须连续通过真实盘口和净收益检查，过期观察会从 1 重新计数。 */
-  async observeCandidate(raw: unknown): Promise<FundingCandidateRecord> {
+  async observeAuthoritativeCandidate(raw: unknown): Promise<FundingCandidateRecord> {
     const observation = FundingCandidateObservationSchema.parse(raw);
-    if (new Decimal(observation.shortRate).minus(observation.longRate).lte(0)) {
-      throw new FundingArbitrageError('funding_direction_not_profitable', 409);
-    }
+    // 不同结算周期必须按实际事件现金流判断，不能再用当前两条费率直接相减。
     if (new Decimal(observation.netAnnualized).lt(this.options.limits.minNetAnnualized)) {
       throw new FundingArbitrageError('funding_net_return_below_threshold', 409);
     }
-    this.precheck({ ...observation, idempotencyKey: 'candidate-check', timeInForce: 'FOK', candidateId: randomUUID() });
+    this.marketPrecheck({ ...observation, idempotencyKey: 'candidate-check', timeInForce: 'FOK', candidateId: randomUUID() }, false);
     const candidateKey = `${observation.asset}:${observation.longVenue}:${observation.shortVenue}:${observation.quantity}`;
     const previous = this.database.prepare('SELECT * FROM funding_arbitrage_candidates WHERE candidate_key = ?')
       .get(candidateKey) as Record<string, string | number | null> | undefined;
@@ -252,13 +270,15 @@ export class FundingArbitrageEngine {
     return this.get(id);
   }
 
-  private precheck(input: StartFundingTrade): ExecutionPairSnapshot {
-    if (!this.options.limits.enabled) throw new FundingArbitrageError('funding_live_disabled', 403);
+  private marketPrecheck(input: StartFundingTrade, enforceLiveLimits: boolean): ExecutionPairSnapshot {
+    if (enforceLiveLimits && !this.options.limits.enabled) throw new FundingArbitrageError('funding_live_disabled', 403);
     const executionGuard = this.options.executionGuard?.() ?? { safe: true as const };
     if (!executionGuard.safe) throw new FundingArbitrageError('global_kill_switch_active', 409, executionGuard.reason);
-    const active = this.database.prepare(`SELECT COUNT(*) AS count FROM funding_arbitrage_trades
-      WHERE state NOT IN ('CLOSED', 'REJECTED')`).get() as { count: number };
-    if (active.count >= this.options.limits.maxConcurrentTrades) throw new FundingArbitrageError('max_concurrent_trades', 409);
+    if (enforceLiveLimits) {
+      const active = this.database.prepare(`SELECT COUNT(*) AS count FROM funding_arbitrage_trades
+        WHERE state NOT IN ('CLOSED', 'REJECTED')`).get() as { count: number };
+      if (active.count >= this.options.limits.maxConcurrentTrades) throw new FundingArbitrageError('max_concurrent_trades', 409);
+    }
     const pair = this.market.pair(input.asset, input.longVenue, input.shortVenue, this.now());
     if (pair.quality !== 'LIVE_SYNCHRONIZED') {
       throw new FundingArbitrageError('market_not_synchronized', 409, pair.reasons.join(','));
@@ -279,10 +299,48 @@ export class FundingArbitrageEngine {
       .div(longFill.average.plus(shortFill.average).div(2)).mul(10_000);
     if (basis.gt(this.options.limits.maxBasisBps)) throw new FundingArbitrageError('basis_exceeded', 409);
     const maxNotional = Decimal.max(longFill.average, shortFill.average).mul(quantity);
-    if (maxNotional.gt(this.options.limits.maxNotionalPerLegUsd)) {
+    if (enforceLiveLimits && maxNotional.gt(this.options.limits.maxNotionalPerLegUsd)) {
       throw new FundingArbitrageError('leg_notional_exceeded', 409);
     }
     return pair;
+  }
+
+  /**
+   * Gate 的每条腿有独立步长和最小名义金额。两腿任一规则缺失或不兼容就拒绝，
+   * 保护价也必须按各自 tick size 朝更容易成交的方向取整。
+   */
+  private async validateInstrumentRules(input: StartFundingTrade, pair: ExecutionPairSnapshot): Promise<{
+    longProtection: string; shortProtection: string; projectedGrossExposure: string;
+  }> {
+    const longSymbol = symbol(input.longVenue, input.asset);
+    const shortSymbol = symbol(input.shortVenue, input.asset);
+    const rules = await this.options.loadInstrumentRules([longSymbol, shortSymbol]);
+    const bySymbol = new Map(rules.map((rule) => [rule.symbol, rule]));
+    const quantity = new Decimal(input.quantity);
+    const longFill = executablePrice(pair.longBook.asks, quantity);
+    const shortFill = executablePrice(pair.shortBook.bids, quantity);
+    if (!longFill || !shortFill) throw new FundingArbitrageError('insufficient_order_book_depth', 409);
+    for (const [target, fill] of [[longSymbol, longFill], [shortSymbol, shortFill]] as const) {
+      const rule = bySymbol.get(target);
+      if (!rule || rule.state !== 'live') throw new FundingArbitrageError('instrument_rule_unavailable', 503, target);
+      const lot = new Decimal(rule.lotSize);
+      const minimum = new Decimal(rule.minSize);
+      if (!lot.isFinite() || !lot.gt(0) || !minimum.isFinite() || quantity.lt(minimum) || !quantity.mod(lot).isZero()) {
+        throw new FundingArbitrageError('invalid_order_quantity_for_instrument', 400, target);
+      }
+      if (rule.minNotional !== null && fill.average.mul(quantity).lt(rule.minNotional)) {
+        throw new FundingArbitrageError('order_below_minimum_notional', 400, target);
+      }
+      const maximum = input.timeInForce === 'FOK' ? rule.maxLimitSize : rule.maxMarketSize;
+      if (maximum !== null && new Decimal(maximum).gt(0) && quantity.gt(maximum)) {
+        throw new FundingArbitrageError('order_above_maximum_size', 400, target);
+      }
+    }
+    return {
+      longProtection: roundToStep(longFill.last, bySymbol.get(longSymbol)!.tickSize, 'up').toString(),
+      shortProtection: roundToStep(shortFill.last, bySymbol.get(shortSymbol)!.tickSize, 'down').toString(),
+      projectedGrossExposure: longFill.average.plus(shortFill.average).mul(quantity).toString(),
+    };
   }
 
   async start(raw: unknown): Promise<FundingTradeRecord> {
@@ -298,9 +356,16 @@ export class FundingArbitrageEngine {
       || this.now() - Date.parse(candidate.last_seen_at) > this.options.limits.confirmationWindowMs) {
       throw new FundingArbitrageError('funding_candidate_not_confirmed', 409);
     }
-    const risk = await this.options.accountRiskCheck();
+    const pair = this.marketPrecheck(input, true);
+    const compliance = await this.validateInstrumentRules(input, pair);
+    const risk = await this.options.accountRiskCheck(compliance.projectedGrossExposure);
     if (!risk.safe) throw new FundingArbitrageError(risk.code, 409, risk.reason);
-    const pair = this.precheck(input);
+    await this.runtime.prepareStrategyMargin([
+      { symbol: symbol(input.longVenue, input.asset), venue: input.longVenue, side: 'BUY', leverage: this.options.limits.leverage,
+        estimatedQuantity: input.quantity, estimatedPrice: pair.longBook.asks[0]![0] },
+      { symbol: symbol(input.shortVenue, input.asset), venue: input.shortVenue, side: 'SELL', leverage: this.options.limits.leverage,
+        estimatedQuantity: input.quantity, estimatedPrice: pair.shortBook.bids[0]![0] },
+    ]);
     const id = randomUUID();
     const now = new Date(this.now()).toISOString();
     this.database.prepare(`INSERT INTO funding_arbitrage_trades
@@ -313,7 +378,7 @@ export class FundingArbitrageEngine {
       quality: pair.quality, exchangeSkewMs: pair.exchangeSkewMs, receiveSkewMs: pair.receiveSkewMs,
     });
     this.busy = true;
-    try { return await this.executeEntry(id, pair); } finally { this.busy = false; }
+    try { return await this.executeEntry(id, compliance.longProtection, compliance.shortProtection); } finally { this.busy = false; }
   }
 
   private async submitLeg(trade: FundingTradeRecord, leg: 'long' | 'short', phase: 'entry' | 'exit', quantity: string,
@@ -347,12 +412,8 @@ export class FundingArbitrageEngine {
     return await this.runtime.awaitTerminalOrder(settled.id, this.orderTimeoutMs);
   }
 
-  private async executeEntry(id: string, pair: ExecutionPairSnapshot): Promise<FundingTradeRecord> {
+  private async executeEntry(id: string, longProtection: string, shortProtection: string): Promise<FundingTradeRecord> {
     let trade = this.update(id, { state: 'SUBMITTING', phase: 'ENTRY' });
-    const quantity = new Decimal(trade.requestedQuantity);
-    const longProtection = executablePrice(pair.longBook.asks, quantity)?.last.toString();
-    const shortProtection = executablePrice(pair.shortBook.bids, quantity)?.last.toString();
-    if (!longProtection || !shortProtection) return this.manual(id, 'protected_price_unavailable', {});
     const longClient = clientOrderId(id, 'entry', 'long');
     const shortClient = clientOrderId(id, 'entry', 'short');
     const submitted = await Promise.allSettled([

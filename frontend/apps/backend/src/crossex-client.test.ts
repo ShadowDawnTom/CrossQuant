@@ -182,6 +182,19 @@ describe('Gate APIv4 signing', () => {
     expect(symbols[0]).toMatchObject({ symbol: 'GATE_FUTURE_BTC_USDT', min_notional: null });
   });
 
+  it('queries authenticated CrossEx funding information for exact symbols', async () => {
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      expect(String(url)).toContain('/crossex/market/funding_info?symbols=BINANCE_FUTURE_SOL_USDT,OKX_FUTURE_SOL_USDT');
+      expect(init?.headers).toEqual(expect.objectContaining({ KEY: 'test-api-key' }));
+      return new Response(JSON.stringify([{ symbol: 'BINANCE_FUTURE_SOL_USDT', funding_rate: '0.0001',
+        funding_time: '1786608000000', funding_interval: '28800' }]), { status: 200 });
+    });
+    const client = new GateCrossExClient(fetchMock as typeof fetch, () => 1_700_000_000_000);
+    const rows = await client.queryFundingInfo({ apiKey: 'test-api-key', apiSecret: 'test-secret' },
+      ['BINANCE_FUTURE_SOL_USDT', 'OKX_FUTURE_SOL_USDT']);
+    expect(rows[0]?.funding_interval).toBe('28800');
+  });
+
   it('queries a single order by id or client text with the documented GET route', async () => {
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       expect(init?.method).toBe('GET');
