@@ -1,6 +1,6 @@
 # CrossQuant 跨所资金费套利使用教程
 
-> 适用范围：Gate CrossEx 账户下，在 Gate、Binance、OKX、Bybit 永续合约之间做资金费套利。  
+> 适用范围：Gate CrossEx 账户下，在 Gate、Binance、OKX、Bybit 永续合约之间做资金费套利。
 > 这不是收益承诺。资金费率会变化，基差可能扩大，两腿可能无法同时成交。第一次实盘必须从 Canary 小额人工确认开始。
 
 ## 1. 先用一句话理解这个策略
