@@ -35,4 +35,9 @@ describe('browser authentication config', () => {
     expect(() => loadConfig({ GCT_FUNDING_SCAN_INTERVAL_MS: '0' })).toThrow('must be greater than zero');
     expect(() => loadConfig({ GCT_FUNDING_LEVERAGE: '0' })).toThrow('must be greater than zero');
   });
+
+  it('Telegram Token 和 Chat ID 必须成对配置', () => {
+    expect(() => loadConfig({ TELEGRAM_BOT_TOKEN: 'token-only' })).toThrow('must be configured together');
+    expect(loadConfig({ TELEGRAM_ALERT_ENABLED: '0', TELEGRAM_BOT_TOKEN: 'ignored' }).riskLimits.telegramBotToken).toBeNull();
+  });
 });

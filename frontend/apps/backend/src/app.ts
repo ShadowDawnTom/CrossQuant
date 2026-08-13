@@ -626,20 +626,18 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     plannedGrossExposureUsd,
   }, config.riskLimits);
 
-  const alertDispatcher = new AlertDispatcher(database, { webhookUrl: config.riskLimits.alertWebhookUrl });
+  const telegramConfigured = config.riskLimits.telegramBotToken && config.riskLimits.telegramChatId;
+  const alertDispatcher = new AlertDispatcher(database, {
+    webhookUrl: config.riskLimits.alertWebhookUrl,
+    telegram: telegramConfigured ? { botToken: config.riskLimits.telegramBotToken!,
+      chatId: config.riskLimits.telegramChatId!, timeoutMs: config.riskLimits.telegramTimeoutMs } : null,
+  });
 
   const sendRiskAlert = async (reason: string): Promise<void> => {
     addAuditEvent(database, 'global_kill_switch_triggered', { reason });
     app.log.error({ reason }, 'global trading kill switch triggered');
-    if (!config.riskLimits.alertWebhookUrl) return;
-    const response = await fetch(config.riskLimits.alertWebhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      body: JSON.stringify({ event: 'gate_crossex_kill_switch', reason, occurredAt: new Date().toISOString() }),
-      redirect: 'error',
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (!response.ok) throw new Error(`risk alert webhook returned ${response.status}`);
+    await alertDispatcher.emit({ eventType: 'gate_crossex_kill_switch', severity: 'critical',
+      message: `全局 Kill Switch 已触发：${reason}`, details: { reason }, dedupKey: `kill-switch:${reason}` });
   };
 
   // Strategies may trade catalog-only tickers (e.g. stock perps) that nothing has watched yet, so

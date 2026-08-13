@@ -62,6 +62,8 @@ GCT_FUNDING_MAX_HOLDING_MS=28800000
 
 告警先写入 SQLite 的 `operational_alerts`，再发送 `GCT_RISK_ALERT_WEBHOOK_URL`。Webhook 失败不会阻塞撤单和 Kill Switch，同类告警在短窗口内会去重。
 
+Telegram 可使用 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID` 和 `TELEGRAM_REQUEST_TIMEOUT_MS`。真实值只能放服务器权限为 `0640` 的 EnvironmentFile；发送器会限制消息长度，并对 Telegram 429 最多退避重试三次。
+
 The private account stream must also be live. Invalid decimals, missing account data, failed reconciliation, stale snapshots, an incomplete current-day trade page, and missing ADL data when the ADL limit is enabled all fail closed. CrossEx ADL rank uses 1–5 with a larger value representing higher reduction priority; the backend deliberately uses the normalized CrossEx rank instead of venue-specific raw ranks. See the official [`GET /crossex/adl_rank` documentation](https://www.gate.com/docs/developers/crossex/en/#query-adl-position-reduction-ranking).
 
 ## Manual emergency stop

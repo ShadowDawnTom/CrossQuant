@@ -41,6 +41,9 @@ export interface BackendConfig {
     maxPortfolioAgeMs: number;
     maxAdlRank: number | null;
     alertWebhookUrl: string | null;
+    telegramBotToken: string | null;
+    telegramChatId: string | null;
+    telegramTimeoutMs: number;
   };
   fundingArbitrage: {
     enabled: boolean;
@@ -114,6 +117,12 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     .split(',').map((email) => email.trim().toLowerCase()).filter(Boolean));
   const traderEmails = new Set((environment.GCT_AUTH_TRADER_EMAILS ?? '')
     .split(',').map((email) => email.trim().toLowerCase()).filter(Boolean));
+  const telegramEnabled = environment.TELEGRAM_ALERT_ENABLED !== '0';
+  const telegramBotToken = telegramEnabled ? environment.TELEGRAM_BOT_TOKEN?.trim() || null : null;
+  const telegramChatId = telegramEnabled ? environment.TELEGRAM_CHAT_ID?.trim() || null : null;
+  if ((telegramBotToken === null) !== (telegramChatId === null)) {
+    throw new Error('TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be configured together');
+  }
   if (authEnabled) {
     if (!authBaseUrl.startsWith('https://')) throw new Error('GCT_AUTH_BASE_URL must use https when authentication is enabled');
     if (!googleClientId || !googleClientSecret) throw new Error('Google OAuth credentials are required when authentication is enabled');
@@ -182,6 +191,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
         ? null
         : parseNonNegativeInteger(environment.GCT_RISK_MAX_ADL_RANK, 'GCT_RISK_MAX_ADL_RANK'),
       alertWebhookUrl: environment.GCT_RISK_ALERT_WEBHOOK_URL?.trim() || null,
+      telegramBotToken,
+      telegramChatId,
+      telegramTimeoutMs: parsePositiveInteger(environment.TELEGRAM_REQUEST_TIMEOUT_MS ?? '10000', 'TELEGRAM_REQUEST_TIMEOUT_MS'),
     },
     fundingArbitrage: {
       // 新状态机即使部署到生产也默认关闭，必须由运维显式设置开关和所有额度。
