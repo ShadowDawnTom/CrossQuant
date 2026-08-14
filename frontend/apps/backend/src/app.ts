@@ -76,6 +76,7 @@ import { evaluateAccountRisk } from './account-risk-guard.js';
 import { AlertDispatcher } from './alert-dispatcher.js';
 import { FundingArbitrageEngine, FundingArbitrageError } from './funding-arbitrage-engine.js';
 import { FundingCandidateScanner, fundingRule } from './funding-candidate-scanner.js';
+import { FundingHoldingMonitor } from './funding-holding-monitor.js';
 import { readDatabaseStatus } from './database.js';
 import { runDatabaseMaintenance } from './database-maintenance.js';
 import {
@@ -670,6 +671,13 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     },
   });
   const tradingGateway = crossExGateway as Partial<TradingCrossExGateway>;
+  const fundingHoldingMonitor = new FundingHoldingMonitor(
+    database,
+    crossExGateway as Partial<PortfolioOperationsCrossExGateway>,
+    () => credentialVault.get(DEFAULT_CREDENTIAL_PROFILE),
+    fundingArbitrageEngine,
+    config.fundingArbitrage.holdingMonitorIntervalMs,
+  );
   const fundingCandidateScanner = tradingGateway.queryFundingInfo && tradingGateway.queryFeeRates
     ? new FundingCandidateScanner(tradingGateway as TradingCrossExGateway,
       () => credentialVault.get(DEFAULT_CREDENTIAL_PROFILE), executionMarketHub, fundingArbitrageEngine, {
@@ -679,16 +687,25 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         fundingRetentionFactor: config.fundingArbitrage.fundingRetentionFactor,
         stressSlippageBps: config.fundingArbitrage.stressSlippageBps,
         adverseExitBasisBps: config.fundingArbitrage.adverseExitBasisBps,
+        onFundingData: async (funding, fees) => { await fundingHoldingMonitor.observe(funding, fees); },
       })
     : null;
+  let privateStreamWasLive = false;
   privateStream.subscribeStatus((status) => {
-    if (status.state === 'live') return;
+    if (status.state === 'live') { privateStreamWasLive = true; return; }
     void alertDispatcher.emit({
       eventType: 'private_stream_degraded', severity: status.state === 'authentication_failed' ? 'critical' : 'warning',
       message: `CrossEx 私有 WebSocket 状态变为 ${status.state}`,
       details: { reason: status.lastError, reconnectAttempt: status.retryAttempt },
       dedupKey: `private-stream:${status.state}:${status.lastError ?? 'unknown'}`,
     });
+    // 启动握手阶段不是事故；只有曾经 LIVE 后掉线，才锁死新单并退出已有资金费组合。
+    if (privateStreamWasLive) {
+      privateStreamWasLive = false;
+      void fundingArbitrageEngine.exitAllForSafety(`private_stream_${status.state}`).catch((error) => {
+        app.log.error({ err: error }, 'failed to exit funding positions after private stream degradation');
+      });
+    }
   });
 
   const quiesceForCredentialMutation = async (): Promise<void> => {
@@ -1226,6 +1243,18 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   }));
 
   app.get('/api/funding-arbitrage/candidates', async () => ({ candidates: fundingArbitrageEngine.listCandidates() }));
+
+  app.get('/api/funding-arbitrage/trades/:id/monitoring', async (request, reply) => {
+    const parsed = z.object({ id: z.string().uuid() }).safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_funding_trade_id' });
+    const trade = fundingArbitrageEngine.list().find((item) => item.id === parsed.data.id);
+    if (!trade) return reply.code(404).send({ error: 'funding_trade_not_found' });
+    return {
+      trade,
+      evaluations: fundingArbitrageEngine.listHoldingEvaluations(parsed.data.id),
+      expectedSettlements: fundingArbitrageEngine.listExpectedSettlements(parsed.data.id),
+    };
+  });
 
   app.post('/api/funding-arbitrage/trades', {
     config: { rateLimit: { max: 5, timeWindow: '1 minute' } },

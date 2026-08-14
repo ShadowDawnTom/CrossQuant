@@ -42,12 +42,14 @@ describe('FundingCandidateScanner', () => {
   it('后端按真实结算次数、双向盘口与四笔手续费生成候选', async () => {
     const candidates: Array<{ quantity: string; netAnnualized: string }> = [];
     const observe = vi.fn(async (input: { quantity: string; netAnnualized: string }) => { candidates.push(input); });
+    const onFundingData = vi.fn(async () => undefined);
     const scanner = new FundingCandidateScanner(gateway(), async () => ({ apiKey: 'key', apiSecret: 'secret' }), market(),
       { observeAuthoritativeCandidate: observe } as unknown as FundingArbitrageEngine,
       { assets: ['SOL'], targetNotionalUsd: '5', horizonHours: 24, fundingRetentionFactor: '0.5',
-        stressSlippageBps: '5', adverseExitBasisBps: '10', now: () => NOW });
+        stressSlippageBps: '5', adverseExitBasisBps: '10', onFundingData, now: () => NOW });
     expect(await scanner.scan()).toBe(1);
     expect(observe).toHaveBeenCalledOnce();
+    expect(onFundingData).toHaveBeenCalledOnce();
     expect(candidates[0]).toMatchObject({ quantity: '0.05' });
     // 当前盘口立即往返亏 0.1 USDT；资金费只保留 50%，再扣 15bp 压力缓冲和四笔手续费。
     expect(Number(candidates[0]?.netAnnualized)).toBeCloseTo(45.7512, 3);

@@ -5,6 +5,7 @@ import { z } from 'zod';
 import type { AccountRiskDecision } from './account-risk-guard.js';
 import type { AlertDispatcher } from './alert-dispatcher.js';
 import type { ExecutionMarketReader, ExecutionPairSnapshot, ExecutionVenue } from './execution-market-hub.js';
+import { evaluateFundingHolding, type FundingSettlementEvent } from './funding-holding-model.js';
 import { TradingRuntime, isTerminalOrderState, type ExecutionOrder } from './trading-runtime.js';
 
 const positiveDecimal = z.string().regex(/^\d+(?:\.\d+)?$/).refine((value) => new Decimal(value).gt(0));
@@ -56,8 +57,22 @@ export interface FundingArbitrageLimits {
   maxUnhedgedMs: number;
   maxNetBaseExposure: string;
   maxEntrySlippageBps: string;
+  maxExitSlippageBps: string;
   maxBasisBps: string;
   maxHoldingMs: number;
+  softReviewMs: number;
+  holdingMonitorIntervalMs: number;
+  holdingStaleMs: number;
+  holdingEventsPerLeg: number;
+  holdingExitConfirmationCount: number;
+  minimumHoldValueUsd: string;
+  settlementGuardMs: number;
+  settlementGraceMs: number;
+  settlementMaxErrorUsd: string;
+  settlementMaxErrorRatio: string;
+  fundingRetentionFactor: string;
+  stressSlippageBps: string;
+  adverseExitBasisBps: string;
   confirmationCount: number;
   confirmationWindowMs: number;
   minNetAnnualized: string;
@@ -99,6 +114,68 @@ export interface FundingTradeRecord {
   realizedPnl: string;
   expectedFunding: string | null;
   actualFunding: string | null;
+  entryLongPrice: string | null;
+  entryShortPrice: string | null;
+  monitorState: string;
+  lastMonitorAt: string | null;
+  softReviewAt: string | null;
+  hardDeadlineAt: string | null;
+  nextSettlementAt: string | null;
+  currentExitPnl: string | null;
+  holdValue: string | null;
+  currentBasisBps: string | null;
+  fundingEdge: string | null;
+  unprofitableCount: number;
+  lastMonitorReason: string | null;
+  cumulativeActualFunding: string;
+}
+
+export interface FundingHoldingObservation {
+  observedAt: string;
+  long: { fundingRate: string; fundingTime: string; fundingInterval: string; takerFeeRate: string };
+  short: { fundingRate: string; fundingTime: string; fundingInterval: string; takerFeeRate: string };
+}
+
+export interface FundingHoldingEvaluationRecord {
+  id: string;
+  tradeId: string;
+  observedAt: string;
+  decision: string;
+  reason: string;
+  marketQuality: string;
+  longRate: string | null;
+  shortRate: string | null;
+  fundingEdge: string | null;
+  conservativeFunding: string | null;
+  riskBuffer: string | null;
+  holdValue: string | null;
+  currentExitPnl: string | null;
+  basisBps: string | null;
+  exitSlippageBps: string | null;
+  unprofitableCount: number;
+  nextSettlementAt: string | null;
+  settlementEvents: FundingSettlementEvent[];
+  details: Record<string, unknown>;
+}
+
+export interface FundingExpectedSettlementRecord {
+  id: string;
+  tradeId: string;
+  symbol: string;
+  venue: string;
+  fundingTime: string;
+  expectedAmount: string;
+  state: string;
+  actualAmount: string | null;
+  reconciledAt: string | null;
+}
+
+export interface FundingLedgerRecord {
+  id: string;
+  symbol: string;
+  venue: string;
+  change: string;
+  createdAt: string;
 }
 
 export interface FundingCandidateRecord {
@@ -113,6 +190,11 @@ interface FundingTradeRow {
   long_order_id: string | null; short_order_id: string | null; repair_order_id: string | null;
   failure_reason: string | null; manual_reason: string | null; opened_at: string | null; closed_at: string | null;
   fees_paid: string; realized_pnl: string; expected_funding: string | null; actual_funding: string | null;
+  entry_long_price: string | null; entry_short_price: string | null;
+  monitor_state: string; last_monitor_at: string | null; soft_review_at: string | null; hard_deadline_at: string | null;
+  next_settlement_at: string | null; current_exit_pnl: string | null; hold_value: string | null;
+  current_basis_bps: string | null; funding_edge: string | null; unprofitable_count: number;
+  last_monitor_reason: string | null; cumulative_actual_funding: string;
   created_at: string; updated_at: string;
 }
 
@@ -141,6 +223,12 @@ function fromRow(row: FundingTradeRow): FundingTradeRecord {
     createdAt: row.created_at, updatedAt: row.updated_at,
     feesPaid: row.fees_paid, realizedPnl: row.realized_pnl,
     expectedFunding: row.expected_funding, actualFunding: row.actual_funding,
+    entryLongPrice: row.entry_long_price, entryShortPrice: row.entry_short_price,
+    monitorState: row.monitor_state, lastMonitorAt: row.last_monitor_at, softReviewAt: row.soft_review_at,
+    hardDeadlineAt: row.hard_deadline_at, nextSettlementAt: row.next_settlement_at,
+    currentExitPnl: row.current_exit_pnl, holdValue: row.hold_value, currentBasisBps: row.current_basis_bps,
+    fundingEdge: row.funding_edge, unprofitableCount: row.unprofitable_count,
+    lastMonitorReason: row.last_monitor_reason, cumulativeActualFunding: row.cumulative_actual_funding,
   };
 }
 
@@ -208,6 +296,37 @@ export class FundingArbitrageEngine {
       lastSeenAt: String(row.last_seen_at), consumedAt: row.consumed_at === null ? null : String(row.consumed_at) }));
   }
 
+  listHoldingEvaluations(tradeId: string, limit = 100): FundingHoldingEvaluationRecord[] {
+    const rows = this.database.prepare(`SELECT * FROM funding_holding_evaluations
+      WHERE trade_id = ? ORDER BY observed_at DESC LIMIT ?`).all(tradeId, Math.max(1, Math.min(500, limit))) as Array<Record<string, unknown>>;
+    return rows.map((row) => {
+      let settlementEvents: FundingSettlementEvent[] = [];
+      let details: Record<string, unknown> = {};
+      try { settlementEvents = JSON.parse(String(row.settlement_events_json)) as FundingSettlementEvent[]; } catch { /* 损坏记录不能拖垮只读页面。 */ }
+      try { details = JSON.parse(String(row.details_json)) as Record<string, unknown>; } catch { /* 同上。 */ }
+      return { id: String(row.id), tradeId: String(row.trade_id), observedAt: String(row.observed_at),
+        decision: String(row.decision), reason: String(row.reason), marketQuality: String(row.market_quality),
+        longRate: row.long_rate === null ? null : String(row.long_rate), shortRate: row.short_rate === null ? null : String(row.short_rate),
+        fundingEdge: row.funding_edge === null ? null : String(row.funding_edge),
+        conservativeFunding: row.conservative_funding === null ? null : String(row.conservative_funding),
+        riskBuffer: row.risk_buffer === null ? null : String(row.risk_buffer), holdValue: row.hold_value === null ? null : String(row.hold_value),
+        currentExitPnl: row.current_exit_pnl === null ? null : String(row.current_exit_pnl),
+        basisBps: row.basis_bps === null ? null : String(row.basis_bps),
+        exitSlippageBps: row.exit_slippage_bps === null ? null : String(row.exit_slippage_bps),
+        unprofitableCount: Number(row.unprofitable_count),
+        nextSettlementAt: row.next_settlement_at === null ? null : String(row.next_settlement_at), settlementEvents, details };
+    });
+  }
+
+  listExpectedSettlements(tradeId: string): FundingExpectedSettlementRecord[] {
+    const rows = this.database.prepare(`SELECT * FROM funding_expected_settlements
+      WHERE trade_id = ? ORDER BY funding_time DESC LIMIT 100`).all(tradeId) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({ id: String(row.id), tradeId: String(row.trade_id), symbol: String(row.symbol),
+      venue: String(row.venue), fundingTime: String(row.funding_time), expectedAmount: String(row.expected_amount),
+      state: String(row.state), actualAmount: row.actual_amount === null ? null : String(row.actual_amount),
+      reconciledAt: row.reconciled_at === null ? null : String(row.reconciled_at) }));
+  }
+
   /** 同一候选必须连续通过真实盘口和净收益检查，过期观察会从 1 重新计数。 */
   async observeAuthoritativeCandidate(raw: unknown): Promise<FundingCandidateRecord> {
     const observation = FundingCandidateObservationSchema.parse(raw);
@@ -258,10 +377,51 @@ export class FundingArbitrageEngine {
       .run(randomUUID(), tradeId, severity, eventType, message, JSON.stringify(details), new Date(this.now()).toISOString());
   }
 
+  private persistHoldingEvaluation(input: Omit<FundingHoldingEvaluationRecord, 'id'>): FundingHoldingEvaluationRecord {
+    const id = randomUUID();
+    this.database.prepare(`INSERT INTO funding_holding_evaluations
+      (id, trade_id, observed_at, decision, reason, market_quality, long_rate, short_rate, funding_edge,
+       conservative_funding, risk_buffer, hold_value, current_exit_pnl, basis_bps, exit_slippage_bps,
+       unprofitable_count, next_settlement_at, settlement_events_json, details_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, input.tradeId, input.observedAt, input.decision, input.reason, input.marketQuality,
+        input.longRate, input.shortRate, input.fundingEdge, input.conservativeFunding, input.riskBuffer,
+        input.holdValue, input.currentExitPnl, input.basisBps, input.exitSlippageBps,
+        input.unprofitableCount, input.nextSettlementAt, JSON.stringify(input.settlementEvents), JSON.stringify(input.details));
+    return { id, ...input };
+  }
+
+  private upsertExpectedSettlements(tradeId: string, events: readonly FundingSettlementEvent[], observedAt: string): void {
+    const statement = this.database.prepare(`INSERT INTO funding_expected_settlements
+      (id, trade_id, symbol, venue, funding_time, expected_amount, state, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)
+      ON CONFLICT(trade_id, symbol, funding_time) DO UPDATE SET
+        expected_amount = CASE WHEN funding_expected_settlements.state = 'PENDING'
+          THEN excluded.expected_amount ELSE funding_expected_settlements.expected_amount END`);
+    this.database.transaction(() => {
+      for (const event of events) statement.run(randomUUID(), tradeId, event.symbol, event.venue,
+        event.fundingTime, event.expectedAmount, observedAt);
+      const currentKeys = new Set(events.map((event) => `${event.symbol}:${event.fundingTime}`));
+      const futurePending = this.database.prepare(`SELECT id, symbol, funding_time FROM funding_expected_settlements
+        WHERE trade_id = ? AND state = 'PENDING' AND funding_time > ?`).all(tradeId, observedAt) as Array<{
+          id: string; symbol: string; funding_time: string;
+        }>;
+      for (const row of futurePending) {
+        if (!currentKeys.has(`${row.symbol}:${row.funding_time}`)) {
+          // 交易所调整结算时间或周期后，旧的未来事件不能再被误判成“资金费未到账”。
+          this.database.prepare("UPDATE funding_expected_settlements SET state = 'SUPERSEDED' WHERE id = ? AND state = 'PENDING'")
+            .run(row.id);
+        }
+      }
+    })();
+  }
+
   private update(id: string, fields: Record<string, string | null>): FundingTradeRecord {
     const allowed = new Set(['state', 'phase', 'open_quantity', 'long_order_id', 'short_order_id', 'repair_order_id',
       'failure_reason', 'manual_reason', 'entry_long_price', 'entry_short_price', 'exit_long_price', 'exit_short_price',
-      'opened_at', 'closed_at']);
+      'opened_at', 'closed_at', 'monitor_state', 'last_monitor_at', 'soft_review_at', 'hard_deadline_at',
+      'next_settlement_at', 'current_exit_pnl', 'hold_value', 'current_basis_bps', 'funding_edge',
+      'unprofitable_count', 'last_monitor_reason', 'cumulative_actual_funding']);
     for (const key of ['fees_paid', 'realized_pnl', 'expected_funding', 'actual_funding']) allowed.add(key);
     const entries = Object.entries(fields).filter(([key]) => allowed.has(key));
     const updatedAt = new Date(this.now()).toISOString();
@@ -278,6 +438,10 @@ export class FundingArbitrageEngine {
       const active = this.database.prepare(`SELECT COUNT(*) AS count FROM funding_arbitrage_trades
         WHERE state NOT IN ('CLOSED', 'REJECTED')`).get() as { count: number };
       if (active.count >= this.options.limits.maxConcurrentTrades) throw new FundingArbitrageError('max_concurrent_trades', 409);
+      const sameAsset = this.database.prepare(`SELECT COUNT(*) AS count FROM funding_arbitrage_trades
+        WHERE asset = ? AND state NOT IN ('CLOSED', 'REJECTED')`).get(input.asset) as { count: number };
+      // 账户资金费流水按交易所和合约聚合，同一币种并发组合会让自动对账无法唯一归属。
+      if (sameAsset.count > 0) throw new FundingArbitrageError('funding_asset_already_active', 409);
     }
     const pair = this.market.pair(input.asset, input.longVenue, input.shortVenue, this.now());
     if (pair.quality !== 'LIVE_SYNCHRONIZED') {
@@ -445,10 +609,13 @@ export class FundingArbitrageEngine {
       return this.update(trade.id, { state: 'REJECTED', failure_reason: 'no_matched_fill', open_quantity: '0' });
     }
     const openedAt = new Date(this.now()).toISOString();
+    const softReviewAt = new Date(this.now() + this.options.limits.softReviewMs).toISOString();
+    const hardDeadlineAt = new Date(this.now() + this.options.limits.maxHoldingMs).toISOString();
     this.event(trade.id, 'info', 'funding_position_opened', '两腿等量仓位已确认', { quantity: matched.toString() });
     return this.update(trade.id, { state: 'OPEN', phase: 'HOLDING', open_quantity: matched.toString(),
       entry_long_price: longOrder?.executedAveragePrice ?? null,
-      entry_short_price: shortOrder?.executedAveragePrice ?? null, opened_at: openedAt });
+      entry_short_price: shortOrder?.executedAveragePrice ?? null, opened_at: openedAt,
+      monitor_state: 'WAITING_FOR_DATA', soft_review_at: softReviewAt, hard_deadline_at: hardDeadlineAt });
   }
 
   private async flattenResidual(trade: FundingTradeRecord, residual: Decimal, phase: string): Promise<boolean> {
@@ -481,6 +648,13 @@ export class FundingArbitrageEngine {
   }
 
   async close(id: string): Promise<FundingTradeRecord> {
+    return this.closeQuantities(id);
+  }
+
+  private async closeQuantities(
+    id: string,
+    actualQuantities?: { long: Decimal; short: Decimal },
+  ): Promise<FundingTradeRecord> {
     if (this.busy) throw new FundingArbitrageError('funding_engine_busy', 409);
     const trade = this.get(id);
     if (trade.state === 'CLOSED') return trade;
@@ -488,20 +662,28 @@ export class FundingArbitrageEngine {
     this.busy = true;
     try {
       this.update(id, { state: 'SUBMITTING', phase: 'EXIT' });
+      const longTarget = actualQuantities?.long ?? new Decimal(trade.openQuantity);
+      const shortTarget = actualQuantities?.short ?? new Decimal(trade.openQuantity);
       const submitted = await Promise.allSettled([
-        this.submitLeg(trade, 'long', 'exit', trade.openQuantity),
-        this.submitLeg(trade, 'short', 'exit', trade.openQuantity),
+        longTarget.gt(0) ? this.submitLeg(trade, 'long', 'exit', longTarget.toString()) : Promise.resolve(null),
+        shortTarget.gt(0) ? this.submitLeg(trade, 'short', 'exit', shortTarget.toString()) : Promise.resolve(null),
       ]);
       const [longInitial, shortInitial] = await Promise.all([
-        this.resolveSubmitted(clientOrderId(id, 'exit', 'long'), submitted[0]!),
-        this.resolveSubmitted(clientOrderId(id, 'exit', 'short'), submitted[1]!),
+        longTarget.gt(0)
+          ? this.resolveSubmitted(clientOrderId(id, 'exit', 'long'), submitted[0] as PromiseSettledResult<ExecutionOrder>)
+          : Promise.resolve(null),
+        shortTarget.gt(0)
+          ? this.resolveSubmitted(clientOrderId(id, 'exit', 'short'), submitted[1] as PromiseSettledResult<ExecutionOrder>)
+          : Promise.resolve(null),
       ]);
       const [longOrder, shortOrder] = await Promise.all([this.settle(longInitial), this.settle(shortInitial)]);
-      if (!longOrder || !shortOrder || !isTerminalOrderState(longOrder.state) || !isTerminalOrderState(shortOrder.state)) {
+      const longUnknown = longTarget.gt(0) && (!longOrder || !isTerminalOrderState(longOrder.state));
+      const shortUnknown = shortTarget.gt(0) && (!shortOrder || !isTerminalOrderState(shortOrder.state));
+      if (longUnknown || shortUnknown) {
         return this.manual(id, 'exit_order_state_unknown', { longState: longOrder?.state, shortState: shortOrder?.state });
       }
-      const remainingLong = new Decimal(trade.openQuantity).minus(longOrder.executedQuantity);
-      const remainingShort = new Decimal(trade.openQuantity).minus(shortOrder.executedQuantity);
+      const remainingLong = longTarget.minus(longOrder?.executedQuantity ?? '0');
+      const remainingShort = shortTarget.minus(shortOrder?.executedQuantity ?? '0');
       const repairs = await Promise.all([
         remainingLong.gt(0) ? this.closeRemainingLeg(trade, 'long', remainingLong) : Promise.resolve(true),
         remainingShort.gt(0) ? this.closeRemainingLeg(trade, 'short', remainingShort) : Promise.resolve(true),
@@ -518,8 +700,9 @@ export class FundingArbitrageEngine {
         WHERE orders.strategy_id = ?`).get(id) as { fees: number; pnl: number };
       this.event(id, 'info', 'funding_position_closed', '两腿 Reduce-only 平仓已确认');
       return this.update(id, { state: 'CLOSED', phase: 'RECONCILED', open_quantity: '0', closed_at: closedAt,
-        exit_long_price: longOrder.executedAveragePrice, exit_short_price: shortOrder.executedAveragePrice,
-        fees_paid: new Decimal(accounting.fees).toString(), realized_pnl: new Decimal(accounting.pnl).toString() });
+        exit_long_price: longOrder?.executedAveragePrice ?? null, exit_short_price: shortOrder?.executedAveragePrice ?? null,
+        fees_paid: new Decimal(accounting.fees).toString(), realized_pnl: new Decimal(accounting.pnl).toString(),
+        monitor_state: 'CLOSED' });
     } finally { this.busy = false; }
   }
 
@@ -542,6 +725,182 @@ export class FundingArbitrageEngine {
     } catch { return false; }
   }
 
+  private async closeFromHoldingMonitor(
+    trade: FundingTradeRecord,
+    reason: string,
+    actualQuantities?: { long: Decimal; short: Decimal },
+  ): Promise<FundingTradeRecord> {
+    await this.options.alertDispatcher.emit({ eventType: 'funding_holding_exit_triggered', severity: 'warning',
+      message: `${trade.asset} 滚动持仓触发退出：${reason}`, details: { tradeId: trade.id, reason },
+      dedupKey: `funding-holding-exit:${trade.id}:${reason}` });
+    const maxBusyRetries = Math.ceil(Math.max(2_000, this.options.limits.maxUnhedgedMs + 500) / 100);
+    let busyRetries = 0;
+    while (true) {
+      try { return await this.closeQuantities(trade.id, actualQuantities); }
+      catch (error) {
+        if (error instanceof FundingArbitrageError && error.code === 'funding_engine_busy' && busyRetries < maxBusyRetries) {
+          // 另一条腿的修复或退出可能还在收尾；短暂等待后必须重试，不能把安全退出静默丢掉。
+          busyRetries += 1;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          continue;
+        }
+        return this.manual(trade.id, 'holding_monitor_exit_failed', {
+          reason, error: error instanceof Error ? error.message.slice(0, 160) : 'unknown',
+        });
+      }
+    }
+  }
+
+  async markHoldingDataUnavailable(id: string, reason: string, details: Record<string, unknown> = {}): Promise<FundingTradeRecord> {
+    const trade = this.get(id);
+    if (trade.state !== 'OPEN') return trade;
+    const observedAt = new Date(this.now()).toISOString();
+    const degradedCount = trade.unprofitableCount + 1;
+    const mustExit = degradedCount >= this.options.limits.holdingExitConfirmationCount;
+    this.persistHoldingEvaluation({ tradeId: id, observedAt, decision: mustExit ? 'EXIT' : 'DEGRADED', reason,
+      marketQuality: 'UNKNOWN', longRate: null, shortRate: null, fundingEdge: null,
+      conservativeFunding: null, riskBuffer: null, holdValue: null, currentExitPnl: null,
+      basisBps: null, exitSlippageBps: null, unprofitableCount: degradedCount,
+      nextSettlementAt: null, settlementEvents: [], details });
+    const updated = this.update(id, { monitor_state: mustExit ? 'EXIT' : 'DEGRADED', last_monitor_at: observedAt,
+      last_monitor_reason: reason, unprofitable_count: String(degradedCount) });
+    await this.options.alertDispatcher.emit({ eventType: 'funding_holding_data_degraded', severity: mustExit ? 'critical' : 'warning',
+      message: `${trade.asset} 持仓监控数据不可用：${reason}${mustExit ? '，连续超限正在退出' : ''}`,
+      details: { tradeId: id, degradedCount, ...details },
+      dedupKey: `funding-holding-data:${id}:${reason}:${mustExit ? 'exit' : 'warning'}` });
+    if (mustExit) {
+      await this.options.onKillSwitch(`funding_holding_data_degraded:${id}:${reason}`);
+      return this.closeFromHoldingMonitor(updated, reason);
+    }
+    return updated;
+  }
+
+  /**
+   * 使用最新费率、同步盘口和真实仓位计算继续持有价值。普通收益退出需要连续确认；
+   * 仓位漂移属于紧急风险，直接触发 Kill Switch 和减仓。
+   */
+  async evaluateOpenTrade(id: string, observation: FundingHoldingObservation): Promise<FundingTradeRecord> {
+    const trade = this.get(id);
+    if (trade.state !== 'OPEN' || !trade.openedAt) return trade;
+    const observedAt = observation.observedAt;
+    const quantity = new Decimal(trade.openQuantity);
+    const expectedLong = symbol(trade.longVenue, trade.asset);
+    const expectedShort = symbol(trade.shortVenue, trade.asset);
+    const positions = this.runtime.listLivePositions();
+    const longPosition = positions.find((position) => position.symbol === expectedLong);
+    const shortPosition = positions.find((position) => position.symbol === expectedShort);
+    const longQuantity = new Decimal(longPosition?.quantity ?? '0');
+    const shortQuantity = new Decimal(shortPosition?.quantity ?? '0');
+    const tolerance = new Decimal(this.options.limits.maxNetBaseExposure);
+    const quantityDrift = Decimal.max(longQuantity.minus(quantity).abs(), shortQuantity.plus(quantity).abs(), longQuantity.plus(shortQuantity).abs());
+    if (!longPosition || !shortPosition || quantityDrift.gt(tolerance)) {
+      this.persistHoldingEvaluation({ tradeId: id, observedAt, decision: 'EMERGENCY_EXIT', reason: 'position_drift',
+        marketQuality: 'UNKNOWN', longRate: observation.long.fundingRate, shortRate: observation.short.fundingRate,
+        fundingEdge: null, conservativeFunding: null, riskBuffer: null, holdValue: null, currentExitPnl: null,
+        basisBps: null, exitSlippageBps: null, unprofitableCount: trade.unprofitableCount,
+        nextSettlementAt: null, settlementEvents: [], details: { expected: quantity.toString(),
+          longQuantity: longQuantity.toString(), shortQuantity: shortQuantity.toString(), tolerance: tolerance.toString() } });
+      this.update(id, { monitor_state: 'EMERGENCY_EXIT', last_monitor_at: observedAt,
+        last_monitor_reason: 'position_drift' });
+      await this.options.alertDispatcher.emit({ eventType: 'funding_position_drift', severity: 'critical',
+        message: `${trade.asset} 两腿数量不再匹配，正在紧急减仓`, details: { tradeId: id,
+          longQuantity: longQuantity.toString(), shortQuantity: shortQuantity.toString() },
+        dedupKey: `funding-position-drift:${id}` });
+      await this.options.onKillSwitch(`funding_position_drift:${id}`);
+      if (longQuantity.lt(0) || shortQuantity.gt(0)) {
+        return this.manual(id, 'position_direction_unexpected', {
+          longQuantity: longQuantity.toString(), shortQuantity: shortQuantity.toString(),
+        });
+      }
+      return this.closeFromHoldingMonitor(trade, 'position_drift', {
+        long: Decimal.max(longQuantity, 0), short: Decimal.max(shortQuantity.neg(), 0),
+      });
+    }
+
+    let pair: ExecutionPairSnapshot;
+    try { pair = this.market.pair(trade.asset, trade.longVenue, trade.shortVenue, this.now()); }
+    catch {
+      return this.markHoldingDataUnavailable(id, 'market_snapshot_unavailable', {
+        longRate: observation.long.fundingRate, shortRate: observation.short.fundingRate,
+      });
+    }
+    if (pair.quality !== 'LIVE_SYNCHRONIZED') {
+      return this.markHoldingDataUnavailable(id, 'market_not_synchronized', {
+        marketQuality: pair.quality, reasons: pair.reasons,
+        longRate: observation.long.fundingRate, shortRate: observation.short.fundingRate,
+      });
+    }
+
+    const longExit = executablePrice(pair.longBook.bids, quantity);
+    const shortExit = executablePrice(pair.shortBook.asks, quantity);
+    const longTop = new Decimal(pair.longBook.bids[0]?.[0] ?? '0');
+    const shortTop = new Decimal(pair.shortBook.asks[0]?.[0] ?? '0');
+    if (!longExit || !shortExit || !longTop.gt(0) || !shortTop.gt(0) || !trade.entryLongPrice || !trade.entryShortPrice) {
+      return this.markHoldingDataUnavailable(id, 'exit_valuation_unavailable', {
+        longRate: observation.long.fundingRate, shortRate: observation.short.fundingRate,
+      });
+    }
+
+    const longNotional = longExit.average.mul(quantity);
+    const shortNotional = shortExit.average.mul(quantity);
+    const longSlippage = longTop.minus(longExit.average).div(longTop).mul(10_000);
+    const shortSlippage = shortExit.average.minus(shortTop).div(shortTop).mul(10_000);
+    const exitSlippage = Decimal.max(longSlippage, shortSlippage);
+    const basis = longExit.average.minus(shortExit.average).abs()
+      .div(longExit.average.plus(shortExit.average).div(2)).mul(10_000);
+    const pricePnl = longExit.average.minus(trade.entryLongPrice).mul(quantity)
+      .plus(new Decimal(trade.entryShortPrice).minus(shortExit.average).mul(quantity));
+    const feeRows = this.database.prepare(`SELECT fill.fee FROM execution_fills AS fill
+      JOIN execution_orders AS orders ON orders.id = fill.order_id WHERE orders.strategy_id = ?`).all(id) as Array<{ fee: string }>;
+    const entryFees = feeRows.reduce((sum, row) => sum.plus(new Decimal(row.fee).abs()), new Decimal(0));
+    const exitFees = longNotional.mul(observation.long.takerFeeRate)
+      .plus(shortNotional.mul(observation.short.takerFeeRate));
+    const currentExitPnl = pricePnl.plus(trade.cumulativeActualFunding).minus(entryFees).minus(exitFees);
+    const model = evaluateFundingHolding({ nowMs: this.now(),
+      long: { symbol: expectedLong, venue: trade.longVenue, side: 'LONG', fundingRate: observation.long.fundingRate,
+        fundingTime: observation.long.fundingTime, fundingInterval: observation.long.fundingInterval,
+        notionalUsd: longNotional.toString() },
+      short: { symbol: expectedShort, venue: trade.shortVenue, side: 'SHORT', fundingRate: observation.short.fundingRate,
+        fundingTime: observation.short.fundingTime, fundingInterval: observation.short.fundingInterval,
+        notionalUsd: shortNotional.toString() },
+      eventsPerLeg: this.options.limits.holdingEventsPerLeg,
+      fundingRetentionFactor: this.options.limits.fundingRetentionFactor,
+      stressSlippageBps: this.options.limits.stressSlippageBps,
+      adverseExitBasisBps: this.options.limits.adverseExitBasisBps,
+      minimumHoldValueUsd: this.options.limits.minimumHoldValueUsd,
+      previousUnprofitableCount: trade.unprofitableCount,
+      unprofitableConfirmationCount: this.options.limits.holdingExitConfirmationCount,
+      settlementGuardMs: this.options.limits.settlementGuardMs,
+      openedAtMs: Date.parse(trade.openedAt), softReviewMs: this.options.limits.softReviewMs,
+      hardHoldingMs: this.options.limits.maxHoldingMs });
+    let decision = model.decision;
+    let reason = model.reason;
+    if (basis.gt(this.options.limits.maxBasisBps)) { decision = 'EXIT'; reason = 'holding_basis_exceeded'; }
+    if (exitSlippage.gt(this.options.limits.maxExitSlippageBps)) { decision = 'EXIT'; reason = 'exit_slippage_exceeded'; }
+    this.upsertExpectedSettlements(id, model.events, observedAt);
+    this.persistHoldingEvaluation({ tradeId: id, observedAt, decision, reason, marketQuality: pair.quality,
+      longRate: observation.long.fundingRate, shortRate: observation.short.fundingRate,
+      fundingEdge: model.fundingEdge, conservativeFunding: model.conservativeFunding,
+      riskBuffer: model.riskBuffer, holdValue: model.holdValue, currentExitPnl: currentExitPnl.toString(),
+      basisBps: basis.toString(), exitSlippageBps: exitSlippage.toString(),
+      unprofitableCount: model.unprofitableCount, nextSettlementAt: model.nextSettlementAt,
+      settlementEvents: model.events, details: { pricePnl: pricePnl.toString(), entryFees: entryFees.toString(),
+        estimatedExitFees: exitFees.toString(), exchangeSkewMs: pair.exchangeSkewMs, receiveSkewMs: pair.receiveSkewMs } });
+    this.update(id, { monitor_state: decision, last_monitor_at: observedAt, next_settlement_at: model.nextSettlementAt,
+      current_exit_pnl: currentExitPnl.toString(), hold_value: model.holdValue, current_basis_bps: basis.toString(),
+      funding_edge: model.fundingEdge, unprofitable_count: String(model.unprofitableCount), last_monitor_reason: reason });
+    this.event(id, decision === 'EXIT' ? 'warning' : 'info', 'funding_holding_evaluated',
+      decision === 'EXIT' ? '滚动持仓触发退出' : '滚动持仓评估完成', { decision, reason,
+        holdValue: model.holdValue, currentExitPnl: currentExitPnl.toString(), basisBps: basis.toString() });
+    if (decision === 'REVIEW_REQUIRED') {
+      await this.options.alertDispatcher.emit({ eventType: 'funding_holding_review_due', severity: 'warning',
+        message: `${trade.asset} 已达到软观察时间，资金费仍为正但需要人工复核`, details: { tradeId: id,
+          holdValue: model.holdValue, currentExitPnl: currentExitPnl.toString() }, dedupKey: `funding-review:${id}` });
+    }
+    if (decision === 'EXIT') return this.closeFromHoldingMonitor(this.get(id), reason);
+    return this.get(id);
+  }
+
   /**
    * 候选扫描器写入最新资金费后调用。空头交易所费率不再高于多头交易所时，优势已经反转，立即减仓退出。
    */
@@ -562,6 +921,74 @@ export class FundingArbitrageEngine {
     return trade;
   }
 
+  /**
+   * 把 Gate 账户流水匹配到预期结算事件。账户流水 ID 全局去重，避免每分钟轮询重复累计。
+   * 结算超过宽限期仍没有流水时停止继续持有，并通过状态机安全退出。
+   */
+  async reconcileFundingLedger(records: readonly FundingLedgerRecord[]): Promise<number> {
+    let matched = 0;
+    const settlementExits = new Map<string, string>();
+    for (const record of records) {
+      const createdAtMs = Date.parse(record.createdAt);
+      if (!Number.isFinite(createdAtMs)) continue;
+      const pending = this.database.prepare(`SELECT * FROM funding_expected_settlements
+        WHERE symbol = ? AND venue = ? AND state = 'PENDING'`).all(record.symbol, record.venue) as Array<Record<string, unknown>>;
+      const selected = pending.map((row) => ({ row, distance: Math.abs(Date.parse(String(row.funding_time)) - createdAtMs) }))
+        .filter((entry) => entry.distance <= this.options.limits.settlementGraceMs)
+        .sort((left, right) => left.distance - right.distance)[0]?.row;
+      if (!selected) continue;
+      const expected = new Decimal(String(selected.expected_amount));
+      const actual = new Decimal(record.change);
+      const error = actual.minus(expected).abs();
+      const relativeError = expected.isZero() ? new Decimal(0) : error.div(expected.abs());
+      const anomalous = error.gt(this.options.limits.settlementMaxErrorUsd)
+        || (!expected.isZero() && relativeError.gt(this.options.limits.settlementMaxErrorRatio));
+      try {
+        const result = this.database.prepare(`UPDATE funding_expected_settlements SET state = ?,
+          account_book_id = ?, actual_amount = ?, reconciled_at = ? WHERE id = ? AND state = 'PENDING'`)
+          .run(anomalous ? 'ANOMALOUS' : 'MATCHED', record.id, record.change,
+            new Date(this.now()).toISOString(), String(selected.id));
+        if (result.changes === 0) continue;
+      } catch { continue; /* 相同账户流水已经由另一条预期事件认领。 */ }
+      matched += 1;
+      const tradeId = String(selected.trade_id);
+      const totals = this.database.prepare(`SELECT COALESCE(SUM(CAST(actual_amount AS REAL)), 0) AS actual,
+        COALESCE(SUM(CAST(expected_amount AS REAL)), 0) AS expected
+        FROM funding_expected_settlements WHERE trade_id = ? AND state IN ('MATCHED', 'ANOMALOUS')`).get(tradeId) as { actual: number; expected: number };
+      this.update(tradeId, { cumulative_actual_funding: new Decimal(totals.actual).toString(),
+        actual_funding: new Decimal(totals.actual).toString(), expected_funding: new Decimal(totals.expected).toString() });
+      this.event(tradeId, anomalous ? 'critical' : 'info', 'funding_settlement_auto_reconciled',
+        anomalous ? '实际资金费流水与预期偏差过大' : '实际资金费流水已自动匹配', {
+        symbol: record.symbol, venue: record.venue, expected: selected.expected_amount, actual: record.change,
+        accountBookId: record.id, error: error.toString(), relativeError: relativeError.toString(), anomalous,
+      });
+      if (anomalous) settlementExits.set(tradeId, 'funding_settlement_anomaly');
+    }
+
+    const cutoff = new Date(this.now() - this.options.limits.settlementGraceMs).toISOString();
+    const missing = this.database.prepare(`SELECT * FROM funding_expected_settlements
+      WHERE state = 'PENDING' AND funding_time < ?`).all(cutoff) as Array<Record<string, unknown>>;
+    for (const row of missing) {
+      this.database.prepare("UPDATE funding_expected_settlements SET state = 'MISSING', reconciled_at = ? WHERE id = ? AND state = 'PENDING'")
+        .run(new Date(this.now()).toISOString(), String(row.id));
+      settlementExits.set(String(row.trade_id), 'funding_settlement_missing');
+      this.event(String(row.trade_id), 'critical', 'funding_settlement_missing', '结算宽限期后仍未找到实际资金费流水', {
+        symbol: row.symbol, venue: row.venue, fundingTime: row.funding_time, expectedAmount: row.expected_amount,
+      });
+    }
+    for (const [tradeId, reason] of settlementExits) {
+      const trade = this.get(tradeId);
+      if (trade.state !== 'OPEN') continue;
+      this.update(tradeId, { monitor_state: reason === 'funding_settlement_missing' ? 'SETTLEMENT_MISSING' : 'SETTLEMENT_ANOMALOUS',
+        last_monitor_reason: reason });
+      await this.options.alertDispatcher.emit({ eventType: reason, severity: 'critical',
+        message: `${trade.asset} ${reason === 'funding_settlement_missing' ? '实际资金费未在宽限期内到账' : '实际资金费与预期偏差过大'}，正在退出`,
+        details: { tradeId }, dedupKey: `${reason}:${tradeId}` });
+      await this.closeFromHoldingMonitor(this.get(tradeId), reason);
+    }
+    return matched;
+  }
+
   async reconcileFundingSettlement(id: string, raw: unknown): Promise<FundingTradeRecord> {
     const settlement = FundingSettlementSchema.parse(raw);
     const trade = this.get(id);
@@ -570,7 +997,8 @@ export class FundingArbitrageEngine {
     }
     const difference = new Decimal(settlement.actualFunding).minus(settlement.expectedFunding);
     const anomalous = difference.abs().gt(settlement.toleranceUsd);
-    const updated = this.update(id, { expected_funding: settlement.expectedFunding, actual_funding: settlement.actualFunding });
+    const updated = this.update(id, { expected_funding: settlement.expectedFunding, actual_funding: settlement.actualFunding,
+      cumulative_actual_funding: settlement.actualFunding });
     this.event(id, anomalous ? 'critical' : 'info', 'funding_settlement_reconciled',
       anomalous ? '实际资金费与预期不符' : '实际资金费对账通过', { ...settlement, difference: difference.toString() });
     if (anomalous) await this.options.alertDispatcher.emit({ eventType: 'funding_settlement_anomaly', severity: 'critical',
@@ -598,6 +1026,16 @@ export class FundingArbitrageEngine {
       }
     }
     for (const trade of open) {
+      const monitoringAnchor = trade.lastMonitorAt ?? trade.openedAt!;
+      if (this.now() - Date.parse(monitoringAnchor) > this.options.limits.holdingStaleMs) {
+        this.update(trade.id, { monitor_state: 'DEGRADED', last_monitor_reason: 'holding_monitor_stale' });
+        await this.options.alertDispatcher.emit({ eventType: 'funding_holding_monitor_stale', severity: 'critical',
+          message: `${trade.asset} 持仓监控长时间未更新，正在安全退出`, details: { tradeId: trade.id, monitoringAnchor },
+          dedupKey: `funding-monitor-stale:${trade.id}` });
+        await this.options.onKillSwitch(`funding_holding_monitor_stale:${trade.id}`);
+        await this.closeFromHoldingMonitor(this.get(trade.id), 'holding_monitor_stale');
+        continue;
+      }
       if (this.now() - Date.parse(trade.openedAt!) <= this.options.limits.maxHoldingMs) continue;
       await this.options.alertDispatcher.emit({ eventType: 'funding_max_holding_exceeded', severity: 'warning',
         message: `${trade.asset} 达到最长持仓时间，正在平仓`, details: { tradeId: trade.id } });
@@ -605,6 +1043,19 @@ export class FundingArbitrageEngine {
       catch (error) { await this.manual(trade.id, 'max_holding_exit_failed', {
         error: error instanceof Error ? error.message.slice(0, 160) : 'unknown',
       }); }
+    }
+  }
+
+  /** 私有订单流掉线后不再允许新单；已有组合通过 REST 状态机按 reduce-only 退出。 */
+  async exitAllForSafety(reason: string): Promise<void> {
+    const open = this.list(500).filter((trade) => trade.state === 'OPEN');
+    await this.options.onKillSwitch(`funding_safety_exit:${reason}`);
+    for (const trade of open) {
+      this.update(trade.id, { monitor_state: 'EMERGENCY_EXIT', last_monitor_reason: reason });
+      await this.options.alertDispatcher.emit({ eventType: 'funding_safety_exit', severity: 'critical',
+        message: `${trade.asset} 触发安全退出：${reason}`, details: { tradeId: trade.id, reason },
+        dedupKey: `funding-safety-exit:${trade.id}:${reason}` });
+      await this.closeFromHoldingMonitor(this.get(trade.id), reason);
     }
   }
 
@@ -635,9 +1086,11 @@ export class FundingArbitrageEngine {
       const long = positions.find((position) => position.symbol === symbol(trade.longVenue, trade.asset));
       const short = positions.find((position) => position.symbol === symbol(trade.shortVenue, trade.asset));
       const expected = new Decimal(trade.openQuantity);
+      const tolerance = new Decimal(this.options.limits.maxNetBaseExposure);
       const positionsConfirmed = long && short
-        && new Decimal(long.quantity).gte(expected)
-        && new Decimal(short.quantity).lte(expected.neg());
+        && new Decimal(long.quantity).minus(expected).abs().lte(tolerance)
+        && new Decimal(short.quantity).plus(expected).abs().lte(tolerance)
+        && new Decimal(long.quantity).plus(short.quantity).abs().lte(tolerance);
       if (!positionsConfirmed) await this.manual(trade.id, 'restart_position_mismatch', {
         expected: expected.toString(), longQuantity: long?.quantity ?? null, shortQuantity: short?.quantity ?? null,
       });

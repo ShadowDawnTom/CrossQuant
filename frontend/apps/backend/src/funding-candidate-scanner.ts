@@ -14,6 +14,7 @@ export interface FundingCandidateScannerOptions {
   fundingRetentionFactor: string;
   stressSlippageBps: string;
   adverseExitBasisBps: string;
+  onFundingData?: (funding: readonly GateFundingInfo[], fees: readonly GateFeeRate[]) => void | Promise<void>;
   now?: () => number;
 }
 
@@ -166,6 +167,8 @@ export class FundingCandidateScanner {
         } catch { /* 不盈利、盘口或风控不合格的组合不是扫描器故障。 */ }
       }
     }
+    // 持仓监控复用本轮认证数据，避免再打一遍 funding_info 和 fee 接口触发限频。
+    await this.options.onFundingData?.(funding, fees);
     return recorded;
   }
 }

@@ -5,6 +5,7 @@ const AUDIT_RETENTION_MS = 180 * DAY_MS;
 const EXECUTION_RETENTION_MS = 365 * DAY_MS;
 const MAX_AUDIT_EVENTS = 50_000;
 const MARKET_SAMPLE_RETENTION_MS = 30 * DAY_MS;
+const FUNDING_SNAPSHOT_RETENTION_MS = 30 * DAY_MS;
 
 export interface DatabaseMaintenanceResult {
   auditEventsDeleted: number;
@@ -12,6 +13,8 @@ export interface DatabaseMaintenanceResult {
   fillsDeleted: number;
   ordersDeleted: number;
   executionMarketSamplesDeleted: number;
+  fundingRateSnapshotsDeleted: number;
+  fundingHoldingEvaluationsDeleted: number;
 }
 
 /**
@@ -26,6 +29,7 @@ export function runDatabaseMaintenance(
   const auditCutoff = new Date(now - AUDIT_RETENTION_MS).toISOString();
   const executionCutoff = new Date(now - EXECUTION_RETENTION_MS).toISOString();
   const marketSampleCutoff = new Date(now - MARKET_SAMPLE_RETENTION_MS).toISOString();
+  const fundingSnapshotCutoff = new Date(now - FUNDING_SNAPSHOT_RETENTION_MS).toISOString();
   return database.transaction(() => {
     const expiredAudit = database.prepare('DELETE FROM audit_events WHERE created_at < ?').run(auditCutoff).changes;
     const excessAudit = database.prepare(`
@@ -66,12 +70,21 @@ export function runDatabaseMaintenance(
     const executionMarketSamplesDeleted = database.prepare(
       'DELETE FROM execution_market_samples WHERE sampled_at < ?',
     ).run(marketSampleCutoff).changes;
+    const fundingRateSnapshotsDeleted = database.prepare(
+      'DELETE FROM funding_rate_snapshots WHERE observed_at < ?',
+    ).run(fundingSnapshotCutoff).changes;
+    // 持仓判断属于交易审计证据，跟成交记录一样保留一年；实时费率快照只保留 30 天。
+    const fundingHoldingEvaluationsDeleted = database.prepare(
+      'DELETE FROM funding_holding_evaluations WHERE observed_at < ?',
+    ).run(executionCutoff).changes;
     return {
       auditEventsDeleted: expiredAudit + excessAudit,
       strategyLogsDeleted,
       fillsDeleted,
       ordersDeleted,
       executionMarketSamplesDeleted,
+      fundingRateSnapshotsDeleted,
+      fundingHoldingEvaluationsDeleted,
     };
   })();
 }

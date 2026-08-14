@@ -25,8 +25,19 @@ The backend evaluates account risk before live activation, before risk-increasin
 | `GCT_FUNDING_MAX_UNHEDGED_MS` | `1500` | 单腿裸露和订单确认的最长等待时间 |
 | `GCT_FUNDING_MAX_NET_BASE_EXPOSURE` | `0` | 单币种允许的净基础币敞口；超过会告警并减仓 |
 | `GCT_FUNDING_MAX_ENTRY_SLIPPAGE_BPS` | `5` | 按盘口多档均价计算的最大入场滑点 |
+| `GCT_FUNDING_MAX_EXIT_SLIPPAGE_BPS` | `10` | 按当前多档盘口估算的最大退出滑点；超过后触发退出 |
 | `GCT_FUNDING_MAX_BASIS_BPS` | `30` | 两腿可执行均价的最大基差 |
-| `GCT_FUNDING_MAX_HOLDING_MS` | `28800000` | 最长持仓时间，默认 8 小时 |
+| `GCT_FUNDING_MAX_HOLDING_MS` | `86400000` | Canary 硬性最长持仓，默认 24 小时 |
+| `GCT_FUNDING_SOFT_REVIEW_MS` | `28800000` | 8 小时后进入人工重点复核，但优势仍为正时不强制平仓 |
+| `GCT_FUNDING_HOLDING_MONITOR_INTERVAL_MS` | `60000` | 开仓组合滚动评估周期 |
+| `GCT_FUNDING_HOLDING_STALE_MS` | `180000` | 监控超过该时间未更新时锁死新单并安全退出 |
+| `GCT_FUNDING_HOLDING_EVENTS_PER_LEG` | `2` | 每轮评估每条腿未来真实结算事件数量 |
+| `GCT_FUNDING_HOLDING_EXIT_CONFIRMATIONS` | `3` | 普通边际收益不足连续确认次数；资金费反转不等待 |
+| `GCT_FUNDING_MIN_HOLD_VALUE_USD` | `0` | 未来结算保守收入扣新增风险后的最低继续持有价值 |
+| `GCT_FUNDING_SETTLEMENT_GUARD_MS` | `30000` | 结算前后保护窗口，暂停普通收益退出判断 |
+| `GCT_FUNDING_SETTLEMENT_GRACE_MS` | `300000` | 结算后等待账户流水的宽限时间 |
+| `GCT_FUNDING_SETTLEMENT_MAX_ERROR_USD` | `0.001` | 实际资金费与预期的最大绝对误差 |
+| `GCT_FUNDING_SETTLEMENT_MAX_ERROR_RATIO` | `0.5` | 实际资金费与预期的最大相对误差 |
 | `GCT_FUNDING_CONFIRMATION_COUNT` | `3` | 同一候选连续通过检查的次数 |
 | `GCT_FUNDING_CONFIRMATION_WINDOW_MS` | `180000` | 连续确认窗口；需覆盖三轮 60 秒扫描及少量接口延迟 |
 | `GCT_FUNDING_MIN_NET_ANNUALIZED` | `0.10` | 扣除模型成本后的最低年化收益，小数表示 |
@@ -53,15 +64,19 @@ GCT_FUNDING_MAX_CONCURRENT_TRADES=1
 GCT_FUNDING_MAX_UNHEDGED_MS=1500
 GCT_FUNDING_MAX_NET_BASE_EXPOSURE=0.01
 GCT_FUNDING_MAX_ENTRY_SLIPPAGE_BPS=5
+GCT_FUNDING_MAX_EXIT_SLIPPAGE_BPS=10
 GCT_FUNDING_MAX_BASIS_BPS=30
-GCT_FUNDING_MAX_HOLDING_MS=28800000
+GCT_FUNDING_SOFT_REVIEW_MS=28800000
+GCT_FUNDING_MAX_HOLDING_MS=86400000
 ```
 
 ## 状态机与人工接管
 
 入场会先冻结一个持久化交易意图，再用稳定的客户端订单号并发提交两腿 FOK/IOC。私有 WebSocket 推送优先更新状态，REST 查单兜底。部分成交或一腿失败时，执行器只会用 reduce-only IOC 反向清理多余仓位；修复仍无法确认就进入 `MANUAL_INTERVENTION`、触发 Kill Switch，并拒绝新单。
 
-重启恢复不会重新发送普通入场单。它会查询已有订单并核对真实仓位；任何无法证明两腿等量的状态都转人工。平仓使用两腿 reduce-only，未完全成交的腿会再做一次减仓确认。资金费观察发现 `shortRate - longRate <= 0`，或达到最长持仓时间，也会触发后端平仓。
+重启恢复不会重新发送普通入场单。它会查询已有订单并核对真实仓位；任何无法证明两腿等量的状态都转人工。平仓使用两腿 reduce-only，未完全成交的腿会再做一次减仓确认。
+
+开仓后每分钟按两边各自真实的下一结算时间和结算间隔生成现金流事件。继续持有价值只扣未来新增风险，不会重复扣已经发生的开仓手续费；当前立即平仓 PnL 会单独计入价格损益、已到账资金费和预计退出手续费。普通收益不足需连续三轮确认，资金费方向反转、仓位漂移、基差/退出滑点超限、监控陈旧、私有流从 LIVE 掉线、结算未到账或金额异常以及硬性持仓上限会直接触发安全退出。结算前后保护窗口会暂停普通收益退出，避免为了几秒钟的费率抖动错过已接近的结算。
 
 告警先写入 SQLite 的 `operational_alerts`，再发送 `GCT_RISK_ALERT_WEBHOOK_URL`。Webhook 失败不会阻塞撤单和 Kill Switch，同类告警在短窗口内会去重。
 

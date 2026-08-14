@@ -52,8 +52,19 @@ export interface BackendConfig {
     maxUnhedgedMs: number;
     maxNetBaseExposure: string;
     maxEntrySlippageBps: string;
+    maxExitSlippageBps: string;
     maxBasisBps: string;
     maxHoldingMs: number;
+    softReviewMs: number;
+    holdingMonitorIntervalMs: number;
+    holdingStaleMs: number;
+    holdingEventsPerLeg: number;
+    holdingExitConfirmationCount: number;
+    minimumHoldValueUsd: string;
+    settlementGuardMs: number;
+    settlementGraceMs: number;
+    settlementMaxErrorUsd: string;
+    settlementMaxErrorRatio: string;
     confirmationCount: number;
     confirmationWindowMs: number;
     minNetAnnualized: string;
@@ -141,6 +152,23 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       if (!allowedEmails.has(email)) throw new Error('GCT_AUTH_TRADER_EMAILS must be a subset of GCT_AUTH_ALLOWED_EMAILS');
     }
   }
+  const fundingMaxHoldingMs = parsePositiveInteger(environment.GCT_FUNDING_MAX_HOLDING_MS ?? '86400000', 'GCT_FUNDING_MAX_HOLDING_MS');
+  // 兼容旧部署只设置了 8 小时硬上限的情况；显式配置仍必须满足软复核早于硬上限。
+  const softReviewDefault = String(Math.min(28_800_000, Math.floor(fundingMaxHoldingMs / 2)));
+  const fundingSoftReviewMs = parsePositiveInteger(environment.GCT_FUNDING_SOFT_REVIEW_MS ?? softReviewDefault, 'GCT_FUNDING_SOFT_REVIEW_MS');
+  if (fundingSoftReviewMs >= fundingMaxHoldingMs) {
+    throw new Error('GCT_FUNDING_SOFT_REVIEW_MS must be lower than GCT_FUNDING_MAX_HOLDING_MS');
+  }
+  const fundingHoldingMonitorIntervalMs = parsePositiveInteger(environment.GCT_FUNDING_HOLDING_MONITOR_INTERVAL_MS ?? '60000', 'GCT_FUNDING_HOLDING_MONITOR_INTERVAL_MS');
+  const fundingHoldingStaleMs = parsePositiveInteger(environment.GCT_FUNDING_HOLDING_STALE_MS ?? '180000', 'GCT_FUNDING_HOLDING_STALE_MS');
+  if (fundingHoldingStaleMs <= fundingHoldingMonitorIntervalMs) {
+    throw new Error('GCT_FUNDING_HOLDING_STALE_MS must be greater than GCT_FUNDING_HOLDING_MONITOR_INTERVAL_MS');
+  }
+  const fundingSettlementGuardMs = parseNonNegativeInteger(environment.GCT_FUNDING_SETTLEMENT_GUARD_MS ?? '30000', 'GCT_FUNDING_SETTLEMENT_GUARD_MS');
+  const fundingSettlementGraceMs = parsePositiveInteger(environment.GCT_FUNDING_SETTLEMENT_GRACE_MS ?? '300000', 'GCT_FUNDING_SETTLEMENT_GRACE_MS');
+  if (fundingSettlementGraceMs <= fundingSettlementGuardMs) {
+    throw new Error('GCT_FUNDING_SETTLEMENT_GRACE_MS must be greater than GCT_FUNDING_SETTLEMENT_GUARD_MS');
+  }
   // Browsers send the loopback host the user actually typed; localhost, 127.0.0.1, and [::1]
   // variants of the local UI and backend are all the same trust domain.
   const loopbackOrigins = [frontendPort, port].flatMap((loopbackPort) => [
@@ -212,8 +240,19 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       maxUnhedgedMs: parseNonNegativeInteger(environment.GCT_FUNDING_MAX_UNHEDGED_MS ?? '1500', 'GCT_FUNDING_MAX_UNHEDGED_MS'),
       maxNetBaseExposure: parseNonNegativeDecimal(environment.GCT_FUNDING_MAX_NET_BASE_EXPOSURE ?? '0', 'GCT_FUNDING_MAX_NET_BASE_EXPOSURE'),
       maxEntrySlippageBps: parseNonNegativeDecimal(environment.GCT_FUNDING_MAX_ENTRY_SLIPPAGE_BPS ?? '5', 'GCT_FUNDING_MAX_ENTRY_SLIPPAGE_BPS'),
+      maxExitSlippageBps: parseNonNegativeDecimal(environment.GCT_FUNDING_MAX_EXIT_SLIPPAGE_BPS ?? '10', 'GCT_FUNDING_MAX_EXIT_SLIPPAGE_BPS'),
       maxBasisBps: parseNonNegativeDecimal(environment.GCT_FUNDING_MAX_BASIS_BPS ?? '30', 'GCT_FUNDING_MAX_BASIS_BPS'),
-      maxHoldingMs: parseNonNegativeInteger(environment.GCT_FUNDING_MAX_HOLDING_MS ?? '28800000', 'GCT_FUNDING_MAX_HOLDING_MS'),
+      maxHoldingMs: fundingMaxHoldingMs,
+      softReviewMs: fundingSoftReviewMs,
+      holdingMonitorIntervalMs: fundingHoldingMonitorIntervalMs,
+      holdingStaleMs: fundingHoldingStaleMs,
+      holdingEventsPerLeg: parsePositiveInteger(environment.GCT_FUNDING_HOLDING_EVENTS_PER_LEG ?? '2', 'GCT_FUNDING_HOLDING_EVENTS_PER_LEG'),
+      holdingExitConfirmationCount: parsePositiveInteger(environment.GCT_FUNDING_HOLDING_EXIT_CONFIRMATIONS ?? '3', 'GCT_FUNDING_HOLDING_EXIT_CONFIRMATIONS'),
+      minimumHoldValueUsd: parseNonNegativeDecimal(environment.GCT_FUNDING_MIN_HOLD_VALUE_USD ?? '0', 'GCT_FUNDING_MIN_HOLD_VALUE_USD'),
+      settlementGuardMs: fundingSettlementGuardMs,
+      settlementGraceMs: fundingSettlementGraceMs,
+      settlementMaxErrorUsd: parseNonNegativeDecimal(environment.GCT_FUNDING_SETTLEMENT_MAX_ERROR_USD ?? '0.001', 'GCT_FUNDING_SETTLEMENT_MAX_ERROR_USD'),
+      settlementMaxErrorRatio: parseUnitInterval(environment.GCT_FUNDING_SETTLEMENT_MAX_ERROR_RATIO ?? '0.5', 'GCT_FUNDING_SETTLEMENT_MAX_ERROR_RATIO'),
       confirmationCount: parseNonNegativeInteger(environment.GCT_FUNDING_CONFIRMATION_COUNT ?? '3', 'GCT_FUNDING_CONFIRMATION_COUNT'),
       confirmationWindowMs: parseNonNegativeInteger(environment.GCT_FUNDING_CONFIRMATION_WINDOW_MS ?? '180000', 'GCT_FUNDING_CONFIRMATION_WINDOW_MS'),
       minNetAnnualized: parseNonNegativeDecimal(environment.GCT_FUNDING_MIN_NET_ANNUALIZED ?? '0.10', 'GCT_FUNDING_MIN_NET_ANNUALIZED'),

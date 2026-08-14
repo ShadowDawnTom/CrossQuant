@@ -168,6 +168,11 @@ test.describe.serial('local trading terminal', () => {
     await page.getByRole('button', { name: '% Funding Rates', exact: true }).click();
     await expect(page).toHaveURL(/\/funding-rates$/);
     await expect(page.getByRole('heading', { name: 'Funding rate matrix.' })).toBeVisible();
+    const fundingExecution = page.getByRole('region', { name: '资金费实盘执行' });
+    await expect(fundingExecution.getByRole('heading', { name: '资金费套利状态机' })).toBeVisible();
+    await expect(fundingExecution).toContainText('后端安全锁定');
+    await expect(fundingExecution).toContainText('确认候选 0');
+    await expect(fundingExecution.getByRole('button', { name: '确认候选并实盘入场' })).toBeDisabled();
     await expect.poll(loadedScripts).toEqual(expect.arrayContaining([expect.stringContaining('funding-route-')]));
 
     const results = await new AxeBuilder({ page })
