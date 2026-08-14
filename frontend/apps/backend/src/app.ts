@@ -77,6 +77,7 @@ import { AlertDispatcher } from './alert-dispatcher.js';
 import { FundingArbitrageEngine, FundingArbitrageError } from './funding-arbitrage-engine.js';
 import { FundingCandidateScanner, fundingRule } from './funding-candidate-scanner.js';
 import { FundingHoldingMonitor } from './funding-holding-monitor.js';
+import { FundingPaperEngine } from './funding-paper-engine.js';
 import { readDatabaseStatus } from './database.js';
 import { runDatabaseMaintenance } from './database-maintenance.js';
 import {
@@ -678,6 +679,25 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     fundingArbitrageEngine,
     config.fundingArbitrage.holdingMonitorIntervalMs,
   );
+  const fundingPaperEngine = new FundingPaperEngine(
+    database,
+    executionMarketHub,
+    () => fundingArbitrageEngine.listCandidates(500),
+    {
+      enabled: config.fundingPaper.enabled,
+      maxOpenPositions: config.fundingPaper.maxOpenPositions,
+      confirmationWindowMs: config.fundingArbitrage.confirmationWindowMs,
+      holdingEventsPerLeg: config.fundingArbitrage.holdingEventsPerLeg,
+      holdingExitConfirmationCount: config.fundingArbitrage.holdingExitConfirmationCount,
+      minimumHoldValueUsd: config.fundingArbitrage.minimumHoldValueUsd,
+      settlementGuardMs: config.fundingArbitrage.settlementGuardMs,
+      maxHoldingMs: config.fundingArbitrage.maxHoldingMs,
+      softReviewMs: config.fundingArbitrage.softReviewMs,
+      fundingRetentionFactor: config.fundingArbitrage.fundingRetentionFactor,
+      stressSlippageBps: config.fundingArbitrage.stressSlippageBps,
+      adverseExitBasisBps: config.fundingArbitrage.adverseExitBasisBps,
+    },
+  );
   const fundingCandidateScanner = tradingGateway.queryFundingInfo && tradingGateway.queryFeeRates
     ? new FundingCandidateScanner(tradingGateway as TradingCrossExGateway,
       () => credentialVault.get(DEFAULT_CREDENTIAL_PROFILE), executionMarketHub, fundingArbitrageEngine, {
@@ -687,7 +707,16 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         fundingRetentionFactor: config.fundingArbitrage.fundingRetentionFactor,
         stressSlippageBps: config.fundingArbitrage.stressSlippageBps,
         adverseExitBasisBps: config.fundingArbitrage.adverseExitBasisBps,
-        onFundingData: async (funding, fees) => { await fundingHoldingMonitor.observe(funding, fees); },
+        onFundingData: async (funding, fees) => {
+          // 实盘监控和模拟盘共享同一份认证快照，避免重复请求 funding_info 与费率接口。
+          const results = await Promise.allSettled([
+            fundingHoldingMonitor.observe(funding, fees),
+            fundingPaperEngine.observe(funding, fees),
+          ]);
+          const failures = results.filter((result) => result.status === 'rejected');
+          // 两条链路必须互不阻塞；都执行完以后再让外层统一记录本轮异常。
+          if (failures.length > 0) throw new AggregateError(failures.map((result) => result.reason), 'funding monitoring cycle failed');
+        },
       })
     : null;
   let privateStreamWasLive = false;
@@ -1243,6 +1272,15 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   }));
 
   app.get('/api/funding-arbitrage/candidates', async () => ({ candidates: fundingArbitrageEngine.listCandidates() }));
+
+  app.get('/api/funding-paper', async () => fundingPaperEngine.summary());
+
+  app.get('/api/funding-paper/:id', async (request, reply) => {
+    const parsed = z.object({ id: z.string().uuid() }).safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_funding_paper_position_id' });
+    const details = fundingPaperEngine.details(parsed.data.id);
+    return details ?? reply.code(404).send({ error: 'funding_paper_position_not_found' });
+  });
 
   app.get('/api/funding-arbitrage/trades/:id/monitoring', async (request, reply) => {
     const parsed = z.object({ id: z.string().uuid() }).safeParse(request.params);

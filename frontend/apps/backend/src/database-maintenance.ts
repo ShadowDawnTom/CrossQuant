@@ -15,6 +15,7 @@ export interface DatabaseMaintenanceResult {
   executionMarketSamplesDeleted: number;
   fundingRateSnapshotsDeleted: number;
   fundingHoldingEvaluationsDeleted: number;
+  fundingPaperEvaluationsDeleted: number;
 }
 
 /**
@@ -77,6 +78,9 @@ export function runDatabaseMaintenance(
     const fundingHoldingEvaluationsDeleted = database.prepare(
       'DELETE FROM funding_holding_evaluations WHERE observed_at < ?',
     ).run(executionCutoff).changes;
+    const fundingPaperEvaluationsDeleted = database.prepare(
+      'DELETE FROM funding_paper_evaluations WHERE observed_at < ?',
+    ).run(executionCutoff).changes;
     return {
       auditEventsDeleted: expiredAudit + excessAudit,
       strategyLogsDeleted,
@@ -85,6 +89,7 @@ export function runDatabaseMaintenance(
       executionMarketSamplesDeleted,
       fundingRateSnapshotsDeleted,
       fundingHoldingEvaluationsDeleted,
+      fundingPaperEvaluationsDeleted,
     };
   })();
 }

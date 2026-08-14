@@ -76,6 +76,10 @@ export interface BackendConfig {
     stressSlippageBps: string;
     adverseExitBasisBps: string;
   };
+  fundingPaper: {
+    enabled: boolean;
+    maxOpenPositions: number;
+  };
 }
 
 function parsePort(value: string, name: string): number {
@@ -263,6 +267,11 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       fundingRetentionFactor: parseUnitInterval(environment.GCT_FUNDING_RETENTION_FACTOR ?? '0.5', 'GCT_FUNDING_RETENTION_FACTOR'),
       stressSlippageBps: parseNonNegativeDecimal(environment.GCT_FUNDING_STRESS_SLIPPAGE_BPS ?? '5', 'GCT_FUNDING_STRESS_SLIPPAGE_BPS'),
       adverseExitBasisBps: parseNonNegativeDecimal(environment.GCT_FUNDING_ADVERSE_EXIT_BASIS_BPS ?? '10', 'GCT_FUNDING_ADVERSE_EXIT_BASIS_BPS'),
+    },
+    fundingPaper: {
+      // 模拟盘也要求显式开启，避免测试或其他部署无意中持续写入研究数据。
+      enabled: environment.GCT_FUNDING_PAPER_ENABLED === '1',
+      maxOpenPositions: parsePositiveInteger(environment.GCT_FUNDING_PAPER_MAX_OPEN_POSITIONS ?? '3', 'GCT_FUNDING_PAPER_MAX_OPEN_POSITIONS'),
     },
   };
 }

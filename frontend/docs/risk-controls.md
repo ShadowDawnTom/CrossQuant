@@ -48,6 +48,8 @@ The backend evaluates account risk before live activation, before risk-increasin
 | `GCT_FUNDING_RETENTION_FACTOR` | `0.5` | 正向当前资金费快照在保守情景中只保留的比例 |
 | `GCT_FUNDING_STRESS_SLIPPAGE_BPS` | `5` | 当前多档盘口以外额外扣除的下单延迟/滑点压力 |
 | `GCT_FUNDING_ADVERSE_EXIT_BASIS_BPS` | `10` | 未来退出基差逆向变化缓冲 |
+| `GCT_FUNDING_PAPER_ENABLED` | `0` | 独立模拟盘开关；开启后仍不会调用订单接口 |
+| `GCT_FUNDING_PAPER_MAX_OPEN_POSITIONS` | `3` | 同时存在的模拟套利组合上限 |
 
 只有 `LIVE_SYNCHRONIZED` 盘口可以通过入场预检。缺价格、深度不足、行情陈旧、跨所时间差过大、账户快照不完整、私有流断线和 Kill Switch 已触发都会 fail-closed。
 
@@ -55,10 +57,12 @@ The backend evaluates account risk before live activation, before risk-increasin
 
 `GCT_AUTH_TRADER_EMAILS` 是交易员白名单，必须是 `GCT_AUTH_ALLOWED_EMAILS` 的子集。只在访问白名单而不在交易员白名单的账号可以看页面，但资金费入场和平仓接口都会返回 `trader_role_required`。
 
-建议 10 USDT 验收阶段保持开关关闭，只跑影子交易。通过至少 24 小时影子验收后，再按交易所最小下单规则选择币对；不要直接照抄以下示例数值：
+建议 10 USDT 验收阶段保持实盘开关关闭、单独开启模拟盘。通过至少 24 小时模拟验收后，再按交易所最小下单规则选择币对；不要直接照抄以下示例数值：
 
 ```dotenv
 GCT_FUNDING_LIVE_ENABLED=0
+GCT_FUNDING_PAPER_ENABLED=1
+GCT_FUNDING_PAPER_MAX_OPEN_POSITIONS=3
 GCT_FUNDING_MAX_NOTIONAL_PER_LEG_USD=5
 GCT_FUNDING_MAX_CONCURRENT_TRADES=1
 GCT_FUNDING_MAX_UNHEDGED_MS=1500

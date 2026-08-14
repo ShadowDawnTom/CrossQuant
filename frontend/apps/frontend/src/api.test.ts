@@ -121,6 +121,24 @@ describe('local API request coordination', () => {
     expect(init?.body).toBe('{"symbols":["BINANCE_FUTURE_BTC_USDT"],"durationDays":30}');
   });
 
+  it('validates the funding paper summary and position detail endpoints', async () => {
+    const position = { id: 'paper-1', candidateId: 'candidate-1', asset: 'SOL', longVenue: 'BINANCE',
+      shortVenue: 'OKX', quantity: '0.1', state: 'OPEN', monitorState: 'HOLD' };
+    const fetchMock = vi.fn(async (path: string) => path === '/api/funding-paper'
+      ? new Response(JSON.stringify({ enabled: true, openCount: 1, closedCount: 0, winRate: '0',
+        cumulativePnl: '0', cumulativeFunding: '0', cumulativeFees: '0.01', fundingSnapshotCount: 10,
+        latestFundingSnapshotAt: '2026-08-14T00:00:00.000Z', executionSampleCount: 20,
+        latestExecutionSampleAt: '2026-08-14T00:00:00.000Z', positions: [position] }))
+      : new Response(JSON.stringify({ position, evaluations: [], settlements: [] })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.fundingPaperSummary()).resolves.toMatchObject({ enabled: true, openCount: 1,
+      positions: [{ asset: 'SOL', state: 'OPEN' }] });
+    await expect(api.fundingPaperDetails('paper-1')).resolves.toMatchObject({ position: { id: 'paper-1' },
+      evaluations: [], settlements: [] });
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual(['/api/funding-paper', '/api/funding-paper/paper-1']);
+  });
+
   it('ignores malformed websocket messages and delivers only validated stream events', () => {
     type Listener = (event: { data?: unknown }) => void;
     class FakeWebSocket {

@@ -156,6 +156,32 @@ export interface FundingExpectedSettlement {
   id: string; tradeId: string; symbol: string; venue: string; fundingTime: string; expectedAmount: string;
   state: string; actualAmount: string | null; reconciledAt: string | null;
 }
+export interface FundingPaperPosition {
+  id: string; candidateId: string; asset: string; longVenue: string; shortVenue: string; quantity: string;
+  state: string; monitorState: string; entryNetAnnualized: string; entryLongPrice: string; entryShortPrice: string;
+  exitLongPrice: string | null; exitShortPrice: string | null; entryFees: string; exitFees: string;
+  fundingPnl: string; pricePnl: string; totalPnl: string; currentExitPnl: string | null; holdValue: string | null;
+  currentBasisBps: string | null; fundingEdge: string | null; longRate: string | null; shortRate: string | null;
+  unprofitableCount: number; dataFailureCount: number; nextSettlementAt: string | null; lastReason: string | null;
+  openedAt: string; closedAt: string | null; lastEvaluatedAt: string | null; updatedAt: string;
+}
+export interface FundingPaperSummary {
+  enabled: boolean; openCount: number; closedCount: number; winRate: string; cumulativePnl: string;
+  cumulativeFunding: string; cumulativeFees: string; fundingSnapshotCount: number;
+  latestFundingSnapshotAt: string | null; executionSampleCount: number; latestExecutionSampleAt: string | null;
+  positions: FundingPaperPosition[];
+}
+export interface FundingPaperEvaluation {
+  id: string; positionId: string; observedAt: string; decision: string; reason: string; marketQuality: string;
+  longRate: string | null; shortRate: string | null; fundingEdge: string | null;
+  conservativeFunding: string | null; riskBuffer: string | null; holdValue: string | null;
+  currentExitPnl: string | null; basisBps: string | null; exitSlippageBps: string | null;
+  unprofitableCount: number; nextSettlementAt: string | null;
+}
+export interface FundingPaperSettlement {
+  id: string; positionId: string; symbol: string; venue: string; side: string; fundingTime: string;
+  fundingRate: string; expectedAmount: string; amount: string | null; state: string; settledAt: string | null;
+}
 
 interface RuntimeSchema<T> {
   safeParse(value: unknown): { success: true; data: T } | { success: false };
@@ -189,6 +215,24 @@ const FundingMonitoringSchema: RuntimeSchema<{ trade: FundingArbitrageTrade; eva
     return data && trade.success && Array.isArray(data.evaluations) && Array.isArray(data.expectedSettlements)
       ? { success: true, data: { trade: trade.data, evaluations: data.evaluations as FundingHoldingEvaluation[],
         expectedSettlements: data.expectedSettlements as FundingExpectedSettlement[] } } : { success: false };
+  },
+};
+const FundingPaperSummarySchema: RuntimeSchema<FundingPaperSummary> = {
+  safeParse(value) {
+    const data = value as Partial<FundingPaperSummary> | null;
+    return data && typeof data.enabled === 'boolean' && typeof data.openCount === 'number'
+      && typeof data.closedCount === 'number' && Array.isArray(data.positions)
+      ? { success: true, data: data as FundingPaperSummary } : { success: false };
+  },
+};
+const FundingPaperDetailsSchema: RuntimeSchema<{ position: FundingPaperPosition;
+  evaluations: FundingPaperEvaluation[]; settlements: FundingPaperSettlement[] }> = {
+  safeParse(value) {
+    const data = value as { position?: Partial<FundingPaperPosition>; evaluations?: unknown; settlements?: unknown } | null;
+    return data && typeof data.position?.id === 'string' && Array.isArray(data.evaluations) && Array.isArray(data.settlements)
+      ? { success: true, data: { position: data.position as FundingPaperPosition,
+        evaluations: data.evaluations as FundingPaperEvaluation[], settlements: data.settlements as FundingPaperSettlement[] } }
+      : { success: false };
   },
 };
 
@@ -323,6 +367,9 @@ export const api = {
   fundingExecutionTrades: () => request(FundingTradesSchema, '/api/funding-arbitrage/trades'),
   fundingTradeMonitoring: (id: string) => request(FundingMonitoringSchema,
     `/api/funding-arbitrage/trades/${encodeURIComponent(id)}/monitoring`),
+  fundingPaperSummary: () => request(FundingPaperSummarySchema, '/api/funding-paper'),
+  fundingPaperDetails: (id: string) => request(FundingPaperDetailsSchema,
+    `/api/funding-paper/${encodeURIComponent(id)}`),
   startFundingArbitrage: (body: { idempotencyKey: string; candidateId: string; asset: string; longVenue: string;
     shortVenue: string; quantity: string; timeInForce: 'FOK' | 'IOC' }) => request(FundingTradeSchema, '/api/funding-arbitrage/trades', {
     method: 'POST', headers: { 'x-gct-trading-intent': 'start-funding-arbitrage' }, body: JSON.stringify(body),

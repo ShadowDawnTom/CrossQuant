@@ -22,6 +22,8 @@ Environment=GCT_DISABLE_OS_KEYCHAIN=1
 Environment=GCT_CREDENTIAL_ENV_PATH=/home/ubuntu/.local/share/crossquant/credentials.env
 Environment=GCT_RISK_MAX_GROSS_EXPOSURE_USD=0
 Environment=GCT_RISK_MAX_DAILY_LOSS_USD=0
+Environment=GCT_FUNDING_PAPER_ENABLED=1
+Environment=GCT_FUNDING_PAPER_MAX_OPEN_POSITIONS=3
 ExecStart=/opt/node-v24.14.0-linux-x64/bin/node apps/backend/dist/server.js
 Restart=always
 RestartSec=5

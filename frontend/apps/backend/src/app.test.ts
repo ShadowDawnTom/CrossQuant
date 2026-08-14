@@ -498,7 +498,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 20, currentMigration: '0020_funding_holding_monitor.sql' },
+      database: { migrationCount: 21, currentMigration: '0021_funding_paper_trading.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',
@@ -537,6 +537,16 @@ describe('local backend', () => {
       method: 'GET', url: '/api/execution-market/pairs/BTC?longVenue=UNKNOWN&shortVenue=BINANCE', headers,
     });
     expect(invalid.statusCode).toBe(400);
+  });
+
+  it('exposes a read-only funding paper dashboard without arming live trading', async () => {
+    const { app } = await createTestApp();
+    const response = await app.inject({ method: 'GET', url: '/api/funding-paper',
+      headers: { host: '127.0.0.1:17840' } });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      enabled: false, openCount: 0, closedCount: 0, cumulativePnl: '0', positions: [],
+    });
   });
 
   it('allows explicit reduce-only emergency orders while the global trading lock is active', async () => {

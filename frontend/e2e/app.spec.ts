@@ -168,6 +168,11 @@ test.describe.serial('local trading terminal', () => {
     await page.getByRole('button', { name: '% Funding Rates', exact: true }).click();
     await expect(page).toHaveURL(/\/funding-rates$/);
     await expect(page.getByRole('heading', { name: 'Funding rate matrix.' })).toBeVisible();
+    const fundingPaper = page.getByRole('region', { name: '资金费模拟盘' });
+    await expect(fundingPaper.getByRole('heading', { name: '资金费模拟盘' })).toBeVisible();
+    await expect(fundingPaper).toContainText('模拟盘未开启');
+    await expect(fundingPaper).toContainText('不会发送交易所订单');
+    await expect(fundingPaper).toContainText('正在等待第一个满足保守净收益和同步盘口要求的候选');
     const fundingExecution = page.getByRole('region', { name: '资金费实盘执行' });
     await expect(fundingExecution.getByRole('heading', { name: '资金费套利状态机' })).toBeVisible();
     await expect(fundingExecution).toContainText('后端安全锁定');
