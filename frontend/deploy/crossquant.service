@@ -20,6 +20,9 @@ Environment=GCT_MIGRATIONS_DIR=/home/ubuntu/code/CrossQuant-current/frontend/mig
 Environment=GCT_FRONTEND_DIST_DIR=/home/ubuntu/code/CrossQuant-current/frontend/apps/frontend/dist
 Environment=GCT_DISABLE_OS_KEYCHAIN=1
 Environment=GCT_CREDENTIAL_ENV_PATH=/home/ubuntu/.local/share/crossquant/credentials.env
+Environment=GCT_FUNDING_LIVE_ENABLED=0
+Environment=GCT_FUNDING_MAX_NOTIONAL_PER_LEG_USD=0
+Environment=GCT_FUNDING_MAX_CONCURRENT_TRADES=0
 Environment=GCT_RISK_MAX_GROSS_EXPOSURE_USD=0
 Environment=GCT_RISK_MAX_DAILY_LOSS_USD=0
 Environment=GCT_EXECUTION_MARKET_SYMBOLS=BTC,ETH,SOL,DOGE,TRUMP
