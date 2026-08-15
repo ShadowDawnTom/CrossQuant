@@ -43,6 +43,7 @@ The backend evaluates account risk before live activation, before risk-increasin
 | `GCT_FUNDING_MIN_NET_ANNUALIZED` | `0.10` | 扣除模型成本后的最低年化收益，小数表示 |
 | `GCT_FUNDING_LEVERAGE` | `1` | 两腿保证金预检和下单前确认的杠杆 |
 | `GCT_FUNDING_SCAN_TARGET_NOTIONAL_USD` | `5` | 后端自动扫描时的单腿目标金额 |
+| `GCT_FUNDING_SCAN_ASSETS` | 跟随执行行情资产 | 严格实盘候选白名单；探索资产不能自动加入 |
 | `GCT_FUNDING_SCAN_HORIZON_HOURS` | `24` | 当前费率快照的现金流情景期，不是预测 |
 | `GCT_FUNDING_SCAN_INTERVAL_MS` | `60000` | 后端自动候选扫描周期；禁止重叠请求，避免占满 Gate 鉴权限频 |
 | `GCT_FUNDING_RETENTION_FACTOR` | `0.5` | 正向当前资金费快照在保守情景中只保留的比例 |
@@ -50,6 +51,12 @@ The backend evaluates account risk before live activation, before risk-increasin
 | `GCT_FUNDING_ADVERSE_EXIT_BASIS_BPS` | `10` | 未来退出基差逆向变化缓冲 |
 | `GCT_FUNDING_PAPER_ENABLED` | `0` | 独立模拟盘开关；开启后仍不会调用订单接口 |
 | `GCT_FUNDING_PAPER_MAX_OPEN_POSITIONS` | `3` | 同时存在的模拟套利组合上限 |
+| `GCT_FUNDING_RESEARCH_ENABLED` | `0` | 独立探索模拟开关；不会调用订单接口或放宽实盘候选 |
+| `GCT_FUNDING_RESEARCH_ASSETS` | `BTC,ETH,SOL,DOGE,TRUMP` | 研究资产；启用时必须同时配置对应执行订单簿 |
+| `GCT_FUNDING_RESEARCH_TARGET_NOTIONAL_USD` | `5` | 单腿目标金额；仍按共同最小数量向上取整 |
+| `GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS` | `1` | 固定为 1，配置其他值会拒绝启动 |
+| `GCT_FUNDING_RESEARCH_MAX_SLIPPAGE_BPS` | `10` | 研究开仓与退出各自允许的组合多档滑点上限 |
+| `GCT_FUNDING_RESEARCH_MIN_SETTLED_EVENTS` | `1` | 至少经历的模拟资金费结算事件数 |
 
 只有 `LIVE_SYNCHRONIZED` 盘口可以通过入场预检。缺价格、深度不足、行情陈旧、跨所时间差过大、账户快照不完整、私有流断线和 Kill Switch 已触发都会 fail-closed。
 
@@ -63,6 +70,12 @@ The backend evaluates account risk before live activation, before risk-increasin
 GCT_FUNDING_LIVE_ENABLED=0
 GCT_FUNDING_PAPER_ENABLED=1
 GCT_FUNDING_PAPER_MAX_OPEN_POSITIONS=3
+GCT_EXECUTION_MARKET_SYMBOLS=BTC,ETH,SOL,DOGE,TRUMP
+GCT_FUNDING_SCAN_ASSETS=BTC,ETH,SOL
+GCT_FUNDING_RESEARCH_ENABLED=1
+GCT_FUNDING_RESEARCH_ASSETS=BTC,ETH,SOL,DOGE,TRUMP
+GCT_FUNDING_RESEARCH_TARGET_NOTIONAL_USD=5
+GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS=1
 GCT_FUNDING_MAX_NOTIONAL_PER_LEG_USD=5
 GCT_FUNDING_MAX_CONCURRENT_TRADES=1
 GCT_FUNDING_MAX_UNHEDGED_MS=1500

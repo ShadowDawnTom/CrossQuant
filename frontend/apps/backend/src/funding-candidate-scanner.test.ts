@@ -64,4 +64,33 @@ describe('FundingCandidateScanner', () => {
     expect(await scanner.scan()).toBe(0);
     expect(observe).not.toHaveBeenCalled();
   });
+
+  it('实盘净收益不达标时仍输出带完整成本拆解的研究机会', async () => {
+    const strictObserve = vi.fn(async () => undefined);
+    const observations: unknown[] = [];
+    const lowEdgeGateway = gateway();
+    lowEdgeGateway.queryFundingInfo = async () => [
+      { symbol: 'BINANCE_FUTURE_SOL_USDT', funding_rate: '0', funding_time: '2000000', funding_interval: '28800' },
+      { symbol: 'OKX_FUTURE_SOL_USDT', funding_rate: '0.0001', funding_time: '2000000', funding_interval: '28800' },
+    ];
+    const scanner = new FundingCandidateScanner(lowEdgeGateway,
+      async () => ({ apiKey: 'key', apiSecret: 'secret' }), market(),
+      { observeAuthoritativeCandidate: strictObserve } as unknown as FundingArbitrageEngine,
+      { assets: ['SOL'], strictAssets: ['SOL'], researchAssets: ['SOL'], targetNotionalUsd: '5',
+        researchTargetNotionalUsd: '5', horizonHours: 24, fundingRetentionFactor: '0.5',
+        stressSlippageBps: '5', adverseExitBasisBps: '10', minNetAnnualized: '0.1',
+        researchMaxSlippageBps: '10', onFundingData: async (_funding, _fees, rows) => { observations.push(...rows); },
+        now: () => NOW },
+    );
+
+    expect(await scanner.scan()).toBe(0);
+    expect(strictObserve).not.toHaveBeenCalled();
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({ status: 'RESEARCH_ELIGIBLE', strictEligible: false,
+      researchEligible: true, primaryReason: 'funding_net_return_below_threshold', quantity: '0.05',
+      marketQuality: 'LIVE_SYNCHRONIZED' });
+    expect(Number((observations[0] as { rawAnnualized: string }).rawAnnualized)).toBeGreaterThan(0);
+    expect(Number((observations[0] as { netAnnualized: string }).netAnnualized)).toBeLessThan(0);
+    expect(Number((observations[0] as { tradingFees: string }).tradingFees)).toBeGreaterThan(0);
+  });
 });

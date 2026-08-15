@@ -498,7 +498,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 21, currentMigration: '0021_funding_paper_trading.sql' },
+      database: { migrationCount: 22, currentMigration: '0022_funding_research_paper.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',
@@ -546,6 +546,18 @@ describe('local backend', () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
       enabled: false, openCount: 0, closedCount: 0, cumulativePnl: '0', positions: [],
+    });
+  });
+
+  it('exposes isolated funding research telemetry without enabling live execution', async () => {
+    const { app } = await createTestApp();
+    const response = await app.inject({ method: 'GET', url: '/api/funding-research',
+      headers: { host: '127.0.0.1:17840' } });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      enabled: false, targetNotionalUsd: '5', maxOpenPositions: 1, openCount: 0, closedCount: 0,
+      scan24h: { observations: 0, liveEligible: 0, researchEligible: 0, rejected: 0 },
+      latestObservations: [], positions: [],
     });
   });
 

@@ -182,6 +182,47 @@ export interface FundingPaperSettlement {
   id: string; positionId: string; symbol: string; venue: string; side: string; fundingTime: string;
   fundingRate: string; expectedAmount: string; amount: string | null; state: string; settledAt: string | null;
 }
+export interface FundingScanObservation {
+  id: string; scanId: string; observedAt: string; asset: string; longVenue: string; shortVenue: string;
+  quantity: string | null; status: 'LIVE_ELIGIBLE' | 'RESEARCH_ELIGIBLE' | 'REJECTED';
+  strictEligible: boolean; researchEligible: boolean; primaryReason: string; reasons: string[];
+  marketQuality: string | null; longRate: string; shortRate: string; longEvents: number; shortEvents: number;
+  entryLongPrice: string | null; entryShortPrice: string | null; exitLongPrice: string | null; exitShortPrice: string | null;
+  entryLongNotional: string | null; entryShortNotional: string | null; rawFundingPnl: string | null;
+  conservativeFundingPnl: string | null; immediateRoundTripPnl: string | null; entryFees: string | null;
+  exitFees: string | null; tradingFees: string | null; stressBuffer: string | null; netPnl: string | null;
+  rawAnnualized: string | null; netAnnualized: string | null; breakEvenHours: string | null;
+  entrySlippageBps: string | null; exitSlippageBps: string | null; basisBps: string | null;
+}
+export interface FundingResearchPosition {
+  id: string; observationId: string; mode: 'RESEARCH'; asset: string; longVenue: string; shortVenue: string;
+  quantity: string; targetNotionalUsd: string; state: string; monitorState: string;
+  entryRawAnnualized: string; entryNetAnnualized: string; entryLongPrice: string; entryShortPrice: string;
+  entryLongNotional: string; entryShortNotional: string; exitLongPrice: string | null; exitShortPrice: string | null;
+  entryFees: string; exitFees: string; fundingPnl: string; pricePnl: string; totalPnl: string;
+  currentExitPnl: string | null; currentBasisBps: string | null; entrySlippageBps: string | null;
+  exitSlippageBps: string | null; settledEvents: number; dataFailureCount: number;
+  nextSettlementAt: string | null; lastReason: string | null; openedAt: string; closedAt: string | null;
+  lastEvaluatedAt: string | null; updatedAt: string;
+}
+export interface FundingResearchEvaluation {
+  id: string; positionId: string; observedAt: string; decision: string; reason: string; marketQuality: string;
+  currentExitPnl: string | null; pricePnl: string | null; fundingPnl: string | null; exitFees: string | null;
+  basisBps: string | null; exitSlippageBps: string | null; settledEvents: number;
+  nextSettlementAt: string | null; details: Record<string, unknown>;
+}
+export interface FundingResearchSettlement {
+  id: string; positionId: string; symbol: string; venue: string; side: string; fundingTime: string;
+  fundingRate: string; notionalUsd: string; expectedAmount: string; amount: string | null;
+  state: string; settledAt: string | null;
+}
+export interface FundingResearchSummary {
+  enabled: boolean; targetNotionalUsd: string; maxOpenPositions: number; minimumSettledEvents: number;
+  lastScanAt: string | null; scan24h: { observations: number; liveEligible: number; researchEligible: number; rejected: number };
+  rejectionReasons: Array<{ reason: string; count: number }>; latestObservations: FundingScanObservation[];
+  openCount: number; closedCount: number; cumulativePnl: string; cumulativeFunding: string;
+  cumulativeFees: string; positions: FundingResearchPosition[];
+}
 
 interface RuntimeSchema<T> {
   safeParse(value: unknown): { success: true; data: T } | { success: false };
@@ -233,6 +274,26 @@ const FundingPaperDetailsSchema: RuntimeSchema<{ position: FundingPaperPosition;
       ? { success: true, data: { position: data.position as FundingPaperPosition,
         evaluations: data.evaluations as FundingPaperEvaluation[], settlements: data.settlements as FundingPaperSettlement[] } }
       : { success: false };
+  },
+};
+const FundingResearchSummarySchema: RuntimeSchema<FundingResearchSummary> = {
+  safeParse(value) {
+    const data = value as Partial<FundingResearchSummary> | null;
+    return data && typeof data.enabled === 'boolean' && typeof data.openCount === 'number'
+      && typeof data.scan24h?.observations === 'number' && Array.isArray(data.latestObservations)
+      && Array.isArray(data.positions) && Array.isArray(data.rejectionReasons)
+      ? { success: true, data: data as FundingResearchSummary } : { success: false };
+  },
+};
+const FundingResearchDetailsSchema: RuntimeSchema<{ position: FundingResearchPosition;
+  evaluations: FundingResearchEvaluation[]; settlements: FundingResearchSettlement[] }> = {
+  safeParse(value) {
+    const data = value as { position?: Partial<FundingResearchPosition>; evaluations?: unknown; settlements?: unknown } | null;
+    return data && typeof data.position?.id === 'string' && data.position.mode === 'RESEARCH'
+      && Array.isArray(data.evaluations) && Array.isArray(data.settlements)
+      ? { success: true, data: { position: data.position as FundingResearchPosition,
+        evaluations: data.evaluations as FundingResearchEvaluation[],
+        settlements: data.settlements as FundingResearchSettlement[] } } : { success: false };
   },
 };
 
@@ -370,6 +431,9 @@ export const api = {
   fundingPaperSummary: () => request(FundingPaperSummarySchema, '/api/funding-paper'),
   fundingPaperDetails: (id: string) => request(FundingPaperDetailsSchema,
     `/api/funding-paper/${encodeURIComponent(id)}`),
+  fundingResearchSummary: () => request(FundingResearchSummarySchema, '/api/funding-research'),
+  fundingResearchDetails: (id: string) => request(FundingResearchDetailsSchema,
+    `/api/funding-research/${encodeURIComponent(id)}`),
   startFundingArbitrage: (body: { idempotencyKey: string; candidateId: string; asset: string; longVenue: string;
     shortVenue: string; quantity: string; timeInForce: 'FOK' | 'IOC' }) => request(FundingTradeSchema, '/api/funding-arbitrage/trades', {
     method: 'POST', headers: { 'x-gct-trading-intent': 'start-funding-arbitrage' }, body: JSON.stringify(body),

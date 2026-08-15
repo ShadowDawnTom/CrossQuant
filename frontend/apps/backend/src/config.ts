@@ -75,10 +75,19 @@ export interface BackendConfig {
     fundingRetentionFactor: string;
     stressSlippageBps: string;
     adverseExitBasisBps: string;
+    scanAssets: string[];
   };
   fundingPaper: {
     enabled: boolean;
     maxOpenPositions: number;
+  };
+  fundingResearch: {
+    enabled: boolean;
+    assets: string[];
+    targetNotionalUsd: string;
+    maxOpenPositions: number;
+    maxSlippageBps: string;
+    minimumSettledEvents: number;
   };
 }
 
@@ -119,6 +128,14 @@ function parsePositiveInteger(value: string, name: string): number {
   const parsed = parseNonNegativeInteger(value, name);
   if (parsed <= 0) throw new Error(`${name} must be greater than zero`);
   return parsed;
+}
+
+function parseAssetList(value: string, name: string): string[] {
+  const assets = [...new Set(value.split(',').map((item) => item.trim().toUpperCase()).filter(Boolean))];
+  if (assets.length === 0 || assets.some((asset) => !/^[A-Z0-9]{2,20}$/.test(asset))) {
+    throw new Error(`${name} must contain comma-separated asset codes`);
+  }
+  return assets;
 }
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): BackendConfig {
@@ -173,6 +190,26 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
   if (fundingSettlementGraceMs <= fundingSettlementGuardMs) {
     throw new Error('GCT_FUNDING_SETTLEMENT_GRACE_MS must be greater than GCT_FUNDING_SETTLEMENT_GUARD_MS');
   }
+  const executionMarketSymbols = parseAssetList(environment.GCT_EXECUTION_MARKET_SYMBOLS ?? 'BTC,ETH', 'GCT_EXECUTION_MARKET_SYMBOLS');
+  const fundingScanAssets = parseAssetList(environment.GCT_FUNDING_SCAN_ASSETS ?? executionMarketSymbols.join(','), 'GCT_FUNDING_SCAN_ASSETS');
+  const fundingResearchAssets = parseAssetList(environment.GCT_FUNDING_RESEARCH_ASSETS ?? 'BTC,ETH,SOL,DOGE,TRUMP', 'GCT_FUNDING_RESEARCH_ASSETS');
+  const fundingResearchEnabled = environment.GCT_FUNDING_RESEARCH_ENABLED === '1';
+  const fundingResearchMaxOpenPositions = parsePositiveInteger(
+    environment.GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS ?? '1', 'GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS',
+  );
+  if (fundingResearchMaxOpenPositions !== 1) {
+    throw new Error('GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS must remain 1');
+  }
+  const missingStrictBooks = fundingScanAssets.filter((asset) => !executionMarketSymbols.includes(asset));
+  if (missingStrictBooks.length > 0) {
+    throw new Error(`GCT_FUNDING_SCAN_ASSETS require execution books for: ${missingStrictBooks.join(',')}`);
+  }
+  if (fundingResearchEnabled) {
+    const missingBooks = fundingResearchAssets.filter((asset) => !executionMarketSymbols.includes(asset));
+    if (missingBooks.length > 0) {
+      throw new Error(`GCT_FUNDING_RESEARCH_ASSETS require execution books for: ${missingBooks.join(',')}`);
+    }
+  }
   // Browsers send the loopback host the user actually typed; localhost, 127.0.0.1, and [::1]
   // variants of the local UI and backend are all the same trust domain.
   const loopbackOrigins = [frontendPort, port].flatMap((loopbackPort) => [
@@ -199,8 +236,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     gatePublicWebSocketUrl: environment.GCT_GATE_PUBLIC_WS_URL ?? 'wss://api.gateio.ws/ws/crossex/public',
     gatePrivateWebSocketUrl: environment.GCT_GATE_PRIVATE_WS_URL ?? 'wss://api.gateio.ws/ws/crossex',
     executionMarket: {
-      symbols: [...new Set((environment.GCT_EXECUTION_MARKET_SYMBOLS ?? 'BTC,ETH')
-        .split(',').map((item) => item.trim().toUpperCase()).filter(Boolean))],
+      symbols: executionMarketSymbols,
       maxBookAgeMs: parseNonNegativeInteger(environment.GCT_EXECUTION_MAX_BOOK_AGE_MS ?? '1500', 'GCT_EXECUTION_MAX_BOOK_AGE_MS'),
       maxExchangeSkewMs: parseNonNegativeInteger(environment.GCT_EXECUTION_MAX_EXCHANGE_SKEW_MS ?? '750', 'GCT_EXECUTION_MAX_EXCHANGE_SKEW_MS'),
       maxReceiveSkewMs: parseNonNegativeInteger(environment.GCT_EXECUTION_MAX_RECEIVE_SKEW_MS ?? '750', 'GCT_EXECUTION_MAX_RECEIVE_SKEW_MS'),
@@ -267,11 +303,21 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       fundingRetentionFactor: parseUnitInterval(environment.GCT_FUNDING_RETENTION_FACTOR ?? '0.5', 'GCT_FUNDING_RETENTION_FACTOR'),
       stressSlippageBps: parseNonNegativeDecimal(environment.GCT_FUNDING_STRESS_SLIPPAGE_BPS ?? '5', 'GCT_FUNDING_STRESS_SLIPPAGE_BPS'),
       adverseExitBasisBps: parseNonNegativeDecimal(environment.GCT_FUNDING_ADVERSE_EXIT_BASIS_BPS ?? '10', 'GCT_FUNDING_ADVERSE_EXIT_BASIS_BPS'),
+      scanAssets: fundingScanAssets,
     },
     fundingPaper: {
       // 模拟盘也要求显式开启，避免测试或其他部署无意中持续写入研究数据。
       enabled: environment.GCT_FUNDING_PAPER_ENABLED === '1',
       maxOpenPositions: parsePositiveInteger(environment.GCT_FUNDING_PAPER_MAX_OPEN_POSITIONS ?? '3', 'GCT_FUNDING_PAPER_MAX_OPEN_POSITIONS'),
+    },
+    fundingResearch: {
+      // 探索模拟只写本地研究账本，不能复用或放宽实盘候选阈值。
+      enabled: fundingResearchEnabled,
+      assets: fundingResearchAssets,
+      targetNotionalUsd: parsePositiveDecimal(environment.GCT_FUNDING_RESEARCH_TARGET_NOTIONAL_USD ?? '5', 'GCT_FUNDING_RESEARCH_TARGET_NOTIONAL_USD'),
+      maxOpenPositions: fundingResearchMaxOpenPositions,
+      maxSlippageBps: parseNonNegativeDecimal(environment.GCT_FUNDING_RESEARCH_MAX_SLIPPAGE_BPS ?? '10', 'GCT_FUNDING_RESEARCH_MAX_SLIPPAGE_BPS'),
+      minimumSettledEvents: parsePositiveInteger(environment.GCT_FUNDING_RESEARCH_MIN_SETTLED_EVENTS ?? '1', 'GCT_FUNDING_RESEARCH_MIN_SETTLED_EVENTS'),
     },
   };
 }

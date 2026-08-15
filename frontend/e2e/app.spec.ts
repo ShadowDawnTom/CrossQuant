@@ -168,6 +168,11 @@ test.describe.serial('local trading terminal', () => {
     await page.getByRole('button', { name: '% Funding Rates', exact: true }).click();
     await expect(page).toHaveURL(/\/funding-rates$/);
     await expect(page.getByRole('heading', { name: 'Funding rate matrix.' })).toBeVisible();
+    const fundingResearch = page.getByRole('region', { name: '探索模拟模式' });
+    await expect(fundingResearch.getByRole('heading', { name: /探索模拟模式/ })).toBeVisible();
+    await expect(fundingResearch).toContainText('探索模拟未开启');
+    await expect(fundingResearch).toContainText('不会发送交易所订单');
+    await expect(fundingResearch).toContainText('达到实盘标准');
     const fundingPaper = page.getByRole('region', { name: '资金费模拟盘' });
     await expect(fundingPaper.getByRole('heading', { name: '资金费模拟盘' })).toBeVisible();
     await expect(fundingPaper).toContainText('模拟盘未开启');

@@ -139,6 +139,27 @@ describe('local API request coordination', () => {
     expect(fetchMock.mock.calls.map(([path]) => path)).toEqual(['/api/funding-paper', '/api/funding-paper/paper-1']);
   });
 
+  it('validates isolated funding research summaries and details', async () => {
+    const position = { id: 'research-1', observationId: 'observation-1', mode: 'RESEARCH', asset: 'SOL',
+      longVenue: 'BINANCE', shortVenue: 'GATE', quantity: '0.05', state: 'OPEN', monitorState: 'HOLD' };
+    const fetchMock = vi.fn(async (path: string) => path === '/api/funding-research'
+      ? new Response(JSON.stringify({ enabled: true, targetNotionalUsd: '5', maxOpenPositions: 1,
+        minimumSettledEvents: 1, lastScanAt: '2026-08-15T00:00:00.000Z',
+        scan24h: { observations: 18, liveEligible: 0, researchEligible: 12, rejected: 6 },
+        rejectionReasons: [{ reason: 'market_not_synchronized', count: 6 }], latestObservations: [],
+        openCount: 1, closedCount: 0, cumulativePnl: '0', cumulativeFunding: '0',
+        cumulativeFees: '0.005', positions: [position] }))
+      : new Response(JSON.stringify({ position, evaluations: [], settlements: [] })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.fundingResearchSummary()).resolves.toMatchObject({ enabled: true, openCount: 1,
+      scan24h: { researchEligible: 12 }, positions: [{ mode: 'RESEARCH' }] });
+    await expect(api.fundingResearchDetails('research-1')).resolves.toMatchObject({
+      position: { id: 'research-1', mode: 'RESEARCH' }, evaluations: [], settlements: [],
+    });
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual(['/api/funding-research', '/api/funding-research/research-1']);
+  });
+
   it('ignores malformed websocket messages and delivers only validated stream events', () => {
     type Listener = (event: { data?: unknown }) => void;
     class FakeWebSocket {

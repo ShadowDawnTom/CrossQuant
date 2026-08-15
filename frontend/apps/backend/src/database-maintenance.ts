@@ -16,6 +16,8 @@ export interface DatabaseMaintenanceResult {
   fundingRateSnapshotsDeleted: number;
   fundingHoldingEvaluationsDeleted: number;
   fundingPaperEvaluationsDeleted: number;
+  fundingScanObservationsDeleted: number;
+  fundingResearchEvaluationsDeleted: number;
 }
 
 /**
@@ -81,6 +83,12 @@ export function runDatabaseMaintenance(
     const fundingPaperEvaluationsDeleted = database.prepare(
       'DELETE FROM funding_paper_evaluations WHERE observed_at < ?',
     ).run(executionCutoff).changes;
+    const fundingScanObservationsDeleted = database.prepare(
+      'DELETE FROM funding_scan_observations WHERE observed_at < ? AND id NOT IN (SELECT observation_id FROM funding_research_positions)',
+    ).run(marketSampleCutoff).changes;
+    const fundingResearchEvaluationsDeleted = database.prepare(
+      'DELETE FROM funding_research_evaluations WHERE observed_at < ?',
+    ).run(executionCutoff).changes;
     return {
       auditEventsDeleted: expiredAudit + excessAudit,
       strategyLogsDeleted,
@@ -90,6 +98,8 @@ export function runDatabaseMaintenance(
       fundingRateSnapshotsDeleted,
       fundingHoldingEvaluationsDeleted,
       fundingPaperEvaluationsDeleted,
+      fundingScanObservationsDeleted,
+      fundingResearchEvaluationsDeleted,
     };
   })();
 }

@@ -34,6 +34,7 @@ import {
 import { useLanguage } from './i18n.js';
 import { FundingExecutionPanel } from './funding-execution-panel.js';
 import { FundingPaperPanel } from './funding-paper-panel.js';
+import { FundingResearchPanel } from './funding-research-panel.js';
 
 const FundingHistoryChart = lazy(() => import('./charts.js').then((module) => ({ default: module.FundingHistoryChart })));
 
@@ -658,6 +659,7 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
       <div><p className="eyebrow">{t('Perpetual futures')}</p><h1>{t('Funding rate matrix.')}</h1><p>{t('Compare funding across exchanges, ranked by aggregate open interest.')}</p></div>
     </section>
 
+    <FundingResearchPanel />
     <FundingPaperPanel />
     <FundingExecutionPanel />
 

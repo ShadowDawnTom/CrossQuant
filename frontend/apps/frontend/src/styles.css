@@ -1399,6 +1399,37 @@ html[data-theme='light'] .portfolio-view .transfer-note.warn { color: #7b5d10 !i
   }
 }
 
+.funding-research-panel { margin-bottom:18px; padding:18px; border-color:#5d4b8f; background:linear-gradient(145deg,rgba(90,65,145,.08),transparent 48%),var(--panel); }
+.funding-research-panel > header { display:flex; justify-content:space-between; align-items:center; gap:16px; }
+.funding-research-panel h2 { display:flex; align-items:center; gap:8px; margin:2px 0 0; font-size:18px; }
+.funding-research-panel h2 em,.research-status { padding:3px 6px; border:1px solid #735dc0; border-radius:999px; color:#b9a8ff; background:rgba(93,71,160,.16); font-size:8px; font-style:normal; letter-spacing:.06em; }
+.research-running { display:flex; align-items:center; gap:7px; padding:6px 10px; border-radius:999px; color:#b9a8ff; background:#28203e; font-size:10px; font-weight:700; }
+.research-running i { width:6px; height:6px; border-radius:50%; background:currentColor; box-shadow:0 0 8px #9d83ff; }
+.funding-research-notice { margin:10px 0 14px; color:var(--muted-strong); font-size:11px; line-height:1.6; }
+.funding-research-stats { display:grid; grid-template-columns:repeat(6,minmax(100px,1fr)); gap:8px; }
+.funding-research-stats > span { display:grid; gap:5px; padding:10px; border:1px solid var(--line); border-radius:7px; background:rgba(115,93,192,.035); }
+.funding-research-stats small,.research-cost-grid small { color:var(--muted-strong); font-size:9px; }
+.funding-research-stats strong { font-size:13px; }
+.funding-research-funnel { display:flex; justify-content:space-between; gap:16px; margin-top:10px; padding:10px; border:1px solid var(--line); border-radius:7px; }
+.funding-research-funnel h3,.funding-research-opportunities h3,.funding-research-positions h3 { margin:0 0 8px; font-size:11px; }
+.funding-research-funnel p { display:flex; flex-wrap:wrap; gap:6px; margin:0; }
+.funding-research-funnel p span { padding:4px 7px; border-radius:999px; color:var(--muted-strong); background:rgba(120,120,140,.12); font-size:8px; }
+.funding-research-funnel > small { color:var(--muted); font-size:8px; white-space:nowrap; }
+.funding-research-opportunities,.funding-research-positions { margin-top:14px; padding-top:13px; border-top:1px solid var(--line); }
+.research-observation-list { display:grid; gap:8px; }
+.research-observation { display:grid; gap:9px; padding:10px; border:1px solid var(--line); border-radius:7px; }
+.research-observation.status-research_eligible { border-color:#66539c; background:rgba(100,78,166,.06); }
+.research-observation.status-live_eligible { border-color:#277e68; background:rgba(39,126,104,.06); }
+.research-observation-title { display:flex; align-items:center; gap:8px; min-width:0; font-size:10px; }
+.research-observation-title > strong { font-size:13px; }
+.research-observation-title > span:not(.research-status) { color:var(--muted-strong); }
+.research-observation-title > em { margin-left:auto; overflow:hidden; color:var(--muted); font-size:9px; font-style:normal; text-overflow:ellipsis; white-space:nowrap; }
+.research-cost-grid { display:grid; grid-template-columns:repeat(6,minmax(105px,1fr)); gap:6px; }
+.research-cost-grid > span { min-width:0; padding:6px; border:1px solid var(--line); border-radius:5px; font-size:9px; }
+.research-cost-grid small { display:block; margin-bottom:3px; }
+.research-position { display:grid; gap:10px; padding:12px 0; border-top:1px solid var(--line); }
+.research-position .paper-position-head > div { display:flex; align-items:center; gap:8px; }
+
 .funding-paper-panel { margin-bottom:18px; padding:18px; border-color:#275b50; }
 .funding-paper-panel > header { display:flex; justify-content:space-between; align-items:center; gap:16px; }
 .funding-paper-panel h2 { margin:2px 0 0; font-size:18px; }
@@ -1474,6 +1505,8 @@ html[data-theme='light'] .portfolio-view .transfer-note.warn { color: #7b5d10 !i
 .funding-monitor-detail p { display:grid; grid-template-columns:1fr 1.2fr auto; gap:8px; margin:0; padding:5px 0; border-top:1px solid var(--line); color:var(--muted-strong); }
 .funding-monitor-detail strong { color:var(--text); }
 @media (max-width:1000px) {
+  .funding-research-stats { grid-template-columns:repeat(3,minmax(110px,1fr)); }
+  .research-cost-grid { grid-template-columns:repeat(3,minmax(110px,1fr)); }
   .funding-paper-stats { grid-template-columns:repeat(3,minmax(110px,1fr)); }
   .funding-paper-data-health { grid-template-columns:1fr; }
   .paper-position-metrics { grid-template-columns:repeat(2,minmax(120px,1fr)); }
@@ -1484,6 +1517,10 @@ html[data-theme='light'] .portfolio-view .transfer-note.warn { color: #7b5d10 !i
   .funding-monitor-detail { grid-template-columns:1fr; }
 }
 @media (max-width:600px) {
+  .funding-research-stats,.research-cost-grid { grid-template-columns:repeat(2,minmax(100px,1fr)); }
+  .funding-research-panel > header,.funding-research-funnel,.research-observation-title { align-items:flex-start; flex-direction:column; }
+  .funding-research-funnel > small { white-space:normal; }
+  .research-observation-title > em { margin-left:0; white-space:normal; }
   .funding-paper-stats { grid-template-columns:repeat(2,minmax(100px,1fr)); }
   .funding-paper-panel > header,.paper-position-head,.paper-position-actions { align-items:flex-start; flex-direction:column; }
 }
