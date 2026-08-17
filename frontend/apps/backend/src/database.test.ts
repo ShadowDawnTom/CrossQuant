@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
-import { chmodSync, cpSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, cpSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { openDatabase, readDatabaseStatus } from './database.js';
@@ -22,6 +22,22 @@ afterEach(() => {
 });
 
 describe('database migrations', () => {
+  it('只将 LF 和 CRLF 视为同一个已执行迁移', () => {
+    const location = temporaryDatabasePath();
+    const migrationsDir = mkdtempSync(join(tmpdir(), 'gate-crossex-line-endings-'));
+    temporaryDirectories.push(migrationsDir);
+    const migrationPath = join(migrationsDir, '0001_line_endings.sql');
+    writeFileSync(migrationPath, 'CREATE TABLE sample (id TEXT);\n', { encoding: 'utf8' });
+    openDatabase(location.path, migrationsDir).close();
+
+    writeFileSync(migrationPath, 'CREATE TABLE sample (id TEXT);\r\n', { encoding: 'utf8' });
+    openDatabase(location.path, migrationsDir).close();
+
+    writeFileSync(migrationPath, 'CREATE TABLE sample (id INTEGER);\r\n', { encoding: 'utf8' });
+    expect(() => openDatabase(location.path, migrationsDir))
+      .toThrow('Applied migration 0001_line_endings.sql does not match its recorded checksum');
+  });
+
   it('applies migrations once and reports the current version', () => {
     const location = temporaryDatabasePath();
     const migrationsDir = resolve(process.cwd(), '../../migrations');

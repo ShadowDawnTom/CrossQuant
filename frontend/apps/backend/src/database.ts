@@ -36,6 +36,15 @@ function migrationChecksum(sql: string): string {
   return createHash('sha256').update(sql).digest('hex');
 }
 
+/**
+ * Windows 和 Linux 的发布包可能只改变 SQL 换行符。旧库保留原始字节校验值，
+ * 因此同时接受 LF/CRLF 两种等价值；SQL 内容有任何其他变化仍会拒绝启动。
+ */
+function compatibleMigrationChecksums(sql: string): Set<string> {
+  const lf = sql.replace(/\r\n?/g, '\n');
+  return new Set([migrationChecksum(lf), migrationChecksum(lf.replace(/\n/g, '\r\n'))]);
+}
+
 function applyMigrationDirectives(database: Database.Database, sql: string): void {
   for (const line of sql.split(/\r?\n/)) {
     const directive = /^-- @ensure-column ([a-z][a-z0-9_]*) ([a-z][a-z0-9_]*) ([A-Z][A-Z0-9_ ()']*)$/.exec(line.trim());
@@ -104,13 +113,14 @@ export function openDatabase(databasePath: string, migrationsDir: string): Datab
 
     for (const id of migrationFiles) {
       const sql = readFileSync(join(migrationsDir, id), 'utf8');
-      const checksum = migrationChecksum(sql);
+      const checksums = compatibleMigrationChecksums(sql);
+      const checksum = migrationChecksum(sql.replace(/\r\n?/g, '\n'));
       const applied = database
         .prepare('SELECT id, checksum FROM schema_migrations WHERE id = ?')
         .get(id) as AppliedMigration | undefined;
 
       if (applied) {
-        if (applied.checksum !== checksum) {
+        if (!checksums.has(applied.checksum)) {
           throw new Error(`Applied migration ${id} does not match its recorded checksum`);
         }
         continue;
