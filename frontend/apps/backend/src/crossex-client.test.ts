@@ -202,13 +202,33 @@ describe('Gate APIv4 signing', () => {
       return new Response('[]', { status: 200 });
     });
     const client = new GateCrossExClient(fetchMock as typeof fetch, () => 1_700_000_000_000,
-      'https://api.gateio.ws/api/v4', 0);
+      'https://api.gateio.ws/api/v4', 0, 0);
     const symbols = Array.from({ length: 201 }, (_, index) => `GATE_FUTURE_A${index}_USDT`);
 
     await client.queryFundingInfo({ apiKey: 'test-api-key', apiSecret: 'test-secret' }, symbols);
 
     expect(calls).toHaveLength(3);
     expect(calls.map((url) => new URL(url).searchParams.get('symbols')!.split(',').length)).toEqual([100, 100, 1]);
+  });
+
+  it('资金费接口遇到 429 时遵守冷却并只重试当前分批', async () => {
+    let calls = 0;
+    const fetchMock = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) return new Response(JSON.stringify({ label: 'TOO_MANY_REQUESTS' }), {
+        status: 429, headers: { 'Retry-After': '0' },
+      });
+      return new Response(JSON.stringify([{ symbol: 'GATE_FUTURE_SOL_USDT', funding_rate: '0.0001',
+        funding_time: '1786608000000', funding_interval: '28800' }]), { status: 200 });
+    });
+    const client = new GateCrossExClient(fetchMock as typeof fetch, () => 1_700_000_000_000,
+      'https://api.gateio.ws/api/v4', 0, 0);
+
+    const rows = await client.queryFundingInfo({ apiKey: 'test-api-key', apiSecret: 'test-secret' },
+      ['GATE_FUTURE_SOL_USDT']);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(rows[0]?.symbol).toBe('GATE_FUTURE_SOL_USDT');
   });
 
   it('queries a single order by id or client text with the documented GET route', async () => {

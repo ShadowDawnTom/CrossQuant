@@ -366,6 +366,7 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
     private readonly now: () => number = Date.now,
     private readonly baseUrl: string = PRODUCTION_BASE_URL,
     private readonly authenticatedRequestSpacingMs = 100,
+    private readonly fundingBatchSpacingMs = 1_100,
   ) {}
 
   async queryAccount(credentials: GateCredentials, exchangeType?: string): Promise<GateCrossExAccount> {
@@ -456,15 +457,25 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
       throw new GateApiError(0, 'INVALID_FUNDING_SYMBOLS');
     }
     const rows: GateFundingInfo[] = [];
-    // 单次接口最多接收 100 个 symbol。分片仍走同一个认证队列，避免扩容扫描池后形成并发突发。
+    // 单次接口最多接收 100 个 symbol。该端点还有独立限频，分批之间留出 1 秒余量。
     for (let offset = 0; offset < uniqueSymbols.length; offset += 100) {
+      if (offset > 0 && this.fundingBatchSpacingMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.fundingBatchSpacingMs));
+      }
       const batch = uniqueSymbols.slice(offset, offset + 100);
       // Gate 对该新接口的签名示例保留 symbols 中的逗号；URLSearchParams 编成 %2C 会验签失败。
       const queryString = `symbols=${batch.join(',')}`;
-      rows.push(...await this.signedRequest(
+      const requestBatch = () => this.signedRequest(
         'GET', FUNDING_INFO_ENDPOINT, queryString, '', credentials,
         z.array(GateFundingInfoSchema), 'INVALID_FUNDING_INFO_RESPONSE', false, 'low',
-      ));
+      );
+      try {
+        rows.push(...await requestBatch());
+      } catch (error) {
+        // 429 已把 Retry-After 写入全局认证队列；当前分批只重试一次，避免无限重放。
+        if (!(error instanceof GateApiError) || error.statusCode !== 429) throw error;
+        rows.push(...await requestBatch());
+      }
     }
     return rows;
   }
