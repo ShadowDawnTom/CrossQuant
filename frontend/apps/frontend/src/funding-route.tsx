@@ -53,6 +53,8 @@ interface FundingPairRow {
   /** Mean open interest per venue reporting it — the filterable metric. */
   avgOi: number;
   oiVenues: number;
+  executionSupport: Array<FundingOverviewVenueEntry['executionSupport']>;
+  bestExecution: FundingOverviewAsset['bestExecution'];
 }
 
 type FundingHistoryDuration = 1 | 7 | 30;
@@ -384,6 +386,7 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
       const rates: Array<number | null> = [];
       const symbols: Array<string | null> = [];
       const listed: boolean[] = [];
+      const executionSupport: Array<FundingOverviewVenueEntry['executionSupport']> = [];
       let oi = 0;
       let oiVenues = 0;
       for (const exchange of exchanges) {
@@ -403,8 +406,11 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
         rates.push(rate !== null && Number.isFinite(rate) ? rate : null);
         symbols.push(entry?.symbol ?? null);
         listed.push(Boolean(entry) || Boolean(hub));
+        executionSupport.push(entry?.executionSupport ?? 'unsupported');
       }
-      return { asset, name: assetName(asset), icon: assetIcon(asset), rates, symbols, listed, oi, avgOi: oiVenues > 0 ? oi / oiVenues : 0, oiVenues };
+      return { asset, name: assetName(asset), icon: assetIcon(asset), rates, symbols, listed, oi,
+        avgOi: oiVenues > 0 ? oi / oiVenues : 0, oiVenues, executionSupport,
+        bestExecution: overviewAssets.get(asset)?.bestExecution ?? null };
     });
   }, [overview, overviewState, marketSnapshot]);
 
@@ -692,7 +698,7 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
             <th><button className="sort-header asset-sort" onClick={() => changeSort('asset')}>{t('Asset')} {sortMark('asset')}</button></th>
             <th><button className="sort-header" onClick={() => changeSort('oi')}>{t('Open interest')} {sortMark('oi')}</button></th>
             <th><button className="sort-header" onClick={() => changeSort('average')}><span><strong>{t('Average rate')}</strong><small>{t('Tradable venues')}</small></span>{sortMark('average')}</button></th>
-            <th><button className="sort-header arb-sort" onClick={() => changeSort('arb')}><span><strong>{t('Max arb')}</strong><small>{t('Best spread')}</small></span>{sortMark('arb')}</button></th>
+            <th><button className="sort-header arb-sort" onClick={() => changeSort('arb')}><span><strong>{metric === 'APR' ? t('Gross snapshot APR') : t('Max arb')}</strong><small>{metric === 'APR' ? t('Executable conservative net return') : t('Best spread')}</small></span>{sortMark('arb')}</button></th>
             {visibleExchanges.map(({ venue }) => <th key={venue.id}><button className="sort-header exchange-sort" onClick={() => changeSort(venue.id as FundingSortKey)}><span className="exchange-heading"><VenueIcon id={venue.id} short={venue.short} /><span><strong>{venue.name}</strong>{sortMark(venue.id as FundingSortKey)}</span></span></button></th>)}
           </tr></thead>
           <tbody>{visibleMarkets.map((item, index) => {
@@ -700,13 +706,21 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
             const lowArb = arb.low;
             const highArb = arb.high;
             const average = getAverage(item);
+            const bestExecution = item.bestExecution;
+            const selectedLongIndex = lowArb ? exchanges.findIndex((venue) => venue.id === lowArb.venue.id) : -1;
+            const selectedShortIndex = highArb ? exchanges.findIndex((venue) => venue.id === highArb.venue.id) : -1;
+            const selectedExecutorSupported = selectedLongIndex >= 0 && selectedShortIndex >= 0
+              && item.executionSupport[selectedLongIndex] === 'live_ready'
+              && item.executionSupport[selectedShortIndex] === 'live_ready';
             return <tr key={item.asset} className="funding-clickable-row" onClick={() => onOpenAsset(item.asset)}>
               <td><button className="funding-history-link" aria-label={`${item.asset} ${t('Historical funding')}`} onClick={(event) => { event.stopPropagation(); onOpenAsset(item.asset); }}><span className={`funding-asset asset-tone-${index % 5}`}>{item.icon}</span><span><strong>{item.asset}</strong><small>{item.name} {t('Perpetual').toLowerCase()}</small></span><span className="funding-row-arrow">→</span></button></td>
               <td>{item.oi > 0
                 ? <><strong className="oi-value">{formatOi(item.oi)}</strong><span className="oi-bar"><i style={{ width: `${Math.max(4, (item.oi / maxOi) * 100)}%` }} /></span><small className="oi-avg">{t('avg')} {formatOi(item.avgOi)}</small></>
                 : <><strong className="oi-value">—</strong><small className="oi-avg">{t('no data')}</small></>}</td>
               <td className="average-funding-cell"><strong className={average.rate === null ? 'funding-rate funding-missing' : 'funding-rate funding-average'}>{average.rate === null ? '—' : formatRate(average.rate)}</strong></td>
-              <td className="arb-cell"><div className="arb-cell-layout"><span className="arb-summary"><strong>{arb.spread !== null ? formatRate(arb.spread) : '—'}</strong><small>{visibleExchanges.length <= 1 ? t('Select 2+ exchanges') : arb.spread !== null ? `${t('Long')} ${lowArb?.venue.short} · ${t('Short')} ${highArb?.venue.short}` : t('no data')}</small></span>{lowArb && highArb && <button className="arb-strategy-button" title={t('Open hedge strategy')} aria-label={`${t('Open hedge strategy')}: ${item.asset}, ${t('Long')} ${lowArb.venue.name}, ${t('Short')} ${highArb.venue.name}`} onClick={(event) => {
+              <td className="arb-cell"><div className="arb-cell-layout"><span className="arb-summary"><strong>{arb.spread !== null ? formatRate(arb.spread) : '—'}</strong><small>{metric === 'APR' && bestExecution
+                ? `${t('Conservative net')} ${bestExecution.conservativeNetAnnualized === null ? '—' : `${(Number(bestExecution.conservativeNetAnnualized) * 100).toFixed(2)}%`} · ${bestExecution.longVenue}→${bestExecution.shortVenue} · ${bestExecution.executionSupport === 'LIVE_READY' ? t('Executor supported') : t('Live unsupported')}`
+                : visibleExchanges.length <= 1 ? t('Select 2+ exchanges') : arb.spread !== null ? `${t('Long')} ${lowArb?.venue.short} · ${t('Short')} ${highArb?.venue.short}` : t('no data')}</small></span>{lowArb && highArb && <button className="arb-strategy-button" disabled={!selectedExecutorSupported} title={selectedExecutorSupported ? t('Open hedge strategy') : t('This pair is not supported by the live executor')} aria-label={`${t('Open hedge strategy')}: ${item.asset}, ${t('Long')} ${lowArb.venue.name}, ${t('Short')} ${highArb.venue.name}`} onClick={(event) => {
                 event.stopPropagation();
                 onOpenStrategy({ asset: item.asset, longVenue: lowArb.venue.id, shortVenue: highArb.venue.id });
               }} onKeyDown={(event) => event.stopPropagation()}><span aria-hidden="true">⇄</span><em>{t('Open')}</em></button>}</div></td>
@@ -721,7 +735,8 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
                   return <td key={`${item.asset}-${venue.id}`}><strong className="funding-rate funding-missing">{historicalMetric && symbol && (historyPending.has(symbol) || !historyBySymbol[symbol]) ? '…' : '—'}</strong><small>{detail}</small></td>;
                 }
                 const colorClass = arb.spread !== null && rate === arb.high?.rate ? 'funding-highest' : arb.spread !== null && rate === arb.low?.rate ? 'funding-lowest' : 'funding-base';
-                return <td key={`${item.asset}-${venue.id}`}><strong className={`funding-rate ${colorClass}`}>{formatRate(rate)}</strong><small className={metric === 'APR' ? undefined : 'funding-period-label'}>{metric === 'APR' ? t('annualized') : metric === 'Per interval' ? t('next payment') : `${t('cumulative')} ${metric}`}</small></td>;
+                const support = item.executionSupport[rateIndex];
+                return <td key={`${item.asset}-${venue.id}`}><strong className={`funding-rate ${colorClass}`}>{formatRate(rate)}</strong><small className={metric === 'APR' ? undefined : 'funding-period-label'}>{metric === 'APR' ? `${t('Gross snapshot')} · ${support === 'live_ready' ? t('Executor supported') : support === 'research_only' ? t('Research only') : t('Unsupported')}` : metric === 'Per interval' ? t('next payment') : `${t('cumulative')} ${metric}`}</small></td>;
               })}
             </tr>;
           })}</tbody>

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ExecutionMarketHub, OrderBookReplica } from './execution-market-hub.js';
+import { crossExFutureSymbol, ExecutionMarketHub, nativeSymbol, OrderBookReplica } from './execution-market-hub.js';
+import { StaticQuoteFxReader } from './quote-fx-oracle.js';
 
 afterEach(() => vi.useRealTimers());
 
@@ -71,6 +72,33 @@ describe('venue payload parsing', () => {
     expect(book.state.bids.get('100')).toBe('2');
     expect(book.state.asks.get('101')).toBe('3');
   });
+
+  it('同步 Kraken、Hyperliquid 与 Deribit 的原生盘口语义', () => {
+    const hub = new ExecutionMarketHub(fetch, { symbols: ['BTC'], quoteFx: new StaticQuoteFxReader() });
+    const internal = hub as unknown as {
+      books: Map<string, OrderBookReplica>;
+      onKraken: (message: Record<string, unknown>) => void;
+      onHyperliquid: (message: Record<string, unknown>) => void;
+      onDeribit: (message: Record<string, unknown>) => void;
+    };
+    internal.onKraken({ feed: 'book_snapshot', product_id: 'PF_XBTUSD', seq: 10,
+      timestamp: 1_800_000_000_000, bids: [{ price: '100', qty: '2' }], asks: [{ price: '101', qty: '3' }] });
+    internal.onHyperliquid({ channel: 'l2Book', data: { coin: 'BTC', time: 1_800_000_000_010,
+      levels: [[{ px: '100.1', sz: '4' }], [{ px: '101.1', sz: '5' }]] } });
+    internal.onDeribit({ method: 'subscription', params: { channel: 'book.BTC_USDC-PERPETUAL.100ms',
+      data: { type: 'snapshot', instrument_name: 'BTC_USDC-PERPETUAL', change_id: 20,
+        timestamp: 1_800_000_000_020, bids: [['new', '100.2', '6']], asks: [['new', '101.2', '7']] } } });
+    internal.onDeribit({ method: 'subscription', params: { channel: 'book.BTC_USDC-PERPETUAL.100ms',
+      data: { type: 'change', instrument_name: 'BTC_USDC-PERPETUAL', change_id: 21, prev_change_id: 20,
+        timestamp: 1_800_000_000_030, bids: [['change', '100.2', '0']], asks: [['new', '101.3', '8']] } } });
+
+    expect(internal.books.get('KRAKEN:BTC')!.state.bids.get('100')).toBe('2');
+    expect(internal.books.get('HYPERLIQUID:BTC')!.state.asks.get('101.1')).toBe('5');
+    expect(internal.books.get('DERIBIT:BTC')!.state.bids.has('100.2')).toBe(false);
+    expect(internal.books.get('DERIBIT:BTC')!.state.sequence).toBe(21);
+    expect(nativeSymbol('KRAKEN', 'DOGE')).toBe('PF_DOGEUSD');
+    expect(crossExFutureSymbol('DERIBIT', 'BTC')).toBe('DERIBIT_FUTURE_BTC_USDC');
+  });
 });
 
 describe('ExecutionMarketHub certification', () => {
@@ -101,7 +129,8 @@ describe('ExecutionMarketHub certification', () => {
 
   it('fails closed on stale books and certifies only synchronized, time-aligned pairs', () => {
     const now = 1_800_000_000_000;
-    const hub = new ExecutionMarketHub(fetch, { symbols: ['BTC'], maxBookAgeMs: 1_000, maxExchangeSkewMs: 100, maxReceiveSkewMs: 100 });
+    const hub = new ExecutionMarketHub(fetch, { symbols: ['BTC'], maxBookAgeMs: 1_000,
+      maxExchangeSkewMs: 100, maxReceiveSkewMs: 100, quoteFx: new StaticQuoteFxReader() });
     const internal = hub as unknown as {
       books: Map<string, OrderBookReplica>;
       connections: Map<string, { state: string }>;
@@ -118,7 +147,8 @@ describe('ExecutionMarketHub certification', () => {
 
   it('rejects pair certification when exchange timestamps are not aligned', () => {
     const now = 1_800_000_000_000;
-    const hub = new ExecutionMarketHub(fetch, { symbols: ['BTC'], maxExchangeSkewMs: 50 });
+    const hub = new ExecutionMarketHub(fetch, { symbols: ['BTC'], maxExchangeSkewMs: 50,
+      quoteFx: new StaticQuoteFxReader() });
     const internal = hub as unknown as {
       books: Map<string, OrderBookReplica>;
       connections: Map<string, { state: string }>;

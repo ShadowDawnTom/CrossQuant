@@ -32,7 +32,8 @@ export interface BackendConfig {
     maxBookAgeMs: number;
     maxExchangeSkewMs: number;
     maxReceiveSkewMs: number;
-    endpoints: Partial<Record<'GATE' | 'BINANCE' | 'OKX' | 'BYBIT', { rest: string; websocket: string }>>;
+    endpoints: Partial<Record<'GATE' | 'BINANCE' | 'OKX' | 'BYBIT' | 'KRAKEN' | 'HYPERLIQUID' | 'DERIBIT',
+      { rest: string; websocket: string }>>;
   };
   riskLimits: {
     maxGrossExposureUsd: string;
@@ -88,6 +89,12 @@ export interface BackendConfig {
     maxOpenPositions: number;
     maxSlippageBps: string;
     minimumSettledEvents: number;
+    minLiquidityUsd: string;
+    liquidityDepthBps: string;
+    maxPairsPerAsset: number;
+    stablecoinRiskBps: string;
+    rollingSoftReviewMs: number;
+    rollingHardHoldingMs: number;
   };
 }
 
@@ -137,6 +144,12 @@ function parseAssetList(value: string, name: string): string[] {
   }
   return assets;
 }
+
+const DEFAULT_RESEARCH_ASSETS = [
+  'BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'ADA', 'SUI', 'AVAX', 'LINK', 'LTC',
+  'BCH', 'DOT', 'UNI', 'AAVE', 'NEAR', 'APT', 'ARB', 'OP', 'INJ', 'ATOM',
+  'FIL', 'ETC', 'XLM', 'HBAR', 'TRX', 'SEI', 'JUP', 'TAO', 'WIF', 'PEPE',
+].join(',');
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): BackendConfig {
   const host = environment.GCT_HOST ?? '127.0.0.1';
@@ -192,13 +205,27 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
   }
   const executionMarketSymbols = parseAssetList(environment.GCT_EXECUTION_MARKET_SYMBOLS ?? 'BTC,ETH', 'GCT_EXECUTION_MARKET_SYMBOLS');
   const fundingScanAssets = parseAssetList(environment.GCT_FUNDING_SCAN_ASSETS ?? executionMarketSymbols.join(','), 'GCT_FUNDING_SCAN_ASSETS');
-  const fundingResearchAssets = parseAssetList(environment.GCT_FUNDING_RESEARCH_ASSETS ?? 'BTC,ETH,SOL,DOGE,TRUMP', 'GCT_FUNDING_RESEARCH_ASSETS');
+  const fundingResearchAssets = parseAssetList(environment.GCT_FUNDING_RESEARCH_ASSETS ?? DEFAULT_RESEARCH_ASSETS, 'GCT_FUNDING_RESEARCH_ASSETS');
   const fundingResearchEnabled = environment.GCT_FUNDING_RESEARCH_ENABLED === '1';
+  if (executionMarketSymbols.length > 50 || fundingResearchAssets.length > 50) {
+    throw new Error('execution and research asset lists must not exceed 50 assets');
+  }
   const fundingResearchMaxOpenPositions = parsePositiveInteger(
     environment.GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS ?? '1', 'GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS',
   );
   if (fundingResearchMaxOpenPositions !== 1) {
-    throw new Error('GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS must remain 1');
+    throw new Error('GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS must remain 1 per cohort');
+  }
+  const fundingResearchRollingSoftReviewMs = parsePositiveInteger(
+    environment.GCT_FUNDING_RESEARCH_ROLLING_SOFT_REVIEW_MS ?? '259200000',
+    'GCT_FUNDING_RESEARCH_ROLLING_SOFT_REVIEW_MS',
+  );
+  const fundingResearchRollingHardHoldingMs = parsePositiveInteger(
+    environment.GCT_FUNDING_RESEARCH_ROLLING_HARD_HOLDING_MS ?? '604800000',
+    'GCT_FUNDING_RESEARCH_ROLLING_HARD_HOLDING_MS',
+  );
+  if (fundingResearchRollingSoftReviewMs >= fundingResearchRollingHardHoldingMs) {
+    throw new Error('GCT_FUNDING_RESEARCH_ROLLING_SOFT_REVIEW_MS must be lower than rolling hard holding limit');
   }
   const missingStrictBooks = fundingScanAssets.filter((asset) => !executionMarketSymbols.includes(asset));
   if (missingStrictBooks.length > 0) {
@@ -247,7 +274,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
         },
         BINANCE: {
           rest: environment.GCT_BINANCE_FUTURES_REST_URL ?? 'https://fapi.binance.com',
-          websocket: environment.GCT_BINANCE_FUTURES_WS_URL ?? 'wss://fstream.binance.com/public/ws',
+          websocket: environment.GCT_BINANCE_FUTURES_WS_URL ?? 'wss://fstream.binance.com/ws',
         },
         OKX: {
           rest: environment.GCT_OKX_REST_URL ?? 'https://openapi.okx.com',
@@ -256,6 +283,18 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
         BYBIT: {
           rest: environment.GCT_BYBIT_REST_URL ?? 'https://api.bybit.com',
           websocket: environment.GCT_BYBIT_WS_URL ?? 'wss://stream.bybit.com/v5/public/linear',
+        },
+        KRAKEN: {
+          rest: environment.GCT_KRAKEN_FUTURES_REST_URL ?? 'https://futures.kraken.com',
+          websocket: environment.GCT_KRAKEN_FUTURES_WS_URL ?? 'wss://futures.kraken.com/ws/v1',
+        },
+        HYPERLIQUID: {
+          rest: environment.GCT_HYPERLIQUID_REST_URL ?? 'https://api.hyperliquid.xyz',
+          websocket: environment.GCT_HYPERLIQUID_WS_URL ?? 'wss://api.hyperliquid.xyz/ws',
+        },
+        DERIBIT: {
+          rest: environment.GCT_DERIBIT_REST_URL ?? 'https://www.deribit.com/api/v2',
+          websocket: environment.GCT_DERIBIT_WS_URL ?? 'wss://www.deribit.com/ws/api/v2',
         },
       },
     },
@@ -318,6 +357,12 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       maxOpenPositions: fundingResearchMaxOpenPositions,
       maxSlippageBps: parseNonNegativeDecimal(environment.GCT_FUNDING_RESEARCH_MAX_SLIPPAGE_BPS ?? '10', 'GCT_FUNDING_RESEARCH_MAX_SLIPPAGE_BPS'),
       minimumSettledEvents: parsePositiveInteger(environment.GCT_FUNDING_RESEARCH_MIN_SETTLED_EVENTS ?? '1', 'GCT_FUNDING_RESEARCH_MIN_SETTLED_EVENTS'),
+      minLiquidityUsd: parsePositiveDecimal(environment.GCT_FUNDING_RESEARCH_MIN_LIQUIDITY_USD ?? '1000', 'GCT_FUNDING_RESEARCH_MIN_LIQUIDITY_USD'),
+      liquidityDepthBps: parsePositiveDecimal(environment.GCT_FUNDING_RESEARCH_LIQUIDITY_DEPTH_BPS ?? '10', 'GCT_FUNDING_RESEARCH_LIQUIDITY_DEPTH_BPS'),
+      maxPairsPerAsset: parsePositiveInteger(environment.GCT_FUNDING_RESEARCH_MAX_PAIRS_PER_ASSET ?? '1', 'GCT_FUNDING_RESEARCH_MAX_PAIRS_PER_ASSET'),
+      stablecoinRiskBps: parseNonNegativeDecimal(environment.GCT_FUNDING_RESEARCH_STABLECOIN_RISK_BPS ?? '5', 'GCT_FUNDING_RESEARCH_STABLECOIN_RISK_BPS'),
+      rollingSoftReviewMs: fundingResearchRollingSoftReviewMs,
+      rollingHardHoldingMs: fundingResearchRollingHardHoldingMs,
     },
   };
 }

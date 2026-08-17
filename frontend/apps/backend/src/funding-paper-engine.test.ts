@@ -20,6 +20,7 @@ afterEach(() => {
 function market(now: () => number, quality: () => 'LIVE_SYNCHRONIZED' | 'LIVE_UNSYNCHRONIZED' = () => 'LIVE_SYNCHRONIZED'): ExecutionMarketReader {
   const book = (venue: 'BINANCE' | 'OKX', bids: Array<readonly [string, string]>, asks: Array<readonly [string, string]>) => ({
     venue, symbol: `${venue}:SOL`, base: 'SOL', quote: 'USDT' as const, bids, asks, sequence: 1,
+    quoteToUsd: '1', quoteRateAgeMs: 0, quoteRateState: 'healthy' as const,
     exchangeTimestamp: new Date(now()).toISOString(), receivedAt: new Date(now()).toISOString(), ageMs: 1,
     synchronized: true, connectionState: 'healthy' as const, rebuilds: 0, sequenceGaps: 0, lastError: null,
   });

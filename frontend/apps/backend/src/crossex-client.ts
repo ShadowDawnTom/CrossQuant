@@ -450,15 +450,23 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
   }
 
   async queryFundingInfo(credentials: GateCredentials, symbols: string[]): Promise<GateFundingInfo[]> {
-    if (symbols.length < 1 || symbols.length > 100 || symbols.some((symbol) => !/^[A-Z0-9_]{3,120}$/.test(symbol))) {
+    const uniqueSymbols = [...new Set(symbols)];
+    if (uniqueSymbols.length < 1 || uniqueSymbols.length > 350
+      || uniqueSymbols.some((symbol) => !/^[A-Z0-9_]{3,120}$/.test(symbol))) {
       throw new GateApiError(0, 'INVALID_FUNDING_SYMBOLS');
     }
-    // Gate 对该新接口的签名示例保留 symbols 中的逗号；URLSearchParams 编成 %2C 会验签失败。
-    const queryString = `symbols=${symbols.join(',')}`;
-    return this.signedRequest(
-      'GET', FUNDING_INFO_ENDPOINT, queryString, '', credentials,
-      z.array(GateFundingInfoSchema), 'INVALID_FUNDING_INFO_RESPONSE', false, 'low',
-    );
+    const rows: GateFundingInfo[] = [];
+    // 单次接口最多接收 100 个 symbol。分片仍走同一个认证队列，避免扩容扫描池后形成并发突发。
+    for (let offset = 0; offset < uniqueSymbols.length; offset += 100) {
+      const batch = uniqueSymbols.slice(offset, offset + 100);
+      // Gate 对该新接口的签名示例保留 symbols 中的逗号；URLSearchParams 编成 %2C 会验签失败。
+      const queryString = `symbols=${batch.join(',')}`;
+      rows.push(...await this.signedRequest(
+        'GET', FUNDING_INFO_ENDPOINT, queryString, '', credentials,
+        z.array(GateFundingInfoSchema), 'INVALID_FUNDING_INFO_RESPONSE', false, 'low',
+      ));
+    }
+    return rows;
   }
 
   async createTransfer(credentials: GateCredentials, transfer: CrossExTransferRequest): Promise<GateTransferResponse> {

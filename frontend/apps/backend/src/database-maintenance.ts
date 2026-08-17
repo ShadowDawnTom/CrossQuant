@@ -6,6 +6,7 @@ const EXECUTION_RETENTION_MS = 365 * DAY_MS;
 const MAX_AUDIT_EVENTS = 50_000;
 const MARKET_SAMPLE_RETENTION_MS = 30 * DAY_MS;
 const FUNDING_SNAPSHOT_RETENTION_MS = 30 * DAY_MS;
+const FUNDING_SCAN_RETENTION_MS = 3 * DAY_MS;
 
 export interface DatabaseMaintenanceResult {
   auditEventsDeleted: number;
@@ -33,6 +34,7 @@ export function runDatabaseMaintenance(
   const executionCutoff = new Date(now - EXECUTION_RETENTION_MS).toISOString();
   const marketSampleCutoff = new Date(now - MARKET_SAMPLE_RETENTION_MS).toISOString();
   const fundingSnapshotCutoff = new Date(now - FUNDING_SNAPSHOT_RETENTION_MS).toISOString();
+  const fundingScanCutoff = new Date(now - FUNDING_SCAN_RETENTION_MS).toISOString();
   return database.transaction(() => {
     const expiredAudit = database.prepare('DELETE FROM audit_events WHERE created_at < ?').run(auditCutoff).changes;
     const excessAudit = database.prepare(`
@@ -85,7 +87,7 @@ export function runDatabaseMaintenance(
     ).run(executionCutoff).changes;
     const fundingScanObservationsDeleted = database.prepare(
       'DELETE FROM funding_scan_observations WHERE observed_at < ? AND id NOT IN (SELECT observation_id FROM funding_research_positions)',
-    ).run(marketSampleCutoff).changes;
+    ).run(fundingScanCutoff).changes;
     const fundingResearchEvaluationsDeleted = database.prepare(
       'DELETE FROM funding_research_evaluations WHERE observed_at < ?',
     ).run(executionCutoff).changes;

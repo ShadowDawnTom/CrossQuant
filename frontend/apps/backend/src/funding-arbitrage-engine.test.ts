@@ -20,6 +20,7 @@ function order(id: string, side: 'BUY' | 'SELL', quantity = '0.1', state = 'FILL
 
 function market(): ExecutionMarketReader {
   const book = (venue: 'BINANCE' | 'OKX') => ({ venue, symbol: 'SOLUSDT', base: 'SOL', quote: 'USDT' as const,
+    quoteToUsd: '1', quoteRateAgeMs: 0, quoteRateState: 'healthy' as const,
     bids: [['99.9', '100'] as const], asks: [['100', '100'] as const], sequence: 1,
     exchangeTimestamp: new Date().toISOString(), receivedAt: new Date().toISOString(), ageMs: 1,
     synchronized: true, connectionState: 'healthy' as const, rebuilds: 0, sequenceGaps: 0, lastError: null });

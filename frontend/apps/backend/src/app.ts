@@ -459,7 +459,10 @@ function safeCredentialError(error: unknown, language: SecureCredentialLanguage)
 export async function buildApp(options: BuildAppOptions): Promise<FastifyInstance> {
   const { config, database, credentialVault, crossExGateway, publicMarketGateway } = options;
   const marketHub = options.marketHub ?? new CrossExMarketHub(config.gatePublicWebSocketUrl);
-  const executionMarketHub = options.executionMarketHub ?? new ExecutionMarketHub(fetch, config.executionMarket);
+  const executionMarketHub = options.executionMarketHub ?? new ExecutionMarketHub(fetch, {
+    ...config.executionMarket,
+    requiredSymbols: config.fundingArbitrage.scanAssets,
+  });
   const tradingSession = options.tradingSession ?? new TradingSession();
   const tradingRuntime = new TradingRuntime(database, tradingSession, credentialVault, crossExGateway);
   const privateStream = new CrossExPrivateStream(config.gatePrivateWebSocketUrl, credentialVault);
@@ -704,6 +707,16 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     targetNotionalUsd: config.fundingResearch.targetNotionalUsd,
     maxOpenPositions: config.fundingResearch.maxOpenPositions,
     minimumSettledEvents: config.fundingResearch.minimumSettledEvents,
+    holdingEventsPerLeg: config.fundingArbitrage.holdingEventsPerLeg,
+    holdingExitConfirmationCount: config.fundingArbitrage.holdingExitConfirmationCount,
+    minimumHoldValueUsd: config.fundingArbitrage.minimumHoldValueUsd,
+    settlementGuardMs: config.fundingArbitrage.settlementGuardMs,
+    fundingRetentionFactor: config.fundingArbitrage.fundingRetentionFactor,
+    stressSlippageBps: config.fundingArbitrage.stressSlippageBps,
+    adverseExitBasisBps: config.fundingArbitrage.adverseExitBasisBps,
+    rollingSoftReviewMs: config.fundingResearch.rollingSoftReviewMs,
+    rollingHardHoldingMs: config.fundingResearch.rollingHardHoldingMs,
+    stablecoinRiskBps: config.fundingResearch.stablecoinRiskBps,
   });
   const fundingScannerAssets = [...new Set([
     ...config.fundingArbitrage.scanAssets,
@@ -723,6 +736,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         researchAssets: config.fundingResearch.enabled ? config.fundingResearch.assets : [],
         researchTargetNotionalUsd: config.fundingResearch.targetNotionalUsd,
         researchMaxSlippageBps: config.fundingResearch.maxSlippageBps,
+        minLiquidityUsd: config.fundingResearch.minLiquidityUsd,
+        liquidityDepthBps: config.fundingResearch.liquidityDepthBps,
+        maxPairsPerAsset: config.fundingResearch.maxPairsPerAsset,
+        stablecoinRiskBps: config.fundingResearch.stablecoinRiskBps,
         onFundingData: async (funding, fees, observations) => {
           // 实盘监控和模拟盘共享同一份认证快照，避免重复请求 funding_info 与费率接口。
           const results = await Promise.allSettled([
@@ -1804,7 +1821,26 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       });
     }
     await fundingOverviewService.ensureFresh();
-    return fundingOverviewService.buildResponse(catalog) satisfies FundingOverviewResponse;
+    const overview = fundingOverviewService.buildResponse(catalog);
+    const executionByAsset = new Map(fundingResearchEngine.latestExecutionObservations()
+      .map((item) => [item.asset, item] as const));
+    for (const asset of overview.assets) {
+      const execution = executionByAsset.get(asset.asset);
+      if (!execution) continue;
+      asset.bestExecution = {
+        observedAt: execution.observedAt,
+        longVenue: execution.longVenue,
+        shortVenue: execution.shortVenue,
+        grossSnapshotAnnualized: execution.rawAnnualized,
+        conservativeNetAnnualized: execution.netAnnualized,
+        conservativeNetPnl: execution.netPnl,
+        executionSupport: execution.executionSupport,
+        status: execution.status,
+        primaryReason: execution.primaryReason,
+        liquidityUsd: execution.liquidityUsd,
+      };
+    }
+    return overview satisfies FundingOverviewResponse;
   });
 
   app.post('/api/markets/funding-history', {

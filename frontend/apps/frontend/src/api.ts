@@ -193,9 +193,14 @@ export interface FundingScanObservation {
   exitFees: string | null; tradingFees: string | null; stressBuffer: string | null; netPnl: string | null;
   rawAnnualized: string | null; netAnnualized: string | null; breakEvenHours: string | null;
   entrySlippageBps: string | null; exitSlippageBps: string | null; basisBps: string | null;
+  longQuote: string; shortQuote: string; longQuoteToUsd: string | null; shortQuoteToUsd: string | null;
+  liquidityUsd: string | null; executionSupport: 'LIVE_READY' | 'RESEARCH_ONLY';
+  stablecoinRiskBuffer: string | null;
+  edgeDurationMinutes?: number; directionFlips24h?: number; settlementHitRate?: string | null;
+  settlementSamples?: number;
 }
 export interface FundingResearchPosition {
-  id: string; observationId: string; mode: 'RESEARCH'; asset: string; longVenue: string; shortVenue: string;
+  id: string; observationId: string; mode: 'RESEARCH'; cohort: 'ONE_SETTLEMENT' | 'ROLLING'; asset: string; longVenue: string; shortVenue: string;
   quantity: string; targetNotionalUsd: string; state: string; monitorState: string;
   entryRawAnnualized: string; entryNetAnnualized: string; entryLongPrice: string; entryShortPrice: string;
   entryLongNotional: string; entryShortNotional: string; exitLongPrice: string | null; exitShortPrice: string | null;
@@ -203,7 +208,7 @@ export interface FundingResearchPosition {
   currentExitPnl: string | null; currentBasisBps: string | null; entrySlippageBps: string | null;
   exitSlippageBps: string | null; settledEvents: number; dataFailureCount: number;
   nextSettlementAt: string | null; lastReason: string | null; openedAt: string; closedAt: string | null;
-  lastEvaluatedAt: string | null; updatedAt: string;
+  lastEvaluatedAt: string | null; updatedAt: string; unprofitableCount: number; longQuote: string; shortQuote: string;
 }
 export interface FundingResearchEvaluation {
   id: string; positionId: string; observedAt: string; decision: string; reason: string; marketQuality: string;
@@ -222,6 +227,8 @@ export interface FundingResearchSummary {
   rejectionReasons: Array<{ reason: string; count: number }>; latestObservations: FundingScanObservation[];
   openCount: number; closedCount: number; cumulativePnl: string; cumulativeFunding: string;
   cumulativeFees: string; positions: FundingResearchPosition[];
+  cohorts: Array<{ cohort: 'ONE_SETTLEMENT' | 'ROLLING'; openCount: number; closedCount: number;
+    cumulativePnl: string; cumulativeFunding: string; cumulativeFees: string }>;
 }
 
 interface RuntimeSchema<T> {

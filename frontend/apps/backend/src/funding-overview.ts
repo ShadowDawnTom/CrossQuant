@@ -27,6 +27,8 @@ const DEFAULT_SETTLEMENT_FRESH_MS = 30_000;
 const SETTLEMENT_WINDOW_MS = 5 * 60_000;
 const HOUR_MS = 60 * 60_000;
 const CROSSEX_FUTURE_SYMBOL = /^[A-Z0-9]+_FUTURE_([A-Z0-9]+)_(?:USDT|USDC|USD)$/;
+const LIVE_EXECUTION_VENUES = new Set(['GATE', 'BINANCE', 'OKX', 'BYBIT']);
+const RESEARCH_EXECUTION_VENUES = new Set(['KRAKEN', 'HYPERLIQUID', 'DERIBIT']);
 
 function nativeAssetFromSymbol(symbol: string): string | null {
   return CROSSEX_FUTURE_SYMBOL.exec(symbol)?.[1] ?? null;
@@ -117,6 +119,7 @@ export class FundingOverviewService {
   buildResponse(catalog: FundingOverviewCatalogView): FundingOverviewResponse {
     const assets = [...catalog.assets.entries()].map(([asset, venueList]) => ({
       asset,
+      bestExecution: null,
       venues: venueList.map((entry): FundingOverviewVenueEntry => {
         const cached = this.venues.get(entry.venue as FundingStatVenue);
         // Catalog assets are canonical identities, while venue statistics retain the native
@@ -133,6 +136,8 @@ export class FundingOverviewService {
           lastPrice: stat?.lastPrice ?? null,
           change24h: stat?.change24h ?? null,
           fetchedAt: stat ? cached?.fetchedAt ?? null : null,
+          executionSupport: LIVE_EXECUTION_VENUES.has(entry.venue) ? 'live_ready'
+            : RESEARCH_EXECUTION_VENUES.has(entry.venue) ? 'research_only' : 'unsupported',
         };
       }),
     }));

@@ -1,8 +1,13 @@
 import WebSocket from 'ws';
 import { Decimal } from 'decimal.js';
+import { StablecoinFxOracle, type ExecutionQuote, type QuoteFxReader } from './quote-fx-oracle.js';
 
-export const EXECUTION_VENUES = ['GATE', 'BINANCE', 'OKX', 'BYBIT'] as const;
+export const EXECUTION_VENUES = [
+  'GATE', 'BINANCE', 'OKX', 'BYBIT', 'KRAKEN', 'HYPERLIQUID', 'DERIBIT',
+] as const;
 export type ExecutionVenue = typeof EXECUTION_VENUES[number];
+/** 新增三所先用于行情认证和模拟盘；真实下单状态机完成专项演练前不能进入严格实盘池。 */
+export const LIVE_EXECUTION_VENUES = ['GATE', 'BINANCE', 'OKX', 'BYBIT'] as const satisfies readonly ExecutionVenue[];
 export type ExecutionQuality = 'BOOTSTRAPPING' | 'LIVE_UNSYNCHRONIZED' | 'LIVE_SYNCHRONIZED';
 
 type Level = readonly [price: string, quantity: string];
@@ -35,7 +40,10 @@ export interface ExecutionBookSnapshot {
   venue: ExecutionVenue;
   symbol: string;
   base: string;
-  quote: 'USDT';
+  quote: ExecutionQuote;
+  quoteToUsd: string | null;
+  quoteRateAgeMs: number | null;
+  quoteRateState: 'healthy' | 'stale' | 'depegged' | 'unavailable';
   bids: Level[];
   asks: Level[];
   sequence: number | null;
@@ -92,11 +100,14 @@ interface VenueConnection {
   reconnectTimer: ReturnType<typeof setTimeout> | null;
   heartbeatTimer: ReturnType<typeof setInterval> | null;
   handshakeTimer: ReturnType<typeof setTimeout> | null;
+  stabilityTimer: ReturnType<typeof setTimeout> | null;
   lastMessageAt: number;
 }
 
 export interface ExecutionMarketHubOptions {
   symbols?: string[];
+  /** 只有严格实盘资产参与整体 health；研究资产缺盘只影响自己的候选。 */
+  requiredSymbols?: string[];
   maxBookAgeMs?: number;
   maxExchangeSkewMs?: number;
   maxReceiveSkewMs?: number;
@@ -104,6 +115,7 @@ export interface ExecutionMarketHubOptions {
   bootstrapBaseMs?: number;
   rateLimitCooldownMs?: number;
   endpoints?: Partial<Record<ExecutionVenue, { rest: string; websocket: string }>>;
+  quoteFx?: QuoteFxReader;
 }
 
 export interface ExecutionMarketSample extends ExecutionPairSnapshot {
@@ -112,9 +124,12 @@ export interface ExecutionMarketSample extends ExecutionPairSnapshot {
 
 const DEFAULT_ENDPOINTS: Record<ExecutionVenue, { rest: string; websocket: string }> = {
   GATE: { rest: 'https://api.gateio.ws/api/v4', websocket: 'wss://fx-ws.gateio.ws/v4/ws/usdt' },
-  BINANCE: { rest: 'https://fapi.binance.com', websocket: 'wss://fstream.binance.com/public/ws' },
+  BINANCE: { rest: 'https://fapi.binance.com', websocket: 'wss://fstream.binance.com/ws' },
   OKX: { rest: 'https://openapi.okx.com', websocket: 'wss://ws.okx.com:8443/ws/v5/public' },
   BYBIT: { rest: 'https://api.bybit.com', websocket: 'wss://stream.bybit.com/v5/public/linear' },
+  KRAKEN: { rest: 'https://futures.kraken.com', websocket: 'wss://futures.kraken.com/ws/v1' },
+  HYPERLIQUID: { rest: 'https://api.hyperliquid.xyz', websocket: 'wss://api.hyperliquid.xyz/ws' },
+  DERIBIT: { rest: 'https://www.deribit.com/api/v2', websocket: 'wss://www.deribit.com/ws/api/v2' },
 };
 
 const MAX_BUFFERED_DELTAS = 10_000;
@@ -166,6 +181,19 @@ function levels(value: unknown, multiplier = '1'): Level[] | null {
   return parsed;
 }
 
+function keyedLevels(value: unknown, priceKey: string, sizeKey: string, multiplier = '1'): Level[] | null {
+  if (!Array.isArray(value)) return null;
+  return levels(value.map((row) => {
+    const item = object(row);
+    return [item?.[priceKey], item?.[sizeKey]];
+  }), multiplier);
+}
+
+function deribitLevels(value: unknown): Level[] | null {
+  if (!Array.isArray(value)) return null;
+  return levels(value.map((row) => Array.isArray(row) && row.length >= 3 ? [row[1], row[2]] : row));
+}
+
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
@@ -174,10 +202,33 @@ function iso(timestamp: number): string | null {
   return timestamp > 0 && Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
 }
 
-function nativeSymbol(venue: ExecutionVenue, base: string): string {
+export function executionQuote(venue: ExecutionVenue): ExecutionQuote {
+  if (venue === 'KRAKEN') return 'USD';
+  if (venue === 'HYPERLIQUID' || venue === 'DERIBIT') return 'USDC';
+  return 'USDT';
+}
+
+export function crossExFutureSymbol(venue: ExecutionVenue, base: string): string {
+  return `${venue}_FUTURE_${base.toUpperCase()}_${executionQuote(venue)}`;
+}
+
+export function nativeSymbol(venue: ExecutionVenue, base: string): string {
   if (venue === 'GATE') return `${base}_USDT`;
   if (venue === 'OKX') return `${base}-USDT-SWAP`;
+  if (venue === 'KRAKEN') {
+    const nativeBase = base === 'BTC' ? 'XBT' : base;
+    return `PF_${nativeBase}USD`;
+  }
+  if (venue === 'HYPERLIQUID') return base;
+  if (venue === 'DERIBIT') return `${base}_USDC-PERPETUAL`;
   return `${base}USDT`;
+}
+
+/** 将原生报价币价格折算成 USD；汇率不可用时必须由上层拒绝候选。 */
+export function usdLevels(book: ExecutionBookSnapshot, source: readonly Level[]): Level[] | null {
+  if (!book.quoteToUsd) return null;
+  const rate = new Decimal(book.quoteToUsd);
+  return source.map(([price, quantity]) => [new Decimal(price).mul(rate).toString(), quantity] as const);
 }
 
 function applyLevels(target: Map<string, string>, updates: readonly Level[]): void {
@@ -272,13 +323,16 @@ export class OrderBookReplica {
 }
 
 /**
- * 四所永续合约执行行情服务。REST 负责启动基线，WebSocket 增量负责持续更新和断序检测。
+ * 七所永续合约执行行情服务。REST 负责启动基线，WebSocket 增量负责持续更新和断序检测。
  */
 export class ExecutionMarketHub {
   private readonly symbols: string[];
+  private readonly requiredSymbols: Set<string>;
   private readonly books = new Map<string, OrderBookReplica>();
   private readonly connections = new Map<ExecutionVenue, VenueConnection>();
   private readonly multipliers = new Map<string, string>();
+  private readonly metadataUnavailable = new Set<string>();
+  private readonly metadataLoadedVenues = new Set<'GATE' | 'OKX'>();
   private readonly bootstrapTasks = new Map<string, Promise<void>>();
   private readonly bootstrapAttempts = new Map<string, number>();
   private readonly bootstrapTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -289,6 +343,7 @@ export class ExecutionMarketHub {
   private readonly reconnectBaseMs: number;
   private readonly bootstrapBaseMs: number;
   private readonly rateLimitCooldownMs: number;
+  private readonly quoteFx: QuoteFxReader;
   private stopped = true;
 
   constructor(
@@ -296,20 +351,24 @@ export class ExecutionMarketHub {
     options: ExecutionMarketHubOptions = {},
   ) {
     this.symbols = [...new Set((options.symbols ?? ['BTC', 'ETH']).map((item) => item.trim().toUpperCase()).filter(Boolean))];
-    if (this.symbols.length === 0 || this.symbols.length > 20) throw new Error('execution market symbols must contain 1 to 20 assets');
+    if (this.symbols.length === 0 || this.symbols.length > 50) throw new Error('execution market symbols must contain 1 to 50 assets');
+    this.requiredSymbols = new Set((options.requiredSymbols ?? this.symbols)
+      .map((item) => item.trim().toUpperCase()).filter((item) => this.symbols.includes(item)));
+    if (this.requiredSymbols.size === 0) throw new Error('execution market required symbols must be configured');
     this.maxBookAgeMs = options.maxBookAgeMs ?? 1_500;
     this.maxExchangeSkewMs = options.maxExchangeSkewMs ?? 750;
     this.maxReceiveSkewMs = options.maxReceiveSkewMs ?? 750;
     this.reconnectBaseMs = options.reconnectBaseMs ?? 500;
     this.bootstrapBaseMs = options.bootstrapBaseMs ?? 1_000;
     this.rateLimitCooldownMs = options.rateLimitCooldownMs ?? 15 * 60_000;
+    this.quoteFx = options.quoteFx ?? new StablecoinFxOracle(fetchImpl);
     this.endpoints = { ...DEFAULT_ENDPOINTS };
     for (const venue of EXECUTION_VENUES) {
       if (options.endpoints?.[venue]) this.endpoints[venue] = options.endpoints[venue]!;
       this.connections.set(venue, {
         socket: null, state: 'disconnected', reconnects: 0, reconnectAttempt: 0,
         reconnectTimer: null, heartbeatTimer: null, lastMessageAt: 0,
-        handshakeTimer: null,
+        handshakeTimer: null, stabilityTimer: null,
       });
       for (const base of this.symbols) this.books.set(this.key(venue, base), new OrderBookReplica(venue, base));
     }
@@ -318,21 +377,25 @@ export class ExecutionMarketHub {
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
+    this.quoteFx.start();
     for (const venue of EXECUTION_VENUES) void this.startVenue(venue);
   }
 
   stop(): void {
     this.stopped = true;
+    this.quoteFx.stop();
     for (const connection of this.connections.values()) {
       if (connection.reconnectTimer) clearTimeout(connection.reconnectTimer);
       if (connection.heartbeatTimer) clearInterval(connection.heartbeatTimer);
       if (connection.handshakeTimer) clearTimeout(connection.handshakeTimer);
+      if (connection.stabilityTimer) clearTimeout(connection.stabilityTimer);
       connection.socket?.close();
       connection.socket = null;
       connection.state = 'disconnected';
       connection.reconnectTimer = null;
       connection.heartbeatTimer = null;
       connection.handshakeTimer = null;
+      connection.stabilityTimer = null;
     }
     for (const timer of this.bootstrapTimers.values()) clearTimeout(timer);
     this.bootstrapTimers.clear();
@@ -348,8 +411,11 @@ export class ExecutionMarketHub {
         totalBooks: replicas.length, reconnects: connection.reconnects, lastMessageAt: iso(connection.lastMessageAt),
       };
     });
-    const ready = venues.reduce((sum, venue) => sum + venue.readyBooks, 0);
-    const total = venues.reduce((sum, venue) => sum + venue.totalBooks, 0);
+    // 研究专用三所发生故障时保留在逐所状态里，但不能让它们触发实盘核心行情 Kill Switch。
+    const requiredBooks = LIVE_EXECUTION_VENUES.flatMap((venue) => [...this.requiredSymbols]
+      .map((base) => ({ venue, book: this.books.get(this.key(venue, base))! })));
+    const ready = requiredBooks.filter(({ venue, book }) => this.isLive(book, this.connections.get(venue)!, now)).length;
+    const total = requiredBooks.length;
     return {
       state: this.stopped ? 'stopped' : ready === total ? 'healthy' : ready === 0 ? 'starting' : 'degraded',
       updatedAt: new Date(now).toISOString(), symbols: [...this.symbols], venues,
@@ -362,8 +428,11 @@ export class ExecutionMarketHub {
     if (!replica) throw new Error('execution_market_not_configured');
     const state = replica.state;
     const connection = this.connections.get(venue)!;
+    const quote = executionQuote(venue);
+    const quoteRate = this.quoteFx.rate(quote, now);
     return {
-      venue, symbol: nativeSymbol(venue, normalized), base: normalized, quote: 'USDT',
+      venue, symbol: nativeSymbol(venue, normalized), base: normalized, quote,
+      quoteToUsd: quoteRate.usdRate, quoteRateAgeMs: quoteRate.ageMs, quoteRateState: quoteRate.state,
       bids: sortedLevels(state.bids, true), asks: sortedLevels(state.asks, false), sequence: state.sequence,
       exchangeTimestamp: iso(state.exchangeTimestamp), receivedAt: iso(state.receivedAt),
       ageMs: state.receivedAt > 0 ? Math.max(0, now - state.receivedAt) : null,
@@ -381,6 +450,8 @@ export class ExecutionMarketHub {
     if (!shortBook.synchronized) reasons.push(`short_${shortVenue.toLowerCase()}_not_live`);
     if (longBook.asks.length === 0) reasons.push('long_asks_missing');
     if (shortBook.bids.length === 0) reasons.push('short_bids_missing');
+    if (longBook.quoteRateState !== 'healthy') reasons.push(`long_${longBook.quote.toLowerCase()}_fx_${longBook.quoteRateState}`);
+    if (shortBook.quoteRateState !== 'healthy') reasons.push(`short_${shortBook.quote.toLowerCase()}_fx_${shortBook.quoteRateState}`);
     const longExchange = Date.parse(longBook.exchangeTimestamp ?? '');
     const shortExchange = Date.parse(shortBook.exchangeTimestamp ?? '');
     const longReceived = Date.parse(longBook.receivedAt ?? '');
@@ -409,11 +480,11 @@ export class ExecutionMarketHub {
     if (this.stopped) return;
     try {
       if (venue === 'GATE' || venue === 'OKX') {
-        for (const base of this.symbols) await this.loadMultiplier(venue, base);
+        await this.loadVenueMultipliers(venue);
       }
       this.connect(venue);
     } catch (error) {
-      for (const base of this.symbols) {
+      for (const base of this.venueSymbols(venue)) {
         const state = this.books.get(this.key(venue, base))!.state;
         state.synchronized = false;
         state.lastError = error instanceof Error ? error.message : 'contract_metadata_failed';
@@ -437,9 +508,14 @@ export class ExecutionMarketHub {
       if (connection.handshakeTimer) clearTimeout(connection.handshakeTimer);
       connection.handshakeTimer = null;
       connection.state = 'healthy';
-      connection.reconnectAttempt = 0;
+      // 连接至少稳定 30 秒后才重置退避；“刚连上就被踢”的错误订阅不能制造重连风暴。
+      if (connection.stabilityTimer) clearTimeout(connection.stabilityTimer);
+      connection.stabilityTimer = setTimeout(() => {
+        if (connection.socket === socket && socket.readyState === WebSocket.OPEN) connection.reconnectAttempt = 0;
+      }, 30_000);
+      connection.stabilityTimer.unref?.();
       this.subscribe(venue, socket);
-      for (const base of this.symbols) {
+      for (const base of this.venueSymbols(venue)) {
         const book = this.books.get(this.key(venue, base))!;
         const generation = book.beginRebuild('connection_opened');
         this.requestBootstrap(venue, base, book, generation);
@@ -452,6 +528,10 @@ export class ExecutionMarketHub {
         }
         if (venue === 'OKX') socket.send('ping');
         else if (venue === 'BYBIT') socket.send(JSON.stringify({ op: 'ping' }));
+        else if (venue === 'HYPERLIQUID') socket.send(JSON.stringify({ method: 'ping' }));
+        else if (venue === 'DERIBIT') socket.send(JSON.stringify({
+          jsonrpc: '2.0', id: Date.now(), method: 'public/test', params: {},
+        }));
         else socket.ping();
       }, 15_000);
       connection.heartbeatTimer.unref?.();
@@ -460,15 +540,27 @@ export class ExecutionMarketHub {
       connection.lastMessageAt = Date.now();
       this.onMessage(venue, payload.toString());
     });
-    socket.on('error', () => undefined);
-    socket.on('close', () => {
+    socket.on('error', (error) => {
+      const message = error instanceof Error ? error.message : 'unknown';
+      for (const base of this.venueSymbols(venue)) {
+        this.books.get(this.key(venue, base))!.state.lastError = `websocket_error:${message}`;
+      }
+    });
+    socket.on('close', (code, reason) => {
       if (connection.socket !== socket) return;
       if (connection.heartbeatTimer) clearInterval(connection.heartbeatTimer);
       if (connection.handshakeTimer) clearTimeout(connection.handshakeTimer);
+      if (connection.stabilityTimer) clearTimeout(connection.stabilityTimer);
       connection.heartbeatTimer = null;
       connection.handshakeTimer = null;
+      connection.stabilityTimer = null;
       connection.socket = null;
-      for (const base of this.symbols) this.books.get(this.key(venue, base))!.state.synchronized = false;
+      const closeReason = Buffer.isBuffer(reason) ? reason.toString('utf8') : String(reason ?? '');
+      for (const base of this.symbols) {
+        const state = this.books.get(this.key(venue, base))!.state;
+        state.synchronized = false;
+        state.lastError = `websocket_closed:${code}:${closeReason || 'no_reason'}`;
+      }
       if (!this.stopped) this.scheduleReconnect(venue);
     });
   }
@@ -484,18 +576,29 @@ export class ExecutionMarketHub {
   }
 
   private subscribe(venue: ExecutionVenue, socket: WebSocket): void {
+    const symbols = this.venueSymbols(venue);
     if (venue === 'GATE') {
-      for (const base of this.symbols) socket.send(JSON.stringify({
+      for (const base of symbols) socket.send(JSON.stringify({
         time: Math.floor(Date.now() / 1_000), channel: 'futures.order_book_update', event: 'subscribe',
         // Gate 的 level 过滤会漏掉范围外变化，但 update id 仍覆盖完整盘口，进而制造假断序。
         payload: [nativeSymbol(venue, base), '100ms'],
       }));
     } else if (venue === 'BINANCE') {
-      socket.send(JSON.stringify({ method: 'SUBSCRIBE', params: this.symbols.map((base) => `${nativeSymbol(venue, base).toLowerCase()}@depth@100ms`), id: Date.now() }));
+      socket.send(JSON.stringify({ method: 'SUBSCRIBE', params: symbols.map((base) => `${nativeSymbol(venue, base).toLowerCase()}@depth@100ms`), id: Date.now() }));
     } else if (venue === 'OKX') {
-      socket.send(JSON.stringify({ op: 'subscribe', args: this.symbols.map((base) => ({ channel: 'books', instId: nativeSymbol(venue, base) })) }));
+      socket.send(JSON.stringify({ op: 'subscribe', args: symbols.map((base) => ({ channel: 'books', instId: nativeSymbol(venue, base) })) }));
+    } else if (venue === 'BYBIT') {
+      socket.send(JSON.stringify({ op: 'subscribe', args: symbols.map((base) => `orderbook.200.${nativeSymbol(venue, base)}`) }));
+    } else if (venue === 'KRAKEN') {
+      for (const base of symbols) socket.send(JSON.stringify({ event: 'subscribe', feed: 'book',
+        product_ids: [nativeSymbol(venue, base)] }));
+    } else if (venue === 'HYPERLIQUID') {
+      for (const base of symbols) socket.send(JSON.stringify({
+        method: 'subscribe', subscription: { type: 'l2Book', coin: nativeSymbol(venue, base) },
+      }));
     } else {
-      socket.send(JSON.stringify({ op: 'subscribe', args: this.symbols.map((base) => `orderbook.200.${nativeSymbol(venue, base)}`) }));
+      for (const base of symbols) socket.send(JSON.stringify({ jsonrpc: '2.0', id: `${Date.now()}-${base}`,
+        method: 'public/subscribe', params: { channels: [`book.${nativeSymbol(venue, base)}.100ms`] } }));
     }
   }
 
@@ -507,7 +610,10 @@ export class ExecutionMarketHub {
     if (venue === 'GATE') this.onGate(message);
     else if (venue === 'BINANCE') this.onBinance(message);
     else if (venue === 'OKX') this.onOkx(message);
-    else this.onBybit(message);
+    else if (venue === 'BYBIT') this.onBybit(message);
+    else if (venue === 'KRAKEN') this.onKraken(message);
+    else if (venue === 'HYPERLIQUID') this.onHyperliquid(message);
+    else this.onDeribit(message);
   }
 
   private onGate(message: Record<string, unknown>): void {
@@ -571,6 +677,69 @@ export class ExecutionMarketHub {
     }, 'monotonic');
   }
 
+  private onKraken(message: Record<string, unknown>): void {
+    if (message.feed !== 'book_snapshot' && message.feed !== 'book') return;
+    const product = typeof message.product_id === 'string' ? message.product_id : '';
+    const base = this.symbols.find((item) => nativeSymbol('KRAKEN', item) === product);
+    const sequence = finiteInteger(message.seq);
+    const timestamp = finiteInteger(message.timestamp) ?? Date.now();
+    if (!base || sequence === null) return;
+    const book = this.books.get(this.key('KRAKEN', base))!;
+    if (message.feed === 'book_snapshot') {
+      const bids = keyedLevels(message.bids, 'price', 'qty');
+      const asks = keyedLevels(message.asks, 'price', 'qty');
+      if (!bids || !asks) return;
+      book.seed(bids, asks, sequence, timestamp, Date.now());
+      return;
+    }
+    const price = positiveText(message.price);
+    const quantity = typeof message.qty === 'string' || typeof message.qty === 'number' ? String(message.qty) : null;
+    if (!price || quantity === null || (message.side !== 'buy' && message.side !== 'sell')) return;
+    const update: Level = [price, quantity];
+    this.applyOrRebuild('KRAKEN', base, {
+      first: sequence, last: sequence, previous: null, exchangeTimestamp: timestamp,
+      bids: message.side === 'buy' ? [update] : [], asks: message.side === 'sell' ? [update] : [],
+    }, 'range');
+  }
+
+  private onHyperliquid(message: Record<string, unknown>): void {
+    if (message.channel !== 'l2Book') return;
+    const data = object(message.data);
+    if (!data || typeof data.coin !== 'string' || !Array.isArray(data.levels)) return;
+    const base = this.symbols.find((item) => nativeSymbol('HYPERLIQUID', item) === data.coin);
+    const bids = keyedLevels(data.levels[0], 'px', 'sz');
+    const asks = keyedLevels(data.levels[1], 'px', 'sz');
+    const timestamp = finiteInteger(data.time);
+    if (!base || !bids || !asks || timestamp === null) return;
+    // Hyperliquid 每次推送都是完整 L2 快照，没有增量序号；新块直接原子替换即可。
+    this.books.get(this.key('HYPERLIQUID', base))!.seed(bids, asks, timestamp, timestamp, Date.now());
+  }
+
+  private onDeribit(message: Record<string, unknown>): void {
+    if (message.method !== 'subscription') return;
+    const params = object(message.params);
+    const data = object(params?.data);
+    const channel = typeof params?.channel === 'string' ? params.channel : '';
+    if (!data || !channel.startsWith('book.') || typeof data.instrument_name !== 'string') return;
+    const base = this.symbols.find((item) => nativeSymbol('DERIBIT', item) === data.instrument_name);
+    const changeId = finiteInteger(data.change_id);
+    const bids = deribitLevels(data.bids);
+    const asks = deribitLevels(data.asks);
+    if (!base || changeId === null || !bids || !asks) return;
+    const timestamp = finiteInteger(data.timestamp) ?? Date.now();
+    const book = this.books.get(this.key('DERIBIT', base))!;
+    if (data.type === 'snapshot') {
+      book.seed(bids, asks, changeId, timestamp, Date.now());
+      return;
+    }
+    const previous = finiteInteger(data.prev_change_id);
+    if (data.type === 'change' && previous !== null) {
+      this.applyOrRebuild('DERIBIT', base, {
+        first: changeId, last: changeId, previous, exchangeTimestamp: timestamp, bids, asks,
+      }, 'previous');
+    }
+  }
+
   private applyOrRebuild(venue: ExecutionVenue, base: string, delta: Delta, mode: 'range' | 'previous' | 'monotonic'): void {
     const book = this.books.get(this.key(venue, base))!;
     if (!book.state.synchronized) {
@@ -591,6 +760,10 @@ export class ExecutionMarketHub {
 
   private multiplier(venue: ExecutionVenue, base: string | undefined): string {
     return base ? this.multipliers.get(this.key(venue, base)) ?? '1' : '1';
+  }
+
+  private venueSymbols(venue: ExecutionVenue): string[] {
+    return this.symbols.filter((base) => !this.metadataUnavailable.has(this.key(venue, base)));
   }
 
   private requestBootstrap(venue: ExecutionVenue, base: string, book: OrderBookReplica, generation: number): void {
@@ -626,10 +799,11 @@ export class ExecutionMarketHub {
   private async bootstrap(venue: ExecutionVenue, base: string, book: OrderBookReplica, generation: number): Promise<void> {
       const snapshot = await this.fetchSnapshot(venue, base);
       if (book.state.generation !== generation) return;
-      if (venue === 'OKX' || venue === 'BYBIT') {
-        // REST 快照与这两所的 WS 序列没有官方桥接规则，只能等 WS snapshot 后才能认证。
-        if (!book.state.synchronized) book.state.rebuilding = true;
-        return;
+       if (venue === 'OKX' || venue === 'BYBIT' || venue === 'KRAKEN'
+         || venue === 'HYPERLIQUID' || venue === 'DERIBIT') {
+         // REST 先验证市场和深度；这些频道都会主动发送完整 WS snapshot，收到后才认证。
+         if (!book.state.synchronized) book.state.rebuilding = true;
+         return;
       }
       if (venue === 'BINANCE') {
         // REST 响应可能比对应的 WS 增量先到，短暂等待同一份快照被增量追上，避免反复请求最新快照。
@@ -687,11 +861,18 @@ export class ExecutionMarketHub {
   private async fetchSnapshot(venue: ExecutionVenue, base: string): Promise<{ bids: Level[]; asks: Level[]; sequence: number; exchangeTimestamp: number }> {
     const symbol = nativeSymbol(venue, base);
     let url: string;
+    let init: RequestInit = { signal: AbortSignal.timeout(8_000) };
     if (venue === 'GATE') url = `${this.endpoints.GATE.rest}/futures/usdt/order_book?contract=${symbol}&limit=100&with_id=true`;
     else if (venue === 'BINANCE') url = `${this.endpoints.BINANCE.rest}/fapi/v1/depth?symbol=${symbol}&limit=1000`;
     else if (venue === 'OKX') url = `${this.endpoints.OKX.rest}/api/v5/market/books?instId=${encodeURIComponent(symbol)}&sz=400`;
-    else url = `${this.endpoints.BYBIT.rest}/v5/market/orderbook?category=linear&symbol=${symbol}&limit=200`;
-    const response = await this.fetchImpl(url, { signal: AbortSignal.timeout(8_000) });
+    else if (venue === 'BYBIT') url = `${this.endpoints.BYBIT.rest}/v5/market/orderbook?category=linear&symbol=${symbol}&limit=200`;
+    else if (venue === 'KRAKEN') url = `${this.endpoints.KRAKEN.rest}/derivatives/api/v3/orderbook?symbol=${encodeURIComponent(symbol)}`;
+    else if (venue === 'HYPERLIQUID') {
+      url = `${this.endpoints.HYPERLIQUID.rest}/info`;
+      init = { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'l2Book', coin: symbol }), signal: AbortSignal.timeout(8_000) };
+    } else url = `${this.endpoints.DERIBIT.rest}/public/get_order_book?instrument_name=${encodeURIComponent(symbol)}&depth=200`;
+    const response = await this.fetchImpl(url, init);
     if (!response.ok) throw new SnapshotHttpError(response.status, retryAfterMs(response.headers.get('retry-after')));
     const payload = object(await response.json());
     if (!payload) throw new Error('snapshot_schema_invalid');
@@ -712,10 +893,22 @@ export class ExecutionMarketHub {
       bids = levels(envelope?.bids, this.multiplier(venue, base)); asks = levels(envelope?.asks, this.multiplier(venue, base));
       // 普通 REST books 只用来验证初始深度，WS snapshot 才提供可桥接的序列。
       sequence = finiteInteger(envelope?.seqId) ?? 0; exchangeTimestamp = finiteInteger(envelope?.ts) ?? Date.now();
-    } else {
+    } else if (venue === 'BYBIT') {
       const result = object(payload.result);
       bids = levels(result?.b); asks = levels(result?.a); sequence = finiteInteger(result?.seq) ?? finiteInteger(result?.u);
       exchangeTimestamp = finiteInteger(payload.time) ?? finiteInteger(result?.ts) ?? Date.now();
+    } else if (venue === 'KRAKEN') {
+      const orderBook = object(payload.orderBook);
+      bids = keyedLevels(orderBook?.bids, 'price', 'qty'); asks = keyedLevels(orderBook?.asks, 'price', 'qty'); sequence = 0;
+      exchangeTimestamp = Date.parse(String(payload.serverTime ?? '')) || Date.now();
+    } else if (venue === 'HYPERLIQUID') {
+      bids = keyedLevels(Array.isArray(payload.levels) ? payload.levels[0] : null, 'px', 'sz');
+      asks = keyedLevels(Array.isArray(payload.levels) ? payload.levels[1] : null, 'px', 'sz');
+      sequence = finiteInteger(payload.time) ?? 0; exchangeTimestamp = finiteInteger(payload.time) ?? Date.now();
+    } else {
+      const result = object(payload.result);
+      bids = deribitLevels(result?.bids); asks = deribitLevels(result?.asks);
+      sequence = finiteInteger(result?.change_id) ?? 0; exchangeTimestamp = finiteInteger(result?.timestamp) ?? Date.now();
     }
     if (!bids || !asks || bids.length === 0 || asks.length === 0 || sequence === null) throw new Error('snapshot_schema_invalid');
     return { bids, asks, sequence, exchangeTimestamp };
@@ -723,6 +916,7 @@ export class ExecutionMarketHub {
 
   private async loadMultiplier(venue: 'GATE' | 'OKX', base: string): Promise<void> {
     if (this.multipliers.has(this.key(venue, base))) return;
+    if (this.metadataUnavailable.has(this.key(venue, base))) throw new Error('contract_not_listed');
     const symbol = nativeSymbol(venue, base);
     const url = venue === 'GATE'
       ? `${this.endpoints.GATE.rest}/futures/usdt/contracts/${symbol}`
@@ -740,16 +934,65 @@ export class ExecutionMarketHub {
       throw new Error('contract_multiplier_invalid');
     }
   }
+
+  /** 一次拉取整所合约元数据，避免 20～50 币启动时逐币打爆公开 REST 限频。 */
+  private async loadVenueMultipliers(venue: 'GATE' | 'OKX'): Promise<void> {
+    if (this.metadataLoadedVenues.has(venue)) return;
+    const rows: unknown[] = [];
+    if (venue === 'GATE') {
+      // Gate 单页上限是 100；顺序分页只在服务启动或重连时执行，仍远少于逐币请求。
+      for (let offset = 0; offset < 1_000; offset += 100) {
+        const response = await this.fetchImpl(`${this.endpoints.GATE.rest}/futures/usdt/contracts?limit=100&offset=${offset}`,
+          { signal: AbortSignal.timeout(8_000) });
+        if (!response.ok) throw new Error(`contract_metadata_http_${response.status}`);
+        const page = await response.json() as unknown;
+        if (!Array.isArray(page)) throw new Error('contract_metadata_schema_invalid');
+        rows.push(...page);
+        if (page.length < 100) break;
+      }
+    } else {
+      const response = await this.fetchImpl(`${this.endpoints.OKX.rest}/api/v5/public/instruments?instType=SWAP`,
+        { signal: AbortSignal.timeout(8_000) });
+      if (!response.ok) throw new Error(`contract_metadata_http_${response.status}`);
+      const payload = object(await response.json());
+      if (!Array.isArray(payload?.data)) throw new Error('contract_metadata_schema_invalid');
+      rows.push(...payload.data);
+    }
+    const bySymbol = new Map<string, Record<string, unknown>>();
+    for (const value of rows) {
+      const row = object(value);
+      const symbol = venue === 'GATE' ? row?.name : row?.instId;
+      if (row && typeof symbol === 'string') bySymbol.set(symbol, row);
+    }
+    for (const base of this.symbols) {
+      const key = this.key(venue, base);
+      const row = bySymbol.get(nativeSymbol(venue, base));
+      const rawMultiplier = venue === 'GATE' ? row?.quanto_multiplier : row?.ctVal;
+      try {
+        const multiplier = new Decimal(String(rawMultiplier));
+        if (!multiplier.isFinite() || !multiplier.isPositive()) throw new Error('contract_multiplier_invalid');
+        this.multipliers.set(key, multiplier.toString());
+        this.metadataUnavailable.delete(key);
+      } catch {
+        this.metadataUnavailable.add(key);
+        const state = this.books.get(key)!.state;
+        state.synchronized = false;
+        state.lastError = row ? 'contract_multiplier_invalid' : 'contract_not_listed';
+      }
+    }
+    this.metadataLoadedVenues.add(venue);
+  }
 }
 
 /** 每个交易所组合只保存最佳价和质量，不落完整深度，控制长期磁盘占用。 */
-export function sampleExecutionPairs(hub: ExecutionMarketReader, symbols: readonly string[], now = Date.now()): ExecutionMarketSample[] {
+export function sampleExecutionPairs(hub: ExecutionMarketReader, symbols: readonly string[], now = Date.now(),
+  venues: readonly ExecutionVenue[] = LIVE_EXECUTION_VENUES): ExecutionMarketSample[] {
   const rows: ExecutionMarketSample[] = [];
   for (const base of symbols) {
-    for (let longIndex = 0; longIndex < EXECUTION_VENUES.length; longIndex += 1) {
-      for (let shortIndex = longIndex + 1; shortIndex < EXECUTION_VENUES.length; shortIndex += 1) {
-        const longVenue = EXECUTION_VENUES[longIndex]!;
-        const shortVenue = EXECUTION_VENUES[shortIndex]!;
+    for (let longIndex = 0; longIndex < venues.length; longIndex += 1) {
+      for (let shortIndex = longIndex + 1; shortIndex < venues.length; shortIndex += 1) {
+        const longVenue = venues[longIndex]!;
+        const shortVenue = venues[shortIndex]!;
         rows.push({ ...hub.pair(base, longVenue, shortVenue, now), sampledAt: new Date(now).toISOString() });
         rows.push({ ...hub.pair(base, shortVenue, longVenue, now), sampledAt: new Date(now).toISOString() });
       }

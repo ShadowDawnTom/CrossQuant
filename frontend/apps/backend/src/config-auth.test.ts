@@ -54,12 +54,13 @@ describe('browser authentication config', () => {
     })).toThrow('require execution books for: DOGE');
   });
 
-  it('探索模拟硬限制同时只能有一组持仓', () => {
+  it('探索模拟硬限制每个实验组同时只能有一组持仓', () => {
     expect(() => loadConfig({ GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS: '2' }))
       .toThrow('must remain 1');
     expect(loadConfig({
       GCT_EXECUTION_MARKET_SYMBOLS: 'BTC,ETH,SOL,DOGE,TRUMP',
       GCT_FUNDING_RESEARCH_ENABLED: '1',
+      GCT_FUNDING_RESEARCH_ASSETS: 'BTC,ETH,SOL,DOGE,TRUMP',
     }).fundingResearch).toMatchObject({
       enabled: true,
       assets: ['BTC', 'ETH', 'SOL', 'DOGE', 'TRUMP'],

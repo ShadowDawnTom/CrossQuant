@@ -2,11 +2,18 @@ import { randomUUID } from 'node:crypto';
 import { Decimal } from 'decimal.js';
 import type { GateCredentials } from './credential-vault.js';
 import type { GateCrossExSymbol, GateFeeRate, GateFundingInfo, TradingCrossExGateway } from './crossex-client.js';
-import type { ExecutionMarketReader, ExecutionVenue } from './execution-market-hub.js';
+import {
+  crossExFutureSymbol,
+  EXECUTION_VENUES,
+  LIVE_EXECUTION_VENUES,
+  type ExecutionMarketReader,
+  type ExecutionVenue,
+  usdLevels,
+} from './execution-market-hub.js';
 import { FundingArbitrageError, type FundingArbitrageEngine } from './funding-arbitrage-engine.js';
 
-const SUPPORTED_VENUES = new Set<ExecutionVenue>(['GATE', 'BINANCE', 'OKX', 'BYBIT']);
-const SYMBOL = /^(GATE|BINANCE|OKX|BYBIT)_FUTURE_([A-Z0-9]+)_USDT$/;
+const LIVE_VENUES = new Set<ExecutionVenue>(LIVE_EXECUTION_VENUES);
+const SYMBOL = /^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT)_FUTURE_([A-Z0-9]+)_(USD|USDC|USDT)$/;
 
 export interface FundingCandidateScannerOptions {
   assets: string[];
@@ -20,6 +27,10 @@ export interface FundingCandidateScannerOptions {
   researchAssets?: string[];
   researchTargetNotionalUsd?: string;
   researchMaxSlippageBps?: string;
+  minLiquidityUsd?: string;
+  liquidityDepthBps?: string;
+  maxPairsPerAsset?: number;
+  stablecoinRiskBps?: string;
   onFundingData?: (funding: readonly GateFundingInfo[], fees: readonly GateFeeRate[],
     observations: readonly FundingScanObservation[]) => void | Promise<void>;
   now?: () => number;
@@ -65,6 +76,18 @@ export interface FundingScanObservation {
   entrySlippageBps: string | null;
   exitSlippageBps: string | null;
   basisBps: string | null;
+  longQuote: string;
+  shortQuote: string;
+  longQuoteToUsd: string | null;
+  shortQuoteToUsd: string | null;
+  liquidityUsd: string | null;
+  executionSupport: 'LIVE_READY' | 'RESEARCH_ONLY';
+  stablecoinRiskBuffer: string | null;
+  edgeDurationMinutes?: number;
+  directionFlips24h?: number;
+  settlementHitRate?: string | null;
+  settlementSamples?: number;
+  cohortClone?: boolean;
 }
 
 function eventCount(item: GateFundingInfo, now: number, horizonMs: number): number {
@@ -96,6 +119,22 @@ function feeFor(fees: GateFeeRate[], venue: ExecutionVenue, symbol: string): Dec
 }
 
 interface ExecutableFill { average: Decimal; notional: Decimal; top: Decimal; slippageBps: Decimal }
+
+function depthWithinBps(levels: ReadonlyArray<readonly [string, string]>, side: 'BUY' | 'SELL', bps: Decimal): Decimal {
+  const top = new Decimal(levels[0]?.[0] ?? '0');
+  if (!top.gt(0)) return new Decimal(0);
+  const boundary = side === 'BUY' ? top.mul(new Decimal(1).plus(bps.div(10_000)))
+    : top.mul(new Decimal(1).minus(bps.div(10_000)));
+  let total = new Decimal(0);
+  for (const [priceText, sizeText] of levels) {
+    const price = new Decimal(priceText);
+    const size = new Decimal(sizeText);
+    if (!price.gt(0) || !size.gt(0)) continue;
+    if ((side === 'BUY' && price.gt(boundary)) || (side === 'SELL' && price.lt(boundary))) break;
+    total = total.plus(price.mul(size));
+  }
+  return total;
+}
 
 function executableFill(levels: ReadonlyArray<readonly [string, string]>, quantity: Decimal, side: 'BUY' | 'SELL'): ExecutableFill | null {
   let remaining = quantity;
@@ -159,10 +198,14 @@ export class FundingCandidateScanner {
     const researchAssets = new Set((this.options.researchAssets ?? []).map((asset) => asset.toUpperCase()));
     const minNetAnnualized = new Decimal(this.options.minNetAnnualized ?? '0');
     const researchMaxSlippageBps = new Decimal(this.options.researchMaxSlippageBps ?? '10');
+    const minimumLiquidityUsd = new Decimal(this.options.minLiquidityUsd ?? '1000');
+    const liquidityDepthBps = new Decimal(this.options.liquidityDepthBps ?? '10');
+    const maxPairsPerAsset = Math.max(1, Math.min(10, this.options.maxPairsPerAsset ?? 3));
+    const stablecoinRiskBps = new Decimal(this.options.stablecoinRiskBps ?? '5');
     const scanId = randomUUID();
     const observedAt = new Date(this.now()).toISOString();
     const observations: FundingScanObservation[] = [];
-    const requestedSymbols = assets.flatMap((asset) => [...SUPPORTED_VENUES].map((venue) => `${venue}_FUTURE_${asset}_USDT`));
+    const requestedSymbols = assets.flatMap((asset) => EXECUTION_VENUES.map((venue) => crossExFutureSymbol(venue, asset)));
     const [funding, reference] = await Promise.all([
       this.gateway.queryFundingInfo!(credentials, requestedSymbols), this.referenceData(credentials),
     ]);
@@ -172,17 +215,29 @@ export class FundingCandidateScanner {
     let recorded = 0;
     for (const asset of assets) {
       const rows = funding.filter((item) => SYMBOL.exec(item.symbol)?.[2] === asset);
-      for (let left = 0; left < rows.length; left += 1) for (let right = left + 1; right < rows.length; right += 1) {
-        const first = rows[left]!;
-        const second = rows[right]!;
+      const combinations = rows.flatMap((first, left) => rows.slice(left + 1).map((second) => {
+        const firstEvents = eventCount(first, this.now(), horizonMs);
+        const secondEvents = eventCount(second, this.now(), horizonMs);
+        const firstTotal = new Decimal(first.funding_rate).mul(firstEvents);
+        const secondTotal = new Decimal(second.funding_rate).mul(secondEvents);
+        return { first, second, firstEvents, secondEvents, rawEdge: firstTotal.minus(secondTotal).abs() };
+      })).filter((item) => item.firstEvents > 0 || item.secondEvents > 0)
+        .sort((left, right) => right.rawEdge.cmp(left.rawEdge));
+      // 研究池只深算毛费率最优的少数组合；严格池仍保留四家已支持执行器的全部组合。
+      const selected = combinations.filter((item, index) => {
+        if (index < maxPairsPerAsset) return true;
+        if (!strictAssets.has(asset)) return false;
+        const firstVenue = SYMBOL.exec(item.first.symbol)?.[1] as ExecutionVenue | undefined;
+        const secondVenue = SYMBOL.exec(item.second.symbol)?.[1] as ExecutionVenue | undefined;
+        return Boolean(firstVenue && secondVenue && LIVE_VENUES.has(firstVenue) && LIVE_VENUES.has(secondVenue));
+      });
+      for (const combination of selected) {
+        const { first, second, firstEvents, secondEvents } = combination;
         const firstMatch = SYMBOL.exec(first.symbol);
         const secondMatch = SYMBOL.exec(second.symbol);
         if (!firstMatch || !secondMatch) continue;
         const firstVenue = firstMatch[1] as ExecutionVenue;
         const secondVenue = secondMatch[1] as ExecutionVenue;
-        const firstEvents = eventCount(first, this.now(), horizonMs);
-        const secondEvents = eventCount(second, this.now(), horizonMs);
-        if (firstEvents === 0 && secondEvents === 0) continue;
         const firstTotal = new Decimal(first.funding_rate).mul(firstEvents);
         const secondTotal = new Decimal(second.funding_rate).mul(secondEvents);
         const [long, short, longVenue, shortVenue, longEvents, shortEvents] = firstTotal.lte(secondTotal)
@@ -191,6 +246,9 @@ export class FundingCandidateScanner {
         const baseObservation = {
           id: randomUUID(), scanId, observedAt, asset, longVenue, shortVenue,
           longRate: long.funding_rate, shortRate: short.funding_rate, longEvents, shortEvents,
+          longQuote: symbolQuote(long.symbol), shortQuote: symbolQuote(short.symbol),
+          executionSupport: LIVE_VENUES.has(longVenue) && LIVE_VENUES.has(shortVenue)
+            ? 'LIVE_READY' as const : 'RESEARCH_ONLY' as const,
         };
         const reject = (primaryReason: string, marketQuality: string | null = null,
           reasons: string[] = [primaryReason]): void => {
@@ -200,7 +258,8 @@ export class FundingCandidateScanner {
             entryLongNotional: null, entryShortNotional: null, rawFundingPnl: null, conservativeFundingPnl: null,
             immediateRoundTripPnl: null, entryFees: null, exitFees: null, tradingFees: null, stressBuffer: null,
             netPnl: null, rawAnnualized: null, netAnnualized: null, breakEvenHours: null,
-            entrySlippageBps: null, exitSlippageBps: null, basisBps: null });
+            entrySlippageBps: null, exitSlippageBps: null, basisBps: null,
+            longQuoteToUsd: null, shortQuoteToUsd: null, liquidityUsd: null, stablecoinRiskBuffer: null });
         };
         const longRule = ruleMap.get(long.symbol);
         const shortRule = ruleMap.get(short.symbol);
@@ -213,8 +272,13 @@ export class FundingCandidateScanner {
           reject('market_not_synchronized', pair.quality, ['market_not_synchronized', ...pair.reasons]);
           continue;
         }
-        const longPrice = new Decimal(pair.longBook.asks[0]?.[0] ?? '0');
-        const shortPrice = new Decimal(pair.shortBook.bids[0]?.[0] ?? '0');
+        const longAsks = usdLevels(pair.longBook, pair.longBook.asks);
+        const longBids = usdLevels(pair.longBook, pair.longBook.bids);
+        const shortAsks = usdLevels(pair.shortBook, pair.shortBook.asks);
+        const shortBids = usdLevels(pair.shortBook, pair.shortBook.bids);
+        if (!longAsks || !longBids || !shortAsks || !shortBids) { reject('quote_fx_unavailable', pair.quality); continue; }
+        const longPrice = new Decimal(longAsks[0]?.[0] ?? '0');
+        const shortPrice = new Decimal(shortBids[0]?.[0] ?? '0');
         if (!longPrice.gt(0) || !shortPrice.gt(0)) { reject('top_of_book_missing', pair.quality); continue; }
         let step;
         try { step = commonStep(longRule.lot_size, shortRule.lot_size); }
@@ -231,11 +295,17 @@ export class FundingCandidateScanner {
         const minimumQuantity = Decimal.max(longRule.min_size, shortRule.min_size, minimumNotional.div(Decimal.min(longPrice, shortPrice)));
         const quantity = minimumQuantity.div(step).ceil().mul(step);
         // 同一数量按盘口逐档吃单；深度不足必须 fail-closed，不能用不存在的顶层价格放行。
-        const longEntry = executableFill(pair.longBook.asks, quantity, 'BUY');
-        const shortEntry = executableFill(pair.shortBook.bids, quantity, 'SELL');
-        const longExit = executableFill(pair.longBook.bids, quantity, 'SELL');
-        const shortExit = executableFill(pair.shortBook.asks, quantity, 'BUY');
+        const longEntry = executableFill(longAsks, quantity, 'BUY');
+        const shortEntry = executableFill(shortBids, quantity, 'SELL');
+        const longExit = executableFill(longBids, quantity, 'SELL');
+        const shortExit = executableFill(shortAsks, quantity, 'BUY');
         if (!longEntry || !shortEntry || !longExit || !shortExit) { reject('insufficient_executable_depth', pair.quality); continue; }
+        const liquidityUsd = Decimal.min(
+          depthWithinBps(longAsks, 'BUY', liquidityDepthBps),
+          depthWithinBps(longBids, 'SELL', liquidityDepthBps),
+          depthWithinBps(shortAsks, 'BUY', liquidityDepthBps),
+          depthWithinBps(shortBids, 'SELL', liquidityDepthBps),
+        );
         const capital = longEntry.notional.plus(shortEntry.notional).div(2);
         if (!capital.gt(0)) { reject('invalid_executable_notional', pair.quality); continue; }
         let longFee;
@@ -255,22 +325,29 @@ export class FundingCandidateScanner {
         const conservativeFundingPnl = snapshotFundingPnl.gt(0) ? snapshotFundingPnl.mul(retention) : snapshotFundingPnl;
         const stressBuffer = capital.mul(new Decimal(this.options.stressSlippageBps)
           .plus(this.options.adverseExitBasisBps)).div(10_000);
-        const netPnl = conservativeFundingPnl.plus(immediateRoundTripPnl).minus(tradingFees).minus(stressBuffer);
+        // 跨报价币组合额外预留稳定币波动缓冲；当前汇率用于换算，未来脱锚风险不能被当作零。
+        const stablecoinRiskBuffer = baseObservation.longQuote === baseObservation.shortQuote ? new Decimal(0)
+          : capital.mul(stablecoinRiskBps).div(10_000);
+        const netPnl = conservativeFundingPnl.plus(immediateRoundTripPnl).minus(tradingFees)
+          .minus(stressBuffer).minus(stablecoinRiskBuffer);
         const rawAnnualized = snapshotFundingPnl.div(capital).mul(8760).div(this.options.horizonHours);
         const netAnnualized = netPnl.div(capital).mul(8760).div(this.options.horizonHours);
         const entrySlippageBps = longEntry.slippageBps.plus(shortEntry.slippageBps);
         const exitSlippageBps = longExit.slippageBps.plus(shortExit.slippageBps);
         const basisBps = longEntry.average.minus(shortEntry.average).abs()
           .div(longEntry.average.plus(shortEntry.average).div(2)).mul(10_000);
-        const friction = tradingFees.plus(stressBuffer).minus(immediateRoundTripPnl);
+        const friction = tradingFees.plus(stressBuffer).plus(stablecoinRiskBuffer).minus(immediateRoundTripPnl);
         const breakEvenHours = conservativeFundingPnl.gt(0)
           ? Decimal.max(0, friction).mul(this.options.horizonHours).div(conservativeFundingPnl)
           : null;
         const researchEligible = researchAssets.has(asset) && snapshotFundingPnl.gt(0)
+          && liquidityUsd.gte(minimumLiquidityUsd)
           && entrySlippageBps.lte(researchMaxSlippageBps) && exitSlippageBps.lte(researchMaxSlippageBps);
         let strictEligible = false;
-        let strictReason = strictAssets.has(asset) ? 'funding_net_return_below_threshold' : 'strict_asset_not_enabled';
-        if (strictAssets.has(asset) && netAnnualized.gte(minNetAnnualized)) {
+        const executorSupported = LIVE_VENUES.has(longVenue) && LIVE_VENUES.has(shortVenue);
+        let strictReason = !strictAssets.has(asset) ? 'strict_asset_not_enabled'
+          : !executorSupported ? 'executor_venue_not_supported' : 'funding_net_return_below_threshold';
+        if (strictAssets.has(asset) && executorSupported && netAnnualized.gte(minNetAnnualized)) {
           try {
             await this.engine.observeAuthoritativeCandidate({ asset, longVenue, shortVenue, quantity: quantity.toString(),
               longRate: long.funding_rate, shortRate: short.funding_rate, netAnnualized: netAnnualized.toString() });
@@ -283,7 +360,8 @@ export class FundingCandidateScanner {
         }
         const researchReason = !researchAssets.has(asset) ? 'research_asset_not_enabled'
           : !snapshotFundingPnl.gt(0) ? 'raw_funding_not_positive'
-            : entrySlippageBps.gt(researchMaxSlippageBps) ? 'research_entry_slippage_exceeded'
+            : liquidityUsd.lt(minimumLiquidityUsd) ? 'research_liquidity_below_threshold'
+              : entrySlippageBps.gt(researchMaxSlippageBps) ? 'research_entry_slippage_exceeded'
               : exitSlippageBps.gt(researchMaxSlippageBps) ? 'research_exit_slippage_exceeded'
                 : 'research_liquidity_passed';
         const status: FundingScanStatus = strictEligible ? 'LIVE_ELIGIBLE'
@@ -300,13 +378,19 @@ export class FundingCandidateScanner {
           stressBuffer: stressBuffer.toString(), netPnl: netPnl.toString(), rawAnnualized: rawAnnualized.toString(),
           netAnnualized: netAnnualized.toString(), breakEvenHours: breakEvenHours?.toString() ?? null,
           entrySlippageBps: entrySlippageBps.toString(), exitSlippageBps: exitSlippageBps.toString(),
-          basisBps: basisBps.toString() });
+          basisBps: basisBps.toString(), longQuoteToUsd: pair.longBook.quoteToUsd,
+          shortQuoteToUsd: pair.shortBook.quoteToUsd, liquidityUsd: liquidityUsd.toString(),
+          stablecoinRiskBuffer: stablecoinRiskBuffer.toString() });
       }
     }
     // 持仓监控复用本轮认证数据，避免再打一遍 funding_info 和 fee 接口触发限频。
     await this.options.onFundingData?.(funding, fees, observations);
     return recorded;
   }
+}
+
+function symbolQuote(symbol: string): string {
+  return SYMBOL.exec(symbol)?.[3] ?? 'UNKNOWN';
 }
 
 export function fundingRule(rule: GateCrossExSymbol) {

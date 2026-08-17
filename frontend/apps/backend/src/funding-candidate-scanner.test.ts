@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { FundingCandidateScanner } from './funding-candidate-scanner.js';
+import { FundingCandidateScanner, type FundingScanObservation } from './funding-candidate-scanner.js';
 import type { ExecutionMarketReader } from './execution-market-hub.js';
 import type { FundingArbitrageEngine } from './funding-arbitrage-engine.js';
 import type { TradingCrossExGateway } from './crossex-client.js';
@@ -9,6 +9,7 @@ const NOW = 1_000_000;
 function market(depth = '10'): ExecutionMarketReader {
   const book = (venue: 'BINANCE' | 'OKX', bids: Array<readonly [string, string]>, asks: Array<readonly [string, string]>) => ({
     venue, symbol: `${venue}_FUTURE_SOL_USDT`, base: 'SOL', quote: 'USDT' as const, bids, asks, sequence: 1,
+    quoteToUsd: '1', quoteRateAgeMs: 0, quoteRateState: 'healthy' as const,
     exchangeTimestamp: new Date(NOW).toISOString(), receivedAt: new Date(NOW).toISOString(), ageMs: 0,
     synchronized: true, connectionState: 'healthy' as const, rebuilds: 0, sequenceGaps: 0, lastError: null,
   });
@@ -79,7 +80,8 @@ describe('FundingCandidateScanner', () => {
       { assets: ['SOL'], strictAssets: ['SOL'], researchAssets: ['SOL'], targetNotionalUsd: '5',
         researchTargetNotionalUsd: '5', horizonHours: 24, fundingRetentionFactor: '0.5',
         stressSlippageBps: '5', adverseExitBasisBps: '10', minNetAnnualized: '0.1',
-        researchMaxSlippageBps: '10', onFundingData: async (_funding, _fees, rows) => { observations.push(...rows); },
+        researchMaxSlippageBps: '10', minLiquidityUsd: '900',
+        onFundingData: async (_funding, _fees, rows) => { observations.push(...rows); },
         now: () => NOW },
     );
 
@@ -92,5 +94,47 @@ describe('FundingCandidateScanner', () => {
     expect(Number((observations[0] as { rawAnnualized: string }).rawAnnualized)).toBeGreaterThan(0);
     expect(Number((observations[0] as { netAnnualized: string }).netAnnualized)).toBeLessThan(0);
     expect(Number((observations[0] as { tradingFees: string }).tradingFees)).toBeGreaterThan(0);
+  });
+
+  it('跨 USD/USDC 报价先换算汇率、计提稳定币风险并保持仅研究标记', async () => {
+    const makeBook = (venue: 'KRAKEN' | 'HYPERLIQUID', quote: 'USD' | 'USDC', rate: string) => ({
+      venue, symbol: venue === 'KRAKEN' ? 'PF_SOLUSD' : 'SOL', base: 'SOL', quote,
+      quoteToUsd: rate, quoteRateAgeMs: 0, quoteRateState: 'healthy' as const,
+      bids: [['99', '100'] as const], asks: [['100', '100'] as const], sequence: 1,
+      exchangeTimestamp: new Date(NOW).toISOString(), receivedAt: new Date(NOW).toISOString(), ageMs: 0,
+      synchronized: true, connectionState: 'healthy' as const, rebuilds: 0, sequenceGaps: 0, lastError: null,
+    });
+    const kraken = makeBook('KRAKEN', 'USD', '1');
+    const hyper = makeBook('HYPERLIQUID', 'USDC', '0.999');
+    const marketReader = {
+      start() {}, stop() {}, health: () => ({ state: 'healthy' as const, updatedAt: new Date(NOW).toISOString(), symbols: ['SOL'], venues: [] }),
+      book: (venue: 'KRAKEN' | 'HYPERLIQUID') => venue === 'KRAKEN' ? kraken : hyper,
+      pair: () => ({ base: 'SOL', longVenue: 'KRAKEN' as const, shortVenue: 'HYPERLIQUID' as const,
+        quality: 'LIVE_SYNCHRONIZED' as const, reasons: [], exchangeSkewMs: 0, receiveSkewMs: 0,
+        longBook: kraken, shortBook: hyper, certifiedAt: new Date(NOW).toISOString() }),
+    } as unknown as ExecutionMarketReader;
+    const rule = (symbol: string, venue: string) => ({ symbol, exchange_type: venue, business_type: 'FUTURE',
+      state: 'live', min_size: '0.01', min_notional: '5', lot_size: '0.01', tick_size: '0.01', max_num_orders: '10',
+      max_market_size: '100', max_limit_size: '100', contract_size: '1', liquidation_fee: '0', delist_time: '0' });
+    const testGateway = { querySymbols: async () => [rule('KRAKEN_FUTURE_SOL_USD', 'KRAKEN'),
+      rule('HYPERLIQUID_FUTURE_SOL_USDC', 'HYPERLIQUID')],
+      queryFeeRates: async () => ['KRAKEN', 'HYPERLIQUID'].map((venue) => ({ exchange_type: venue,
+        spot_maker_fee: '0', spot_taker_fee: '0', future_maker_fee: '0.0002', future_taker_fee: '0.0005' })),
+      queryFundingInfo: async () => [
+        { symbol: 'KRAKEN_FUTURE_SOL_USD', funding_rate: '-0.001', funding_time: '2000000', funding_interval: '28800' },
+        { symbol: 'HYPERLIQUID_FUTURE_SOL_USDC', funding_rate: '0.001', funding_time: '2000000', funding_interval: '28800' },
+      ] } as unknown as TradingCrossExGateway;
+    let row: FundingScanObservation | undefined;
+    const scanner = new FundingCandidateScanner(testGateway, async () => ({ apiKey: 'key', apiSecret: 'secret' }),
+      marketReader, { observeAuthoritativeCandidate: vi.fn() } as unknown as FundingArbitrageEngine,
+      { assets: ['SOL'], strictAssets: ['SOL'], researchAssets: ['SOL'], targetNotionalUsd: '5',
+        researchTargetNotionalUsd: '5', horizonHours: 24, fundingRetentionFactor: '0.5', stressSlippageBps: '0',
+        adverseExitBasisBps: '0', stablecoinRiskBps: '5', minLiquidityUsd: '900', researchMaxSlippageBps: '10',
+        onFundingData: async (_funding, _fees, rows) => { row = rows[0]; }, now: () => NOW });
+
+    expect(await scanner.scan()).toBe(0);
+    expect(row).toMatchObject({ executionSupport: 'RESEARCH_ONLY', longQuote: 'USD', shortQuote: 'USDC',
+      longQuoteToUsd: '1', shortQuoteToUsd: '0.999', researchEligible: true });
+    expect(Number(row?.stablecoinRiskBuffer)).toBeGreaterThan(0);
   });
 });

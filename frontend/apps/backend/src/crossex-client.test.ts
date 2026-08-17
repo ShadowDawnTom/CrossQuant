@@ -195,6 +195,22 @@ describe('Gate APIv4 signing', () => {
     expect(rows[0]?.funding_interval).toBe('28800');
   });
 
+  it('将扩展研究池按每批100个资金费 symbol 串行查询', async () => {
+    const calls: string[] = [];
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      calls.push(String(url));
+      return new Response('[]', { status: 200 });
+    });
+    const client = new GateCrossExClient(fetchMock as typeof fetch, () => 1_700_000_000_000,
+      'https://api.gateio.ws/api/v4', 0);
+    const symbols = Array.from({ length: 201 }, (_, index) => `GATE_FUTURE_A${index}_USDT`);
+
+    await client.queryFundingInfo({ apiKey: 'test-api-key', apiSecret: 'test-secret' }, symbols);
+
+    expect(calls).toHaveLength(3);
+    expect(calls.map((url) => new URL(url).searchParams.get('symbols')!.split(',').length)).toEqual([100, 100, 1]);
+  });
+
   it('queries a single order by id or client text with the documented GET route', async () => {
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       expect(init?.method).toBe('GET');

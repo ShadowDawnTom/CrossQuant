@@ -20,6 +20,7 @@ afterEach(() => {
 function market(now: () => number): ExecutionMarketReader {
   const book = (venue: 'BINANCE' | 'GATE', bids: Array<readonly [string, string]>, asks: Array<readonly [string, string]>) => ({
     venue, symbol: `${venue}_FUTURE_SOL_USDT`, base: 'SOL', quote: 'USDT' as const, bids, asks, sequence: 1,
+    quoteToUsd: '1', quoteRateAgeMs: 0, quoteRateState: 'healthy' as const,
     exchangeTimestamp: new Date(now()).toISOString(), receivedAt: new Date(now()).toISOString(), ageMs: 0,
     synchronized: true, connectionState: 'healthy' as const, rebuilds: 0, sequenceGaps: 0, lastError: null,
   });
@@ -59,6 +60,9 @@ function observation(now: number): FundingScanObservation {
     exitFees: '0.005005', tradingFees: '0.01001', stressBuffer: '0.0075', netPnl: '-0.02730985',
     rawAnnualized: '0.0292', netAnnualized: '-1.99', breakEvenHours: '1349',
     entrySlippageBps: '0', exitSlippageBps: '0', basisBps: '19.98',
+    longQuote: 'USDT', shortQuote: 'USDT', longQuoteToUsd: '1', shortQuoteToUsd: '1',
+    liquidityUsd: '1000', executionSupport: 'LIVE_READY',
+    stablecoinRiskBuffer: '0',
   };
 }
 
@@ -70,22 +74,29 @@ describe('FundingResearchEngine', () => {
     let currentTime = Date.parse('2026-08-15T00:00:00.000Z');
     const engine = new FundingResearchEngine(database, market(() => currentTime), {
       enabled: true, targetNotionalUsd: '5', maxOpenPositions: 1, minimumSettledEvents: 1,
+      stressSlippageBps: '0', adverseExitBasisBps: '0', fundingRetentionFactor: '0.5',
     }, () => currentTime);
 
-    expect(await engine.observe([observation(currentTime)], funding(currentTime), fees)).toBe(1);
-    expect(engine.list()).toHaveLength(1);
-    expect(engine.list()[0]).toMatchObject({ mode: 'RESEARCH', state: 'OPEN', monitorState: 'HOLD', settledEvents: 0 });
-    expect(engine.summary()).toMatchObject({ enabled: true, openCount: 1, scan24h: {
+    expect(await engine.observe([observation(currentTime)], funding(currentTime), fees)).toBe(2);
+    expect(engine.list()).toHaveLength(2);
+    expect(engine.list()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ cohort: 'ONE_SETTLEMENT', state: 'OPEN', monitorState: 'HOLD', settledEvents: 0 }),
+      expect.objectContaining({ cohort: 'ROLLING', state: 'OPEN', monitorState: 'HOLD', settledEvents: 0 }),
+    ]));
+    expect(engine.summary()).toMatchObject({ enabled: true, openCount: 2, scan24h: {
       observations: 1, liveEligible: 0, researchEligible: 1, rejected: 0,
     } });
 
     currentTime += 61_000;
     await engine.observe([observation(currentTime)], funding(currentTime), fees);
-    expect(engine.list()[0]).toMatchObject({ state: 'CLOSED', monitorState: 'EXIT', settledEvents: 2,
+    const oneSettlement = engine.list().find((item) => item.cohort === 'ONE_SETTLEMENT')!;
+    const rolling = engine.list().find((item) => item.cohort === 'ROLLING')!;
+    expect(oneSettlement).toMatchObject({ state: 'CLOSED', monitorState: 'EXIT', settledEvents: 2,
       lastReason: 'research_minimum_settlement_completed' });
-    expect(Number(engine.list()[0]!.fundingPnl)).toBeGreaterThan(0);
-    expect(engine.details(engine.list()[0]!.id)?.settlements.filter((item) => item.state === 'SETTLED')).toHaveLength(2);
-    expect(engine.details(engine.list()[0]!.id)?.evaluations.some((item) => item.decision === 'EXIT')).toBe(true);
+    expect(rolling).toMatchObject({ state: 'OPEN', monitorState: 'HOLD', settledEvents: 2 });
+    expect(Number(oneSettlement.fundingPnl)).toBeGreaterThan(0);
+    expect(engine.details(oneSettlement.id)?.settlements.filter((item) => item.state === 'SETTLED')).toHaveLength(2);
+    expect(engine.details(oneSettlement.id)?.evaluations.some((item) => item.decision === 'EXIT')).toBe(true);
   });
 
   it('关闭探索模拟时仍保存拒绝原因，但不会创建持仓', async () => {

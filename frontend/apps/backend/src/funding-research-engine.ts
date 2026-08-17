@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { Decimal } from 'decimal.js';
 import type { GateFeeRate, GateFundingInfo } from './crossex-client.js';
-import type { ExecutionMarketReader, ExecutionVenue } from './execution-market-hub.js';
+import { crossExFutureSymbol, type ExecutionMarketReader, type ExecutionVenue, usdLevels } from './execution-market-hub.js';
 import type { FundingScanObservation } from './funding-candidate-scanner.js';
+import { evaluateFundingHolding } from './funding-holding-model.js';
 
 type Level = readonly [price: string, quantity: string];
 
@@ -19,7 +20,19 @@ export interface FundingResearchOptions {
   targetNotionalUsd: string;
   maxOpenPositions: number;
   minimumSettledEvents: number;
+  holdingEventsPerLeg?: number;
+  holdingExitConfirmationCount?: number;
+  minimumHoldValueUsd?: string;
+  settlementGuardMs?: number;
+  fundingRetentionFactor?: string;
+  stressSlippageBps?: string;
+  adverseExitBasisBps?: string;
+  rollingSoftReviewMs?: number;
+  rollingHardHoldingMs?: number;
+  stablecoinRiskBps?: string;
 }
+
+export type FundingResearchCohort = 'ONE_SETTLEMENT' | 'ROLLING';
 
 interface ResearchPositionRow {
   id: string;
@@ -57,12 +70,17 @@ interface ResearchPositionRow {
   last_evaluated_at: string | null;
   created_at: string;
   updated_at: string;
+  cohort: FundingResearchCohort;
+  unprofitable_count: number;
+  long_quote: string;
+  short_quote: string;
 }
 
 export interface FundingResearchPosition {
   id: string;
   observationId: string;
   mode: 'RESEARCH';
+  cohort: FundingResearchCohort;
   asset: string;
   longVenue: ExecutionVenue;
   shortVenue: ExecutionVenue;
@@ -95,6 +113,9 @@ export interface FundingResearchPosition {
   closedAt: string | null;
   lastEvaluatedAt: string | null;
   updatedAt: string;
+  unprofitableCount: number;
+  longQuote: string;
+  shortQuote: string;
 }
 
 export interface FundingResearchEvaluation {
@@ -145,10 +166,8 @@ export interface FundingResearchSummary {
   cumulativeFunding: string;
   cumulativeFees: string;
   positions: FundingResearchPosition[];
-}
-
-function symbol(venue: ExecutionVenue, asset: string): string {
-  return `${venue}_FUTURE_${asset}_USDT`;
+  cohorts: Array<{ cohort: FundingResearchCohort; openCount: number; closedCount: number;
+    cumulativePnl: string; cumulativeFunding: string; cumulativeFees: string }>;
 }
 
 function feeFor(fees: readonly GateFeeRate[], venue: ExecutionVenue, marketSymbol: string): Decimal | null {
@@ -186,7 +205,7 @@ function depthFill(levels: readonly Level[], quantityText: string, side: 'BUY' |
 
 function fromPosition(row: ResearchPositionRow): FundingResearchPosition {
   return {
-    id: row.id, observationId: row.observation_id, mode: 'RESEARCH', asset: row.asset,
+    id: row.id, observationId: row.observation_id, mode: 'RESEARCH', cohort: row.cohort, asset: row.asset,
     longVenue: row.long_venue, shortVenue: row.short_venue, quantity: row.quantity,
     targetNotionalUsd: row.target_notional_usd, state: row.state, monitorState: row.monitor_state,
     entryRawAnnualized: row.entry_raw_annualized, entryNetAnnualized: row.entry_net_annualized,
@@ -200,6 +219,8 @@ function fromPosition(row: ResearchPositionRow): FundingResearchPosition {
     dataFailureCount: row.data_failure_count, nextSettlementAt: row.next_settlement_at,
     lastReason: row.last_reason, openedAt: row.opened_at, closedAt: row.closed_at,
     lastEvaluatedAt: row.last_evaluated_at, updatedAt: row.updated_at,
+    unprofitableCount: row.unprofitable_count,
+    longQuote: row.long_quote, shortQuote: row.short_quote,
   };
 }
 
@@ -230,6 +251,13 @@ function observationFromRow(row: Record<string, unknown>): FundingScanObservatio
     entrySlippageBps: row.entry_slippage_bps === null ? null : String(row.entry_slippage_bps),
     exitSlippageBps: row.exit_slippage_bps === null ? null : String(row.exit_slippage_bps),
     basisBps: row.basis_bps === null ? null : String(row.basis_bps),
+    longQuote: String(row.long_quote ?? 'USDT'), shortQuote: String(row.short_quote ?? 'USDT'),
+    longQuoteToUsd: row.long_quote_to_usd === null ? null : String(row.long_quote_to_usd),
+    shortQuoteToUsd: row.short_quote_to_usd === null ? null : String(row.short_quote_to_usd),
+    liquidityUsd: row.liquidity_usd === null ? null : String(row.liquidity_usd),
+    executionSupport: String(row.execution_support ?? 'LIVE_READY') as FundingScanObservation['executionSupport'],
+    cohortClone: Number(row.cohort_clone ?? 0) === 1,
+    stablecoinRiskBuffer: row.stablecoin_risk_buffer === null ? null : String(row.stablecoin_risk_buffer),
   };
 }
 
@@ -259,6 +287,18 @@ export class FundingResearchEngine {
       .all(Math.max(1, Math.min(500, limit))) as ResearchPositionRow[]).map(fromPosition);
   }
 
+  latestExecutionObservations(): FundingScanObservation[] {
+    const last = this.database.prepare(`SELECT scan_id FROM funding_scan_observations
+      ORDER BY observed_at DESC, id DESC LIMIT 1`).get() as { scan_id: string } | undefined;
+    if (!last) return [];
+    const rows = (this.database.prepare(`SELECT * FROM funding_scan_observations WHERE scan_id = ? AND cohort_clone = 0
+      ORDER BY research_eligible DESC, strict_eligible DESC,
+      CASE WHEN net_annualized IS NULL THEN 1 ELSE 0 END, CAST(net_annualized AS REAL) DESC`)
+      .all(last.scan_id) as Array<Record<string, unknown>>).map(observationFromRow);
+    const seen = new Set<string>();
+    return rows.filter((item) => !seen.has(item.asset) && Boolean(seen.add(item.asset)));
+  }
+
   summary(): FundingResearchSummary {
     const dayAgo = new Date(this.now() - 24 * 60 * 60_000).toISOString();
     const lastScan = this.database.prepare(`SELECT scan_id, observed_at FROM funding_scan_observations
@@ -267,20 +307,30 @@ export class FundingResearchEngine {
       COALESCE(SUM(strict_eligible), 0) AS liveEligible,
       COALESCE(SUM(research_eligible), 0) AS researchEligible,
       COALESCE(SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END), 0) AS rejected
-      FROM funding_scan_observations WHERE observed_at >= ?`).get(dayAgo) as Record<string, number>;
+      FROM funding_scan_observations WHERE observed_at >= ? AND cohort_clone = 0`).get(dayAgo) as Record<string, number>;
     const rejectionReasons = this.database.prepare(`SELECT primary_reason AS reason, COUNT(*) AS count
-      FROM funding_scan_observations WHERE observed_at >= ? AND status = 'REJECTED'
+      FROM funding_scan_observations WHERE observed_at >= ? AND status = 'REJECTED' AND cohort_clone = 0
       GROUP BY primary_reason ORDER BY count DESC, reason LIMIT 20`).all(dayAgo) as Array<{ reason: string; count: number }>;
     const latestObservations = !lastScan ? [] : (this.database.prepare(`SELECT * FROM funding_scan_observations
-      WHERE scan_id = ? ORDER BY research_eligible DESC, strict_eligible DESC,
+      WHERE scan_id = ? AND cohort_clone = 0 ORDER BY research_eligible DESC, strict_eligible DESC,
       CASE WHEN net_annualized IS NULL THEN 1 ELSE 0 END, CAST(net_annualized AS REAL) DESC LIMIT 40`)
-      .all(lastScan.scan_id) as Array<Record<string, unknown>>).map(observationFromRow);
+      .all(lastScan.scan_id) as Array<Record<string, unknown>>).map(observationFromRow)
+      .map((item) => this.withHistoryStats(item, dayAgo));
     const positions = this.list(100);
-    const ledger = this.database.prepare(`SELECT state, funding_pnl, entry_fees, exit_fees, total_pnl
-      FROM funding_research_positions`).all() as Array<{ state: string; funding_pnl: string;
+    const ledger = this.database.prepare(`SELECT cohort, state, funding_pnl, entry_fees, exit_fees, total_pnl
+      FROM funding_research_positions`).all() as Array<{ cohort: FundingResearchCohort; state: string; funding_pnl: string;
         entry_fees: string; exit_fees: string; total_pnl: string }>;
     const closed = ledger.filter((position) => position.state === 'CLOSED');
     const fees = ledger.reduce((total, position) => total.plus(position.entry_fees).plus(position.exit_fees), new Decimal(0));
+    const cohorts = (['ONE_SETTLEMENT', 'ROLLING'] as const).map((cohort) => {
+      const rows = ledger.filter((item) => item.cohort === cohort);
+      const cohortClosed = rows.filter((item) => item.state === 'CLOSED');
+      return { cohort, openCount: rows.filter((item) => item.state === 'OPEN').length,
+        closedCount: cohortClosed.length,
+        cumulativePnl: cohortClosed.reduce((total, item) => total.plus(item.total_pnl), new Decimal(0)).toString(),
+        cumulativeFunding: rows.reduce((total, item) => total.plus(item.funding_pnl), new Decimal(0)).toString(),
+        cumulativeFees: rows.reduce((total, item) => total.plus(item.entry_fees).plus(item.exit_fees), new Decimal(0)).toString() };
+    });
     return {
       enabled: this.options.enabled, targetNotionalUsd: this.options.targetNotionalUsd,
       maxOpenPositions: this.options.maxOpenPositions, minimumSettledEvents: this.options.minimumSettledEvents,
@@ -292,8 +342,44 @@ export class FundingResearchEngine {
       closedCount: closed.length,
       cumulativePnl: closed.reduce((total, position) => total.plus(position.total_pnl), new Decimal(0)).toString(),
       cumulativeFunding: ledger.reduce((total, position) => total.plus(position.funding_pnl), new Decimal(0)).toString(),
-      cumulativeFees: fees.toString(), positions,
+      cumulativeFees: fees.toString(), positions, cohorts,
     };
+  }
+
+  private withHistoryStats(observation: FundingScanObservation, dayAgo: string): FundingScanObservation {
+    const directions = this.database.prepare(`SELECT observed_at, long_venue, short_venue, raw_funding_pnl
+      FROM funding_scan_observations WHERE asset = ? AND observed_at >= ? AND cohort_clone = 0
+      AND ((long_venue = ? AND short_venue = ?) OR (long_venue = ? AND short_venue = ?))
+      ORDER BY observed_at DESC`).all(observation.asset, dayAgo, observation.longVenue, observation.shortVenue,
+      observation.shortVenue, observation.longVenue) as Array<{ observed_at: string; long_venue: string;
+        short_venue: string; raw_funding_pnl: string | null }>;
+    let flips = 0;
+    let previous: string | null = null;
+    let edgeStart = observation.observedAt;
+    let edgeIsContinuous = true;
+    const currentDirection = `${observation.longVenue}:${observation.shortVenue}`;
+    for (const row of directions) {
+      const direction = `${row.long_venue}:${row.short_venue}`;
+      if (previous !== null && direction !== previous) flips += 1;
+      previous = direction;
+      if (!edgeIsContinuous) continue;
+      if (direction === currentDirection && row.raw_funding_pnl !== null && new Decimal(row.raw_funding_pnl).gt(0)) {
+        edgeStart = row.observed_at;
+      } else {
+        edgeIsContinuous = false;
+      }
+    }
+    const settlements = this.database.prepare(`SELECT funding_pnl FROM funding_research_positions
+      WHERE asset = ? AND settled_events > 0
+      AND ((long_venue = ? AND short_venue = ?) OR (long_venue = ? AND short_venue = ?))`)
+      .all(observation.asset, observation.longVenue, observation.shortVenue,
+        observation.shortVenue, observation.longVenue) as Array<{ funding_pnl: string }>;
+    const hits = settlements.filter((item) => new Decimal(item.funding_pnl).gt(0)).length;
+    return { ...observation,
+      edgeDurationMinutes: Math.max(0, Math.round((Date.parse(observation.observedAt) - Date.parse(edgeStart)) / 60_000)),
+      directionFlips24h: flips,
+      settlementHitRate: settlements.length > 0 ? new Decimal(hits).div(settlements.length).toString() : null,
+      settlementSamples: settlements.length };
   }
 
   details(id: string): { position: FundingResearchPosition; evaluations: FundingResearchEvaluation[];
@@ -335,18 +421,24 @@ export class FundingResearchEngine {
       changed += 1;
     }
     if (!this.options.enabled) return changed;
-    const openCount = (this.database.prepare("SELECT COUNT(*) AS count FROM funding_research_positions WHERE state = 'OPEN'")
-      .get() as { count: number }).count;
-    if (openCount >= Math.min(1, this.options.maxOpenPositions)) return changed;
     const best = [...observations].filter((item) => item.researchEligible && item.quantity !== null
       && item.entryLongPrice !== null && item.entryShortPrice !== null && item.entryLongNotional !== null
       && item.entryShortNotional !== null && item.entryFees !== null && item.rawAnnualized !== null
       && item.netAnnualized !== null).sort((left, right) => new Decimal(right.netAnnualized!).cmp(left.netAnnualized!))[0];
-    if (!best || !this.open(best, funding, observedAt)) return changed;
-    const opened = this.database.prepare('SELECT id FROM funding_research_positions WHERE observation_id = ?')
-      .get(best.id) as { id: string } | undefined;
-    if (opened) this.evaluate(opened.id, funding, fees, observedAt);
-    return changed + 1;
+    if (!best) return changed;
+    for (const cohort of ['ONE_SETTLEMENT', 'ROLLING'] as const) {
+      const openCount = (this.database.prepare(`SELECT COUNT(*) AS count FROM funding_research_positions
+        WHERE state = 'OPEN' AND cohort = ?`).get(cohort) as { count: number }).count;
+      if (openCount >= this.options.maxOpenPositions) continue;
+      // observation_id 有历史唯一约束；第二组复制同一时点快照，保证两组入场基线完全一致。
+      const cohortObservation = cohort === 'ONE_SETTLEMENT' ? best : { ...best, id: randomUUID(), cohortClone: true };
+      if (cohort === 'ROLLING') this.persistObservations([cohortObservation]);
+      const openedId = this.open(cohortObservation, funding, observedAt, cohort);
+      if (!openedId) continue;
+      this.evaluate(openedId, funding, fees, observedAt);
+      changed += 1;
+    }
+    return changed;
   }
 
   private persistObservations(observations: readonly FundingScanObservation[]): void {
@@ -356,8 +448,10 @@ export class FundingResearchEngine {
        short_events, entry_long_price, entry_short_price, exit_long_price, exit_short_price,
        entry_long_notional, entry_short_notional, raw_funding_pnl, conservative_funding_pnl,
        immediate_round_trip_pnl, entry_fees, exit_fees, trading_fees, stress_buffer, net_pnl,
-       raw_annualized, net_annualized, break_even_hours, entry_slippage_bps, exit_slippage_bps, basis_bps)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+       raw_annualized, net_annualized, break_even_hours, entry_slippage_bps, exit_slippage_bps, basis_bps,
+       long_quote, short_quote, long_quote_to_usd, short_quote_to_usd, liquidity_usd, execution_support,
+       cohort_clone, stablecoin_risk_buffer)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     this.database.transaction(() => {
       for (const item of observations) statement.run(item.id, item.scanId, item.observedAt, item.asset,
         item.longVenue, item.shortVenue, item.quantity, item.status, item.strictEligible ? 1 : 0,
@@ -367,29 +461,34 @@ export class FundingResearchEngine {
         item.entryShortNotional, item.rawFundingPnl, item.conservativeFundingPnl,
         item.immediateRoundTripPnl, item.entryFees, item.exitFees, item.tradingFees, item.stressBuffer,
         item.netPnl, item.rawAnnualized, item.netAnnualized, item.breakEvenHours,
-        item.entrySlippageBps, item.exitSlippageBps, item.basisBps);
+        item.entrySlippageBps, item.exitSlippageBps, item.basisBps, item.longQuote, item.shortQuote,
+        item.longQuoteToUsd, item.shortQuoteToUsd, item.liquidityUsd, item.executionSupport, item.cohortClone ? 1 : 0,
+        item.stablecoinRiskBuffer);
     })();
   }
 
-  private open(observation: FundingScanObservation, funding: readonly GateFundingInfo[], observedAt: string): boolean {
+  private open(observation: FundingScanObservation, funding: readonly GateFundingInfo[], observedAt: string,
+    cohort: FundingResearchCohort): string | null {
     const id = randomUUID();
     try {
       this.database.prepare(`INSERT INTO funding_research_positions
         (id, observation_id, asset, long_venue, short_venue, quantity, target_notional_usd, state,
          monitor_state, entry_raw_annualized, entry_net_annualized, entry_long_price, entry_short_price,
-         entry_long_notional, entry_short_notional, entry_fees, entry_slippage_bps, opened_at, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+         entry_long_notional, entry_short_notional, entry_fees, entry_slippage_bps, opened_at, created_at, updated_at,
+         cohort, long_quote, short_quote)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(id, observation.id, observation.asset, observation.longVenue, observation.shortVenue,
           observation.quantity, this.options.targetNotionalUsd, observation.rawAnnualized,
           observation.netAnnualized, observation.entryLongPrice, observation.entryShortPrice,
           observation.entryLongNotional, observation.entryShortNotional, observation.entryFees,
-          observation.entrySlippageBps, observedAt, observedAt, observedAt);
+          observation.entrySlippageBps, observedAt, observedAt, observedAt, cohort,
+          observation.longQuote, observation.shortQuote);
       this.refreshSettlements(id, observation.asset, observation.longVenue, observation.shortVenue,
         new Decimal(observation.entryLongNotional!), new Decimal(observation.entryShortNotional!), funding, observedAt);
-      return true;
+      return id;
     } catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
-      if (code.startsWith('SQLITE_CONSTRAINT')) return false;
+      if (code.startsWith('SQLITE_CONSTRAINT')) return null;
       throw error;
     }
   }
@@ -398,8 +497,8 @@ export class FundingResearchEngine {
     const position = this.database.prepare("SELECT * FROM funding_research_positions WHERE id = ? AND state = 'OPEN'")
       .get(id) as ResearchPositionRow | undefined;
     if (!position) return;
-    const longSymbol = symbol(position.long_venue, position.asset);
-    const shortSymbol = symbol(position.short_venue, position.asset);
+    const longSymbol = crossExFutureSymbol(position.long_venue, position.asset);
+    const shortSymbol = crossExFutureSymbol(position.short_venue, position.asset);
     const fundingBySymbol = new Map(funding.map((item) => [item.symbol, item]));
     const longFunding = fundingBySymbol.get(longSymbol);
     const shortFunding = fundingBySymbol.get(shortSymbol);
@@ -418,8 +517,11 @@ export class FundingResearchEngine {
       this.unavailable(position, observedAt, 'market_not_live_synchronized', { reasons: pair.reasons });
       return;
     }
-    const longExit = depthFill(pair.longBook.bids, position.quantity, 'SELL');
-    const shortExit = depthFill(pair.shortBook.asks, position.quantity, 'BUY');
+    const longBids = usdLevels(pair.longBook, pair.longBook.bids);
+    const shortAsks = usdLevels(pair.shortBook, pair.shortBook.asks);
+    if (!longBids || !shortAsks) { this.unavailable(position, observedAt, 'quote_fx_unavailable'); return; }
+    const longExit = depthFill(longBids, position.quantity, 'SELL');
+    const shortExit = depthFill(shortAsks, position.quantity, 'BUY');
     if (!longExit || !shortExit) { this.unavailable(position, observedAt, 'exit_depth_insufficient'); return; }
     const quantity = new Decimal(position.quantity);
     const fundingPnl = new Decimal(position.funding_pnl);
@@ -432,25 +534,70 @@ export class FundingResearchEngine {
     const exitSlippageBps = longExit.slippageBps.plus(shortExit.slippageBps);
     const settledEvents = (this.database.prepare(`SELECT COUNT(*) AS count FROM funding_research_settlements
       WHERE position_id = ? AND state = 'SETTLED'`).get(position.id) as { count: number }).count;
+    const settledLegs = (this.database.prepare(`SELECT COUNT(DISTINCT symbol) AS count FROM funding_research_settlements
+      WHERE position_id = ? AND state = 'SETTLED'`).get(position.id) as { count: number }).count;
     const nextSettlement = this.database.prepare(`SELECT MIN(funding_time) AS next FROM funding_research_settlements
       WHERE position_id = ? AND state = 'PENDING'`).get(position.id) as { next: string | null };
-    const shouldExit = settledEvents >= this.options.minimumSettledEvents;
-    const decision = shouldExit ? 'EXIT' : 'HOLD';
-    const reason = shouldExit ? 'research_minimum_settlement_completed' : 'research_waiting_first_settlement';
+    let decision: string;
+    let reason: string;
+    let unprofitableCount = position.unprofitable_count;
+    let holdingDetails: Record<string, unknown> = {};
+    if (position.cohort === 'ONE_SETTLEMENT') {
+      // “一次结算”必须两条腿都真正跨过结算点，不能一所先结算就把另一条待验证事件取消。
+      const shouldExit = settledLegs === 2 && settledEvents >= this.options.minimumSettledEvents * 2;
+      decision = shouldExit ? 'EXIT' : 'HOLD';
+      reason = shouldExit ? 'research_minimum_settlement_completed' : 'research_waiting_first_settlement';
+    } else {
+      try {
+        const holding = evaluateFundingHolding({
+          nowMs: Date.parse(observedAt),
+          long: { symbol: longSymbol, venue: position.long_venue, side: 'LONG',
+            fundingRate: longFunding.funding_rate, fundingTime: longFunding.funding_time,
+            fundingInterval: longFunding.funding_interval, notionalUsd: position.entry_long_notional },
+          short: { symbol: shortSymbol, venue: position.short_venue, side: 'SHORT',
+            fundingRate: shortFunding.funding_rate, fundingTime: shortFunding.funding_time,
+            fundingInterval: shortFunding.funding_interval, notionalUsd: position.entry_short_notional },
+          eventsPerLeg: this.options.holdingEventsPerLeg ?? 2,
+          fundingRetentionFactor: this.options.fundingRetentionFactor ?? '0.5',
+          stressSlippageBps: this.options.stressSlippageBps ?? '5',
+          adverseExitBasisBps: new Decimal(this.options.adverseExitBasisBps ?? '10')
+            .plus(position.long_quote === position.short_quote ? 0 : this.options.stablecoinRiskBps ?? '5').toString(),
+          minimumHoldValueUsd: this.options.minimumHoldValueUsd ?? '0',
+          previousUnprofitableCount: position.unprofitable_count,
+          unprofitableConfirmationCount: this.options.holdingExitConfirmationCount ?? 3,
+          settlementGuardMs: this.options.settlementGuardMs ?? 30_000,
+          openedAtMs: Date.parse(position.opened_at),
+          softReviewMs: this.options.rollingSoftReviewMs ?? 3 * 24 * 60 * 60_000,
+          hardHoldingMs: this.options.rollingHardHoldingMs ?? 7 * 24 * 60 * 60_000,
+        });
+        decision = holding.decision;
+        reason = holding.reason;
+        unprofitableCount = holding.unprofitableCount;
+        holdingDetails = { rawHoldingFunding: holding.rawFunding,
+          conservativeHoldingFunding: holding.conservativeFunding, holdRiskBuffer: holding.riskBuffer,
+          holdValue: holding.holdValue, fundingEdge: holding.fundingEdge,
+          inSettlementGuard: holding.inSettlementGuard };
+      } catch {
+        this.unavailable(position, observedAt, 'funding_schedule_unavailable');
+        return;
+      }
+    }
     this.persistEvaluation(position.id, observedAt, decision, reason, pair.quality, {
       currentExitPnl: totalPnl.toString(), pricePnl: pricePnl.toString(), fundingPnl: fundingPnl.toString(),
       exitFees: exitFees.toString(), basisBps: basisBps.toString(), exitSlippageBps: exitSlippageBps.toString(),
       settledEvents, nextSettlementAt: nextSettlement.next,
       details: { exchangeSkewMs: pair.exchangeSkewMs, receiveSkewMs: pair.receiveSkewMs,
-        longRate: longFunding.funding_rate, shortRate: shortFunding.funding_rate },
+        longRate: longFunding.funding_rate, shortRate: shortFunding.funding_rate, cohort: position.cohort,
+        ...holdingDetails },
     });
     this.database.prepare(`UPDATE funding_research_positions SET monitor_state = ?, current_exit_pnl = ?,
       price_pnl = ?, exit_fees = ?, current_basis_bps = ?, exit_slippage_bps = ?, settled_events = ?,
-      data_failure_count = 0, next_settlement_at = ?, last_reason = ?, last_evaluated_at = ?, updated_at = ?
+      data_failure_count = 0, next_settlement_at = ?, last_reason = ?, unprofitable_count = ?,
+      last_evaluated_at = ?, updated_at = ?
       WHERE id = ?`).run(decision, totalPnl.toString(), pricePnl.toString(), exitFees.toString(),
-      basisBps.toString(), exitSlippageBps.toString(), settledEvents, nextSettlement.next, reason,
+      basisBps.toString(), exitSlippageBps.toString(), settledEvents, nextSettlement.next, reason, unprofitableCount,
       observedAt, observedAt, position.id);
-    if (shouldExit) this.close(position, observedAt, reason, longExit.average, shortExit.average,
+    if (decision === 'EXIT') this.close(position, observedAt, reason, longExit.average, shortExit.average,
       exitFees, pricePnl, totalPnl, settledEvents);
   }
 
@@ -471,7 +618,7 @@ export class FundingResearchEngine {
         updated_at = excluded.updated_at WHERE funding_research_settlements.state = 'PENDING'`);
     this.database.transaction(() => {
       for (const leg of legs) {
-        const marketSymbol = symbol(leg.venue, asset);
+        const marketSymbol = crossExFutureSymbol(leg.venue, asset);
         const item = bySymbol.get(marketSymbol);
         if (!item) continue;
         const fundingTime = new Date(Number(item.funding_time)).toISOString();

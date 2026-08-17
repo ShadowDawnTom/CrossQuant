@@ -512,12 +512,25 @@ export const FundingOverviewVenueEntrySchema = z.object({
   /** Fractional 24h price change, e.g. -0.012 means -1.2%. */
   change24h: z.string().nullable(),
   fetchedAt: z.string().nullable(),
+  executionSupport: z.enum(['live_ready', 'research_only', 'unsupported']),
 });
 export type FundingOverviewVenueEntry = z.infer<typeof FundingOverviewVenueEntrySchema>;
 
 export const FundingOverviewAssetSchema = z.object({
   asset: z.string(),
   venues: z.array(FundingOverviewVenueEntrySchema),
+  bestExecution: z.object({
+    observedAt: z.string(),
+    longVenue: z.string(),
+    shortVenue: z.string(),
+    grossSnapshotAnnualized: z.string().nullable(),
+    conservativeNetAnnualized: z.string().nullable(),
+    conservativeNetPnl: z.string().nullable(),
+    executionSupport: z.enum(['LIVE_READY', 'RESEARCH_ONLY']),
+    status: z.enum(['LIVE_ELIGIBLE', 'RESEARCH_ELIGIBLE', 'REJECTED']),
+    primaryReason: z.string(),
+    liquidityUsd: z.string().nullable(),
+  }).nullable(),
 });
 export type FundingOverviewAsset = z.infer<typeof FundingOverviewAssetSchema>;
 
