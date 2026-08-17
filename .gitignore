@@ -8,6 +8,7 @@ dist/
 build/
 *.egg-info/
 data/
+.private-backups/
 
 # 克隆的 Gate CrossEx 前端只提交源码，不提交本地运行状态或凭据。
 frontend/node_modules/
