@@ -85,7 +85,11 @@ describe('FundingResearchEngine', () => {
     ]));
     expect(engine.summary()).toMatchObject({ enabled: true, openCount: 2, scan24h: {
       observations: 1, liveEligible: 0, researchEligible: 1, rejected: 0,
-    } });
+    }, variants: expect.arrayContaining([
+      expect.objectContaining({ variant: 'TAKER_TAKER', state: 'PRICED' }),
+      expect.objectContaining({ variant: 'MAKER_TAKER', state: 'PRICED' }),
+      expect.objectContaining({ variant: 'SPOT_PERP', state: 'UNAVAILABLE' }),
+    ]) });
 
     currentTime += 61_000;
     await engine.observe([observation(currentTime)], funding(currentTime), fees);
@@ -95,8 +99,12 @@ describe('FundingResearchEngine', () => {
       lastReason: 'research_minimum_settlement_completed' });
     expect(rolling).toMatchObject({ state: 'OPEN', monitorState: 'HOLD', settledEvents: 2 });
     expect(Number(oneSettlement.fundingPnl)).toBeGreaterThan(0);
-    expect(engine.details(oneSettlement.id)?.settlements.filter((item) => item.state === 'SETTLED')).toHaveLength(2);
+    expect(engine.details(oneSettlement.id)?.settlements.filter((item) => item.state === 'SETTLED'))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ amountSource: 'PREDICTED_SNAPSHOT' })]));
     expect(engine.details(oneSettlement.id)?.evaluations.some((item) => item.decision === 'EXIT')).toBe(true);
+    await engine.observe([observation(currentTime)], funding(currentTime), fees);
+    expect(engine.list().filter((item) => item.cohort === 'ONE_SETTLEMENT')).toHaveLength(1);
+    expect(oneSettlement.reopenAfter).not.toBeNull();
   });
 
   it('关闭探索模拟时仍保存拒绝原因，但不会创建持仓', async () => {

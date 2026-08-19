@@ -148,7 +148,7 @@ describe('local API request coordination', () => {
         scan24h: { observations: 18, liveEligible: 0, researchEligible: 12, rejected: 6 },
         rejectionReasons: [{ reason: 'market_not_synchronized', count: 6 }], latestObservations: [],
         openCount: 1, closedCount: 0, cumulativePnl: '0', cumulativeFunding: '0',
-        cumulativeFees: '0.005', positions: [position] }))
+        cumulativeFees: '0.005', positions: [position], cohorts: [], variants: [] }))
       : new Response(JSON.stringify({ position, evaluations: [], settlements: [] })));
     vi.stubGlobal('fetch', fetchMock);
 

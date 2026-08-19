@@ -63,10 +63,12 @@ The backend evaluates account risk before live activation, before risk-increasin
 | `GCT_FUNDING_RESEARCH_STABLECOIN_RISK_BPS` | `5` | USD/USDC/USDT 跨报价组合的额外脱锚缓冲 |
 | `GCT_FUNDING_RESEARCH_ROLLING_SOFT_REVIEW_MS` | `259200000` | 滚动组 72 小时重点观察提醒 |
 | `GCT_FUNDING_RESEARCH_ROLLING_HARD_HOLDING_MS` | `604800000` | 滚动组 7 天硬性退出上限 |
+| `GCT_FUNDING_RESEARCH_MAKER_FILL_PROBABILITY` | `0.35` | Maker/Taker 反事实中的保守完整对冲成交概率 |
+| `GCT_FUNDING_RESEARCH_MAKER_LEG_RISK_BPS` | `5` | Maker 腿未成交时的裸露敞口期望损失缓冲 |
 
 只有 `LIVE_SYNCHRONIZED` 盘口可以通过入场预检。缺价格、深度不足、行情陈旧、跨所时间差过大、账户快照不完整、私有流断线和 Kill Switch 已触发都会 fail-closed。
 
-候选只由后端读取 Gate 已认证 `funding_info` 和账户手续费生成，浏览器不能提交资金费率或年化。接口值只用于“当前费率不变”的快照情景，不代表未来确定收益。扫描器按各所结算事件计数，用当前多档盘口计算立即往返价格损益，扣除开平仓四次 taker 手续费，并对正向资金费打折、额外扣除滑点和未来退出基差压力缓冲；入场还会重新校验合约状态、`min_size`、`min_notional`、`lot_size`、`tick_size`、预计总敞口和可用保证金。
+候选只由后端读取 Gate 已认证 `funding_info` 和账户手续费生成，浏览器不能提交资金费率或年化。接口值只用于“当前费率不变”的快照情景，不代表未来确定收益。扫描器按各所结算事件计数，用当前多档盘口计算立即往返价格损益，扣除开平仓四次 taker 手续费，并对正向资金费打折、额外扣除滑点和未来退出基差压力缓冲。真实结算历史达到 7 个完整 UTC 日后，保守持续率还会取“人工上限”和“历史正收益日命中率”中的较低值；入场仍会重新校验合约状态、数量规则、预计总敞口和可用保证金。
 
 `GCT_AUTH_TRADER_EMAILS` 是交易员白名单，必须是 `GCT_AUTH_ALLOWED_EMAILS` 的子集。只在访问白名单而不在交易员白名单的账号可以看页面，但资金费入场和平仓接口都会返回 `trader_role_required`。
 

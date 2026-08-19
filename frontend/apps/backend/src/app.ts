@@ -66,7 +66,7 @@ import { FundingHistoryService } from './funding-history.js';
 import { FundingOverviewService } from './funding-overview.js';
 import { canonicalMarketAsset } from './market-asset-aliases.js';
 import { CrossExMarketHub, CANDLE_INTERVALS, type MarketDefinition, type MarketHubMessage } from './market-hub.js';
-import { ExecutionMarketHub, EXECUTION_VENUES, sampleExecutionPairs, type ExecutionMarketReader, type ExecutionVenue } from './execution-market-hub.js';
+import { crossExFutureSymbol, ExecutionMarketHub, EXECUTION_VENUES, sampleExecutionPairs, type ExecutionMarketReader, type ExecutionVenue } from './execution-market-hub.js';
 import { StrategyEngine, StrategyEngineError } from './strategy-engine.js';
 import { TradingSession } from './trading-session.js';
 import { TradingRuntime, TradingRuntimeError } from './trading-runtime.js';
@@ -79,6 +79,8 @@ import { FundingCandidateScanner, fundingRule } from './funding-candidate-scanne
 import { FundingHoldingMonitor } from './funding-holding-monitor.js';
 import { FundingPaperEngine } from './funding-paper-engine.js';
 import { FundingResearchEngine } from './funding-research-engine.js';
+import { readFundingPersistence } from './funding-persistence.js';
+import { SpotMarketReader } from './spot-market-reader.js';
 import { readDatabaseStatus } from './database.js';
 import { runDatabaseMaintenance } from './database-maintenance.js';
 import {
@@ -702,6 +704,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       adverseExitBasisBps: config.fundingArbitrage.adverseExitBasisBps,
     },
   );
+  const spotMarketReader = new SpotMarketReader(fetch);
   const fundingResearchEngine = new FundingResearchEngine(database, executionMarketHub, {
     enabled: config.fundingResearch.enabled,
     targetNotionalUsd: config.fundingResearch.targetNotionalUsd,
@@ -717,6 +720,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     rollingSoftReviewMs: config.fundingResearch.rollingSoftReviewMs,
     rollingHardHoldingMs: config.fundingResearch.rollingHardHoldingMs,
     stablecoinRiskBps: config.fundingResearch.stablecoinRiskBps,
+    horizonHours: config.fundingArbitrage.scanHorizonHours,
+    makerFillProbability: config.fundingResearch.makerFillProbability,
+    makerLegRiskBps: config.fundingResearch.makerLegRiskBps,
+    spotMarket: spotMarketReader,
   });
   const fundingScannerAssets = [...new Set([
     ...config.fundingArbitrage.scanAssets,
@@ -740,6 +747,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         liquidityDepthBps: config.fundingResearch.liquidityDepthBps,
         maxPairsPerAsset: config.fundingResearch.maxPairsPerAsset,
         stablecoinRiskBps: config.fundingResearch.stablecoinRiskBps,
+        persistenceStats: (longSymbol, shortSymbol, nowMs) => readFundingPersistence(
+          database, longSymbol, shortSymbol, nowMs,
+        ),
         onFundingData: async (funding, fees, observations) => {
           // 实盘监控和模拟盘共享同一份认证快照，避免重复请求 funding_info 与费率接口。
           const results = await Promise.allSettled([
@@ -1053,6 +1063,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     }, 10_000);
     executionHealthMonitorTimer.unref?.();
     fundingHistoryService.startBackground();
+    fundingHistoryService.trackSymbols(fundingScannerAssets.flatMap((asset) => (
+      EXECUTION_VENUES.map((venue) => crossExFutureSymbol(venue, asset))
+    )));
     databaseMaintenanceTimer = setInterval(() => {
       try {
         const result = runDatabaseMaintenance(database);

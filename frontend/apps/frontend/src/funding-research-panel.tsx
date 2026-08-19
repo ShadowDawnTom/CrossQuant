@@ -37,6 +37,11 @@ const reasonLabel: Record<string, string> = {
   hold_value_not_positive: '继续持有价值连续不为正', funding_direction_reversed: '资金费方向翻转',
   soft_review_due: '滚动组达到72小时重点观察', hard_holding_limit: '滚动组达到7天硬上限',
   settlement_guard_active: '处于结算保护窗口', funding_schedule_unavailable: '结算计划不可用',
+  crossed_order_book: '本地盘口交叉，已隔离并重建', executable_taker_baseline: '四笔 Taker 基准',
+  counterfactual_fill_adjusted: '按挂单成交概率折算', same_venue_cash_and_carry: '同所现货/永续现金套利',
+  maker_fee_missing: 'Maker 费率缺失', spot_perp_not_supported_for_candidate: '该组合暂无同所现货对冲',
+  spot_bbo_depth_insufficient: '现货最优档深度不足', spot_perp_fee_or_price_missing: '现货套利费率或价格缺失',
+  spot_book_unavailable: '现货盘口暂不可用',
 };
 
 function reason(value: string): string {
@@ -88,7 +93,7 @@ export function FundingResearchPanel() {
         <i />{summary?.enabled ? '独立模拟运行中' : '探索模拟未开启'}
       </span>
     </header>
-    <p className="funding-research-notice">每轮从同步盘口和流动性过滤后的市场选择最优组合，同时开“一次结算验证组”和“滚动持仓组”；每组最多1个、目标每腿 {summary?.targetNotionalUsd ?? '5'} U。毛快照 APR 只表示当前费率外推，可执行保守净收益已扣盘口、四笔手续费、稳定币换算和风险缓冲。不会发送交易所订单。</p>
+    <p className="funding-research-notice">每轮从同步盘口和流动性过滤后的市场选择最优组合，对比一次结算、滚动持仓、Maker/Taker 反事实和同所现货/永续四条影子口径；目标每腿 {summary?.targetNotionalUsd ?? '5'} U，但合约步长可能抬高实际金额。毛快照 APR 只表示当前费率外推，所有研究都不会发送交易所订单。</p>
     {error && <p className="funding-paper-error" role="alert">研究数据读取失败：{error}</p>}
 
     <div className="funding-research-stats">
@@ -101,6 +106,24 @@ export function FundingResearchPanel() {
     </div>
     {summary && <div className="funding-research-stats">
       {summary.cohorts.map((item) => <span key={item.cohort}><small>{item.cohort === 'ONE_SETTLEMENT' ? '一次结算组' : '滚动持仓组'} 持仓/已平</small><strong>{item.openCount} / {item.closedCount}</strong><em>{decimal(item.cumulativePnl)} U</em></span>)}
+    </div>}
+    {summary && <div className="funding-research-opportunities">
+      <h3>P2 影子策略对比</h3>
+      <div className="research-observation-list">{(['TAKER_TAKER', 'MAKER_TAKER', 'SPOT_PERP'] as const).map((variant) => {
+        const item = summary.variants.find((row) => row.variant === variant);
+        const label = variant === 'TAKER_TAKER' ? '永续 Taker/Taker（一次结算 + 滚动）'
+          : variant === 'MAKER_TAKER' ? '永续 Maker/Taker 反事实' : '同所现货/永续';
+        return <article key={variant} className="research-observation"><div className="research-observation-title">
+          <strong>{label}</strong><em>{item ? `${item.asset} · ${reason(item.reason)}` : '等待首轮有效候选'}</em>
+        </div><div className="research-cost-grid">
+          <span><small>模型状态</small>{item?.state ?? '—'}</span>
+          <span><small>保守净收益年化</small>{percent(item?.expectedNetAnnualized)}</span>
+          <span><small>预计净 PnL</small>{decimal(item?.expectedNetPnl, 6)} U</span>
+          <span><small>手续费</small>{decimal(item?.tradingFees, 6)} U</span>
+          <span><small>成交概率</small>{item?.fillProbability == null ? '—' : percent(item.fillProbability)}</span>
+          <span><small>回本时间</small>{item?.breakEvenHours ? `${decimal(item.breakEvenHours, 1)}h` : '不可达'}</span>
+        </div></article>;
+      })}</div>
     </div>}
 
     <div className="funding-research-funnel">
@@ -124,7 +147,7 @@ export function FundingResearchPanel() {
               </div>
               <div className="research-cost-grid">
                 <span><small>实际合法数量</small>{item.quantity ?? '—'}</span>
-                <span><small>每腿名义</small>{decimal(item.entryLongNotional, 2)} / {decimal(item.entryShortNotional, 2)} U</span>
+                <span><small>目标 / 实际每腿</small>{decimal(item.requestedNotionalUsd, 2)} → {decimal(item.entryLongNotional, 2)} / {decimal(item.entryShortNotional, 2)} U</span>
                 <span><small>毛快照 APR</small>{percent(item.rawAnnualized)}</span>
                 <span><small>可执行保守净收益年化</small>{percent(item.netAnnualized)}</span>
                 <span><small>24h 原始资金费</small>{decimal(item.rawFundingPnl, 6)} U</span>
@@ -140,7 +163,9 @@ export function FundingResearchPanel() {
                 <span><small>报价 / USD 汇率</small>{item.longQuote} {decimal(item.longQuoteToUsd, 5)} / {item.shortQuote} {decimal(item.shortQuoteToUsd, 5)}</span>
                 <span><small>优势持续</small>{item.edgeDurationMinutes === undefined ? '—' : `${item.edgeDurationMinutes} 分钟`}</span>
                 <span><small>24h 方向翻转</small>{item.directionFlips24h ?? '—'} 次</span>
-                <span><small>模拟结算命中率</small>{item.settlementHitRate == null ? '—' : `${percent(item.settlementHitRate)} (${item.settlementSamples})`}</span>
+                <span><small>真实历史结算命中率</small>{item.settlementHitRate == null ? '样本积累中' : `${percent(item.settlementHitRate)} (${item.settlementSamples})`}</span>
+                <span><small>实际采用持续率</small>{percent(item.retentionFactorUsed)}</span>
+                <span><small>历史日收益 P10 / 中位</small>{percent(item.historicalEdgeP10)} / {percent(item.historicalEdgeMedian)}</span>
               </div>
             </article>)}</div>}
     </div>
@@ -163,6 +188,7 @@ export function FundingResearchPanel() {
               <span><small>下一结算</small>{time(position.nextSettlementAt)}</span>
               <span><small>入场毛快照 APR</small>{percent(position.entryRawAnnualized)}</span>
               <span><small>入场保守净收益年化</small>{percent(position.entryNetAnnualized)}</span>
+              <span><small>平仓后最早重开</small>{time(position.reopenAfter)}</span>
             </div>
             <div className="paper-position-actions">
               <small>{reason(position.lastReason ?? 'research_waiting_first_settlement')} · 开仓 {time(position.openedAt)}</small>
@@ -171,7 +197,7 @@ export function FundingResearchPanel() {
             {selectedId === position.id && <div className="paper-position-details">
               <div><h4>模拟资金费结算</h4>{settlements.length === 0 ? <p>等待生成结算事件。</p> : settlements.slice(0, 12).map((item) =>
                 <p key={item.id}><span>{item.venue} {item.side} · {time(item.fundingTime)}</span>
-                  <span>{decimal(item.expectedAmount, 6)} → {decimal(item.amount, 6)} U</span><strong>{item.state}</strong></p>)}</div>
+                  <span>{decimal(item.expectedAmount, 6)} → {decimal(item.amount, 6)} U</span><strong>{item.state} · {item.amountSource === 'PREDICTED_SNAPSHOT' ? '预测模拟' : item.amountSource}</strong></p>)}</div>
               <div><h4>研究评估时间线</h4>{evaluations.length === 0 ? <p>等待首轮评估。</p> : evaluations.slice(0, 12).map((item) =>
                 <p key={item.id}><span>{time(item.observedAt)}</span><span>{item.decision} · {reason(item.reason)}</span>
                   <strong>{decimal(item.currentExitPnl)} U</strong></p>)}</div>

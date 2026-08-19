@@ -137,7 +137,7 @@ const publicMarketGateway = {
       quote: 'USDT',
       fundingRate8h: venue === 'GATE' ? '0.00013' : '0.0001',
       nextFundingAt: '2030-01-01T08:00:00.000Z',
-      openInterestValue: venue === 'GATE' ? '2500000' : '2200000',
+      openInterestValue: venue === 'GATE' ? '25000000' : '22000000',
       lastPrice: venue === 'GATE' ? '64000' : '64010',
       change24h: venue === 'GATE' ? '0.0125' : '-0.01',
     }];

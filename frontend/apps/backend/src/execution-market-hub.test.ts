@@ -51,6 +51,15 @@ describe('OrderBookReplica', () => {
     expect(book.apply({ ...delta(31, 31, 30), bids: [], asks: [], exchangeTimestamp: Date.now() }, 'previous')).toBe(true);
     expect(book.state.receivedAt).toBe(Date.now());
   });
+
+  it('fails closed when a snapshot or incremental update crosses the local book', () => {
+    const book = new OrderBookReplica('GATE', 'BTC');
+    expect(book.seed([['102', '1']], [['101', '1']], 1, Date.now(), Date.now())).toBe(false);
+    expect(book.state).toMatchObject({ synchronized: false, lastError: 'crossed_order_book' });
+    expect(book.seed([['100', '1']], [['101', '1']], 2, Date.now(), Date.now())).toBe(true);
+    expect(book.apply({ ...delta(3, 3), bids: [['102', '1']], asks: [] }, 'range')).toBe(false);
+    expect(book.state).toMatchObject({ synchronized: false, lastError: 'crossed_order_book' });
+  });
 });
 
 describe('venue payload parsing', () => {
@@ -71,6 +80,27 @@ describe('venue payload parsing', () => {
     expect(book.state.sequence).toBe(12);
     expect(book.state.bids.get('100')).toBe('2');
     expect(book.state.asks.get('101')).toBe('3');
+  });
+
+  it('atomically replaces a Gate book when full=true and maps Bybit thousand contracts', () => {
+    const hub = new ExecutionMarketHub(fetch, { symbols: ['BTC', 'PEPE'] });
+    const internal = hub as unknown as {
+      books: Map<string, OrderBookReplica>;
+      multipliers: Map<string, string>;
+      onGate: (message: Record<string, unknown>) => void;
+      onBybit: (message: Record<string, unknown>) => void;
+    };
+    internal.multipliers.set('GATE:BTC', '1');
+    const book = internal.books.get('GATE:BTC')!;
+    book.seed([['99', '1']], [['103', '1']], 10, Date.now(), Date.now());
+    internal.onGate({ channel: 'futures.order_book_update', event: 'update', result: {
+      full: true, s: 'BTC_USDT', U: 11, u: 12, t: Date.now(), b: [{ p: '100', s: '2' }], a: [{ p: '101', s: '3' }],
+    } });
+    expect([...book.state.bids.entries()]).toEqual([['100', '2']]);
+    expect([...book.state.asks.entries()]).toEqual([['101', '3']]);
+    internal.onBybit({ op: 'subscribe', req_id: 'book:PEPE', success: false, ret_msg: 'bad topic' });
+    expect(internal.books.get('BYBIT:PEPE')!.state.lastError).toBe('subscription_rejected:bad topic');
+    expect(nativeSymbol('BYBIT', 'PEPE')).toBe('1000PEPEUSDT');
   });
 
   it('同步 Kraken、Hyperliquid 与 Deribit 的原生盘口语义', () => {

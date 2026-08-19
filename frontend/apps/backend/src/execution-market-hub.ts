@@ -221,6 +221,8 @@ export function nativeSymbol(venue: ExecutionVenue, base: string): string {
   }
   if (venue === 'HYPERLIQUID') return base;
   if (venue === 'DERIBIT') return `${base}_USDC-PERPETUAL`;
+  // 各所对千倍面值合约的命名不统一，必须在原生行情层做映射，不能让一个错误主题拖垮整批订阅。
+  if (venue === 'BYBIT' && base === 'PEPE') return '1000PEPEUSDT';
   return `${base}USDT`;
 }
 
@@ -244,6 +246,14 @@ function sortedLevels(source: Map<string, string>, descending: boolean): Level[]
     .slice(0, MAX_PUBLISHED_LEVELS);
 }
 
+function bookIsUncrossed(bids: Map<string, string>, asks: Map<string, string>): boolean {
+  const bestBid = sortedLevels(bids, true)[0];
+  const bestAsk = sortedLevels(asks, false)[0];
+  // 单侧暂时为空会由 isLive 拒绝，但仍要保留序列以便下一条增量恢复；只有两侧都有价时才判断交叉。
+  if (!bestBid || !bestAsk) return true;
+  return new Decimal(bestBid[0]).lt(bestAsk[0]);
+}
+
 /**
  * 单个交易所盘口副本。所有增量先过序列检查，断序时立即失效，禁止继续提供可交易行情。
  */
@@ -259,6 +269,8 @@ export class OrderBookReplica {
     this.state.synchronized = false;
     this.state.rebuilding = true;
     this.state.sequence = null;
+    this.state.bids.clear();
+    this.state.asks.clear();
     this.state.buffered = [];
     this.state.rebuilds += 1;
     this.state.lastError = reason;
@@ -275,15 +287,28 @@ export class OrderBookReplica {
     return true;
   }
 
-  seed(bids: Level[], asks: Level[], sequence: number, exchangeTimestamp: number, receivedAt: number): void {
-    this.state.bids = new Map(bids.filter(([, quantity]) => Number(quantity) > 0));
-    this.state.asks = new Map(asks.filter(([, quantity]) => Number(quantity) > 0));
+  seed(bids: Level[], asks: Level[], sequence: number, exchangeTimestamp: number, receivedAt: number): boolean {
+    const nextBids = new Map(bids.filter(([, quantity]) => Number(quantity) > 0));
+    const nextAsks = new Map(asks.filter(([, quantity]) => Number(quantity) > 0));
+    if (!bookIsUncrossed(nextBids, nextAsks)) {
+      this.state.bids.clear();
+      this.state.asks.clear();
+      this.state.sequence = null;
+      this.state.synchronized = false;
+      this.state.rebuilding = false;
+      this.state.lastError = 'crossed_order_book';
+      this.state.sequenceGaps += 1;
+      return false;
+    }
+    this.state.bids = nextBids;
+    this.state.asks = nextAsks;
     this.state.sequence = sequence;
     this.state.exchangeTimestamp = exchangeTimestamp;
     this.state.receivedAt = receivedAt;
     this.state.synchronized = true;
     this.state.rebuilding = false;
     this.state.lastError = null;
+    return true;
   }
 
   apply(delta: Delta, mode: 'range' | 'previous' | 'monotonic'): boolean {
@@ -308,6 +333,12 @@ export class OrderBookReplica {
     }
     applyLevels(this.state.bids, delta.bids);
     applyLevels(this.state.asks, delta.asks);
+    if (!bookIsUncrossed(this.state.bids, this.state.asks)) {
+      this.gap('crossed_order_book');
+      this.state.bids.clear();
+      this.state.asks.clear();
+      return false;
+    }
     this.state.sequence = delta.last;
     this.state.exchangeTimestamp = delta.exchangeTimestamp;
     this.state.receivedAt = Date.now();
@@ -336,6 +367,7 @@ export class ExecutionMarketHub {
   private readonly bootstrapTasks = new Map<string, Promise<void>>();
   private readonly bootstrapAttempts = new Map<string, number>();
   private readonly bootstrapTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly venueCooldownUntil = new Map<ExecutionVenue, number>();
   private readonly endpoints: Record<ExecutionVenue, { rest: string; websocket: string }>;
   private readonly maxBookAgeMs: number;
   private readonly maxExchangeSkewMs: number;
@@ -507,7 +539,8 @@ export class ExecutionMarketHub {
       if (this.stopped || connection.socket !== socket) return socket.close();
       if (connection.handshakeTimer) clearTimeout(connection.handshakeTimer);
       connection.handshakeTimer = null;
-      connection.state = 'healthy';
+      // TCP 握手成功不等于订阅成功；至少收到一本有效快照后才能对外宣称行情连接健康。
+      connection.state = 'connecting';
       // 连接至少稳定 30 秒后才重置退避；“刚连上就被踢”的错误订阅不能制造重连风暴。
       if (connection.stabilityTimer) clearTimeout(connection.stabilityTimer);
       connection.stabilityTimer = setTimeout(() => {
@@ -518,7 +551,8 @@ export class ExecutionMarketHub {
       for (const base of this.venueSymbols(venue)) {
         const book = this.books.get(this.key(venue, base))!;
         const generation = book.beginRebuild('connection_opened');
-        this.requestBootstrap(venue, base, book, generation);
+        // Bybit 的 orderbook 主题首包本身就是完整快照。避免 30 个 REST 初始化请求触发 IP 级封禁。
+        if (venue !== 'BYBIT') this.requestBootstrap(venue, base, book, generation);
       }
       connection.heartbeatTimer = setInterval(() => {
         if (socket.readyState !== WebSocket.OPEN) return;
@@ -580,15 +614,17 @@ export class ExecutionMarketHub {
     if (venue === 'GATE') {
       for (const base of symbols) socket.send(JSON.stringify({
         time: Math.floor(Date.now() / 1_000), channel: 'futures.order_book_update', event: 'subscribe',
-        // Gate 的 level 过滤会漏掉范围外变化，但 update id 仍覆盖完整盘口，进而制造假断序。
-        payload: [nativeSymbol(venue, base), '100ms'],
+        // REST 初始化固定取 100 档，因此 WS 也必须订阅 100 档，否则本地深度会逐步错位。
+        payload: [nativeSymbol(venue, base), '100ms', '100'],
       }));
     } else if (venue === 'BINANCE') {
       socket.send(JSON.stringify({ method: 'SUBSCRIBE', params: symbols.map((base) => `${nativeSymbol(venue, base).toLowerCase()}@depth@100ms`), id: Date.now() }));
     } else if (venue === 'OKX') {
       socket.send(JSON.stringify({ op: 'subscribe', args: symbols.map((base) => ({ channel: 'books', instId: nativeSymbol(venue, base) })) }));
     } else if (venue === 'BYBIT') {
-      socket.send(JSON.stringify({ op: 'subscribe', args: symbols.map((base) => `orderbook.200.${nativeSymbol(venue, base)}`) }));
+      // 单个无效合约不能污染整所订阅；req_id 也让失败 ACK 能准确落到对应盘口。
+      for (const base of symbols) socket.send(JSON.stringify({ req_id: `book:${base}`, op: 'subscribe',
+        args: [`orderbook.200.${nativeSymbol(venue, base)}`] }));
     } else if (venue === 'KRAKEN') {
       for (const base of symbols) socket.send(JSON.stringify({ event: 'subscribe', feed: 'book',
         product_ids: [nativeSymbol(venue, base)] }));
@@ -614,6 +650,10 @@ export class ExecutionMarketHub {
     else if (venue === 'KRAKEN') this.onKraken(message);
     else if (venue === 'HYPERLIQUID') this.onHyperliquid(message);
     else this.onDeribit(message);
+    const connection = this.connections.get(venue)!;
+    if (this.venueSymbols(venue).some((base) => this.books.get(this.key(venue, base))!.state.synchronized)) {
+      connection.state = 'healthy';
+    }
   }
 
   private onGate(message: Record<string, unknown>): void {
@@ -624,7 +664,16 @@ export class ExecutionMarketHub {
     const base = this.symbols.find((item) => nativeSymbol('GATE', item) === symbol);
     const first = finiteInteger(result.U); const last = finiteInteger(result.u);
     const bids = levels(result.b, this.multiplier('GATE', base)); const asks = levels(result.a, this.multiplier('GATE', base));
-    if (!base || first === null || last === null || !bids || !asks) return;
+    if (!base || last === null || !bids || !asks) return;
+    if (result.full === true) {
+      const book = this.books.get(this.key('GATE', base))!;
+      if (!book.seed(bids, asks, last, finiteInteger(result.t) ?? Date.now(), Date.now())) {
+        const generation = book.beginRebuild(book.state.lastError);
+        this.requestBootstrap('GATE', base, book, generation);
+      }
+      return;
+    }
+    if (first === null) return;
     this.applyOrRebuild('GATE', base, { first, last, previous: null, exchangeTimestamp: finiteInteger(result.t) ?? Date.now(), bids, asks }, 'range');
   }
 
@@ -659,6 +708,18 @@ export class ExecutionMarketHub {
   }
 
   private onBybit(message: Record<string, unknown>): void {
+    if (message.op === 'subscribe') {
+      const requestId = typeof message.req_id === 'string' ? message.req_id : '';
+      const base = requestId.startsWith('book:') ? requestId.slice(5) : '';
+      if (base && message.success === false) {
+        const state = this.books.get(this.key('BYBIT', base))?.state;
+        if (state) {
+          state.synchronized = false;
+          state.lastError = `subscription_rejected:${String(message.ret_msg ?? 'unknown')}`;
+        }
+      }
+      return;
+    }
     if (typeof message.topic !== 'string' || !message.topic.startsWith('orderbook.200.')) return;
     const row = object(message.data);
     if (!row || typeof row.s !== 'string') return;
@@ -668,7 +729,9 @@ export class ExecutionMarketHub {
     if (!base || updateId === null || !bids || !asks) return;
     const book = this.books.get(this.key('BYBIT', base))!;
     if (message.type === 'snapshot' || updateId === 1) {
-      book.seed(bids, asks, updateId, finiteInteger(message.ts) ?? finiteInteger(row.cts) ?? Date.now(), Date.now());
+      if (!book.seed(bids, asks, updateId, finiteInteger(message.ts) ?? finiteInteger(row.cts) ?? Date.now(), Date.now())) {
+        this.connections.get('BYBIT')?.socket?.terminate();
+      }
       return;
     }
     // `seq` 是跨频道序号，不能拿来判断本频道连续性；本地盘口按 update id 严格连续，疑似丢包就重建。
@@ -753,6 +816,11 @@ export class ExecutionMarketHub {
       return;
     }
     if (!book.apply(delta, mode) && !book.state.rebuilding) {
+      // Bybit 的 WS 快照就是权威初始化源；断序后重连可重新获得全量快照，也避免 REST 限频风暴。
+      if (venue === 'BYBIT') {
+        this.connections.get('BYBIT')?.socket?.terminate();
+        return;
+      }
       const generation = book.beginRebuild(book.state.lastError);
       this.requestBootstrap(venue, base, book, generation);
     }
@@ -769,6 +837,16 @@ export class ExecutionMarketHub {
   private requestBootstrap(venue: ExecutionVenue, base: string, book: OrderBookReplica, generation: number): void {
     const key = this.key(venue, base);
     if (this.stopped || this.bootstrapTasks.has(key) || this.bootstrapTimers.has(key)) return;
+    const venueCooldown = this.venueCooldownUntil.get(venue) ?? 0;
+    if (venueCooldown > Date.now()) {
+      const timer = setTimeout(() => {
+        this.bootstrapTimers.delete(key);
+        this.requestBootstrap(venue, base, book, book.state.generation);
+      }, venueCooldown - Date.now());
+      timer.unref?.();
+      this.bootstrapTimers.set(key, timer);
+      return;
+    }
     const task = this.bootstrap(venue, base, book, generation)
       .then(() => { this.bootstrapAttempts.delete(key); })
       .catch((error: unknown) => {
@@ -776,8 +854,11 @@ export class ExecutionMarketHub {
         book.state.lastError = error instanceof Error ? error.message : 'snapshot_bootstrap_failed';
         const attempts = (this.bootstrapAttempts.get(key) ?? 0) + 1;
         this.bootstrapAttempts.set(key, attempts);
-        // 418/429 表示交易所已限流，必须长冷却；其他故障也使用指数退避，禁止增量触发 REST 风暴。
-        const delay = error instanceof SnapshotHttpError && (error.status === 418 || error.status === 429)
+        // Bybit 的 403 access-too-frequent 是 IP 级封禁；全所共享冷却，不能让逐币重试自维持封禁。
+        const rateLimited = error instanceof SnapshotHttpError
+          && (error.status === 418 || error.status === 429 || (venue === 'BYBIT' && error.status === 403));
+        if (rateLimited) this.venueCooldownUntil.set(venue, Date.now() + Math.max(this.rateLimitCooldownMs, error.retryAfterMs ?? 0));
+        const delay = rateLimited
           ? Math.max(this.rateLimitCooldownMs, error.retryAfterMs ?? 0)
           : Math.min(30_000, this.bootstrapBaseMs * 2 ** Math.min(attempts - 1, 5));
         const timer = setTimeout(() => {

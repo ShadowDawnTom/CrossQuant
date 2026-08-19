@@ -361,7 +361,7 @@ test.describe.serial('local trading terminal', () => {
     await expect(page.getByRole('button', { name: 'Cumulative 30d', exact: true })).toHaveAttribute('aria-pressed', 'true');
   });
 
-  test('opens a paired position with the funding-arbitrage pair preconfigured', async ({ page }) => {
+  test('opens an executor-supported paired position with the funding-arbitrage pair preconfigured', async ({ page }) => {
     await page.goto('/funding-rates');
     const riskDialog = page.getByRole('dialog', { name: 'Risk disclaimer' });
     await riskDialog.waitFor({ state: 'visible', timeout: 1_000 }).catch(() => undefined);
@@ -378,27 +378,27 @@ test.describe.serial('local trading terminal', () => {
       return labelBounds ? Math.abs((headerBounds.left + headerBounds.width / 2) - (labelBounds.left + labelBounds.width / 2)) : Number.POSITIVE_INFINITY;
     });
     expect(arbHeaderCenterOffset).toBeLessThanOrEqual(1);
-    await page.getByRole('textbox', { name: 'Search asset' }).fill('HYPE');
+    await page.getByRole('textbox', { name: 'Search asset' }).fill('BTC');
 
-    const openStrategy = page.getByRole('button', { name: 'Open hedge strategy: HYPE, Long Bybit, Short Hyperliquid' });
+    const openStrategy = page.getByRole('button', { name: 'Open hedge strategy: BTC, Long Binance, Short Gate.io' });
     await expect(openStrategy).toBeVisible();
     await openStrategy.click();
 
     await expect(page).toHaveURL(/\/strategies\/paired-position$/);
-    await expect(page.getByRole('combobox', { name: 'Search asset' })).toHaveAttribute('placeholder', 'HYPEUSDC ↔ HYPEUSDT');
-    await expect(page.getByRole('combobox', { name: 'Exchange A' })).toHaveValue('hyperliquid');
-    await expect(page.getByRole('combobox', { name: 'Exchange B' })).toHaveValue('bybit');
+    await expect(page.getByRole('combobox', { name: 'Search asset' })).toHaveAttribute('placeholder', 'BTCUSDT PERP');
+    await expect(page.getByRole('combobox', { name: 'Exchange A' })).toHaveValue('gate');
+    await expect(page.getByRole('combobox', { name: 'Exchange B' })).toHaveValue('binance');
     await expect(page.getByLabel('Per-order quantity')).toHaveValue('');
     await expect(page.getByLabel('Per-order quantity')).toHaveAttribute('placeholder', 'e.g. 0.10');
     await expect(page.getByLabel('Total amount')).toHaveValue('');
     await expect(page.getByLabel('Total amount')).toHaveAttribute('placeholder', 'e.g. 1.00');
     await expect(page.getByLabel('Entry threshold')).toHaveValue('0');
-    await expect(page.locator('.strategy-leg').first().locator('.leg-top em')).toHaveText('Sell HYPEUSDC');
-    await expect(page.locator('.strategy-leg').last().locator('.leg-top em')).toHaveText('Buy HYPEUSDT');
-    await expect(page.locator('.strategy-leg').first()).toContainText('36.55');
-    await expect(page.locator('.strategy-leg').first()).toContainText('+0.0200%');
-    await expect(page.locator('.strategy-leg').last()).toContainText('36.5');
-    await expect(page.locator('.strategy-leg').last()).toContainText('-0.0100%');
+    await expect(page.locator('.strategy-leg').first().locator('.leg-top em')).toHaveText('Sell BTCUSDT');
+    await expect(page.locator('.strategy-leg').last().locator('.leg-top em')).toHaveText('Buy BTCUSDT');
+    await expect(page.locator('.strategy-leg').first()).toContainText('64,000');
+    await expect(page.locator('.strategy-leg').first()).toContainText('+0.0130%');
+    await expect(page.locator('.strategy-leg').last()).toContainText('64,010');
+    await expect(page.locator('.strategy-leg').last()).toContainText('+0.0100%');
     await expect(page.getByRole('button', { name: 'Exchange A leverage: 1×' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Exchange B leverage: 1×' })).toBeVisible();
     await expect(page.locator('.strategy-history-tabs > button')).toHaveText([
@@ -424,8 +424,8 @@ test.describe.serial('local trading terminal', () => {
     await expect.poll(() => page.evaluate(async () => {
       const response = await fetch('/api/markets');
       const snapshot = await response.json() as { markets: Array<{ asset: string; venue: string }> };
-      return snapshot.markets.filter((market) => market.asset === 'HYPE').map((market) => market.venue);
-    })).toEqual(expect.arrayContaining(['HYPERLIQUID', 'BYBIT']));
+      return snapshot.markets.filter((market) => market.asset === 'BTC').map((market) => market.venue);
+    })).toEqual(expect.arrayContaining(['GATE', 'BINANCE']));
   });
 
   test('fits a narrow viewport and matches the mobile baseline', async ({ page }) => {

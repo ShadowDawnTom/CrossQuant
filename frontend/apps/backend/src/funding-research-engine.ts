@@ -5,6 +5,7 @@ import type { GateFeeRate, GateFundingInfo } from './crossex-client.js';
 import { crossExFutureSymbol, type ExecutionMarketReader, type ExecutionVenue, usdLevels } from './execution-market-hub.js';
 import type { FundingScanObservation } from './funding-candidate-scanner.js';
 import { evaluateFundingHolding } from './funding-holding-model.js';
+import type { SpotMarketReader } from './spot-market-reader.js';
 
 type Level = readonly [price: string, quantity: string];
 
@@ -30,6 +31,10 @@ export interface FundingResearchOptions {
   rollingSoftReviewMs?: number;
   rollingHardHoldingMs?: number;
   stablecoinRiskBps?: string;
+  horizonHours?: number;
+  makerFillProbability?: string;
+  makerLegRiskBps?: string;
+  spotMarket?: SpotMarketReader;
 }
 
 export type FundingResearchCohort = 'ONE_SETTLEMENT' | 'ROLLING';
@@ -74,6 +79,7 @@ interface ResearchPositionRow {
   unprofitable_count: number;
   long_quote: string;
   short_quote: string;
+  reopen_after: string | null;
 }
 
 export interface FundingResearchPosition {
@@ -116,6 +122,7 @@ export interface FundingResearchPosition {
   unprofitableCount: number;
   longQuote: string;
   shortQuote: string;
+  reopenAfter: string | null;
 }
 
 export interface FundingResearchEvaluation {
@@ -148,6 +155,7 @@ export interface FundingResearchSettlement {
   expectedAmount: string;
   amount: string | null;
   state: string;
+  amountSource: string;
   settledAt: string | null;
 }
 
@@ -168,6 +176,26 @@ export interface FundingResearchSummary {
   positions: FundingResearchPosition[];
   cohorts: Array<{ cohort: FundingResearchCohort; openCount: number; closedCount: number;
     cumulativePnl: string; cumulativeFunding: string; cumulativeFees: string }>;
+  variants: FundingResearchVariant[];
+}
+
+export interface FundingResearchVariant {
+  id: string;
+  observationId: string;
+  evaluatedAt: string;
+  asset: string;
+  longVenue: string;
+  shortVenue: string;
+  variant: 'TAKER_TAKER' | 'MAKER_TAKER' | 'SPOT_PERP';
+  hedgeModel: 'PERP_PERP' | 'SPOT_PERP';
+  state: 'PRICED' | 'UNAVAILABLE';
+  expectedNetPnl: string | null;
+  expectedNetAnnualized: string | null;
+  tradingFees: string | null;
+  fillProbability: string | null;
+  breakEvenHours: string | null;
+  reason: string;
+  details: Record<string, unknown>;
 }
 
 function feeFor(fees: readonly GateFeeRate[], venue: ExecutionVenue, marketSymbol: string): Decimal | null {
@@ -176,6 +204,17 @@ function feeFor(fees: readonly GateFeeRate[], venue: ExecutionVenue, marketSymbo
   try {
     return new Decimal(row.special_fee_list?.find((item) => item.symbol === marketSymbol)?.taker_fee_rate
       ?? row.future_taker_fee);
+  } catch {
+    return null;
+  }
+}
+
+function makerFeeFor(fees: readonly GateFeeRate[], venue: ExecutionVenue, marketSymbol: string): Decimal | null {
+  const row = fees.find((item) => item.exchange_type === venue);
+  if (!row) return null;
+  try {
+    return new Decimal(row.special_fee_list?.find((item) => item.symbol === marketSymbol)?.maker_fee_rate
+      ?? row.future_maker_fee);
   } catch {
     return null;
   }
@@ -221,6 +260,7 @@ function fromPosition(row: ResearchPositionRow): FundingResearchPosition {
     lastEvaluatedAt: row.last_evaluated_at, updatedAt: row.updated_at,
     unprofitableCount: row.unprofitable_count,
     longQuote: row.long_quote, shortQuote: row.short_quote,
+    reopenAfter: row.reopen_after,
   };
 }
 
@@ -258,6 +298,14 @@ function observationFromRow(row: Record<string, unknown>): FundingScanObservatio
     executionSupport: String(row.execution_support ?? 'LIVE_READY') as FundingScanObservation['executionSupport'],
     cohortClone: Number(row.cohort_clone ?? 0) === 1,
     stablecoinRiskBuffer: row.stablecoin_risk_buffer === null ? null : String(row.stablecoin_risk_buffer),
+    dataValid: Number(row.data_valid ?? 1) === 1,
+    invalidReason: row.invalid_reason === null ? null : String(row.invalid_reason),
+    persistenceProbability: row.persistence_probability === null ? null : String(row.persistence_probability),
+    persistenceSamples: Number(row.persistence_samples ?? 0),
+    retentionFactorUsed: row.retention_factor_used === null ? undefined : String(row.retention_factor_used),
+    historicalEdgeP10: row.historical_edge_p10 === null ? null : String(row.historical_edge_p10),
+    historicalEdgeMedian: row.historical_edge_median === null ? null : String(row.historical_edge_median),
+    requestedNotionalUsd: row.requested_notional_usd === null ? undefined : String(row.requested_notional_usd),
   };
 }
 
@@ -292,6 +340,7 @@ export class FundingResearchEngine {
       ORDER BY observed_at DESC, id DESC LIMIT 1`).get() as { scan_id: string } | undefined;
     if (!last) return [];
     const rows = (this.database.prepare(`SELECT * FROM funding_scan_observations WHERE scan_id = ? AND cohort_clone = 0
+      AND data_valid = 1
       ORDER BY research_eligible DESC, strict_eligible DESC,
       CASE WHEN net_annualized IS NULL THEN 1 ELSE 0 END, CAST(net_annualized AS REAL) DESC`)
       .all(last.scan_id) as Array<Record<string, unknown>>).map(observationFromRow);
@@ -307,12 +356,12 @@ export class FundingResearchEngine {
       COALESCE(SUM(strict_eligible), 0) AS liveEligible,
       COALESCE(SUM(research_eligible), 0) AS researchEligible,
       COALESCE(SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END), 0) AS rejected
-      FROM funding_scan_observations WHERE observed_at >= ? AND cohort_clone = 0`).get(dayAgo) as Record<string, number>;
+      FROM funding_scan_observations WHERE observed_at >= ? AND cohort_clone = 0 AND data_valid = 1`).get(dayAgo) as Record<string, number>;
     const rejectionReasons = this.database.prepare(`SELECT primary_reason AS reason, COUNT(*) AS count
-      FROM funding_scan_observations WHERE observed_at >= ? AND status = 'REJECTED' AND cohort_clone = 0
+      FROM funding_scan_observations WHERE observed_at >= ? AND status = 'REJECTED' AND cohort_clone = 0 AND data_valid = 1
       GROUP BY primary_reason ORDER BY count DESC, reason LIMIT 20`).all(dayAgo) as Array<{ reason: string; count: number }>;
     const latestObservations = !lastScan ? [] : (this.database.prepare(`SELECT * FROM funding_scan_observations
-      WHERE scan_id = ? AND cohort_clone = 0 ORDER BY research_eligible DESC, strict_eligible DESC,
+      WHERE scan_id = ? AND cohort_clone = 0 AND data_valid = 1 ORDER BY research_eligible DESC, strict_eligible DESC,
       CASE WHEN net_annualized IS NULL THEN 1 ELSE 0 END, CAST(net_annualized AS REAL) DESC LIMIT 40`)
       .all(lastScan.scan_id) as Array<Record<string, unknown>>).map(observationFromRow)
       .map((item) => this.withHistoryStats(item, dayAgo));
@@ -342,13 +391,33 @@ export class FundingResearchEngine {
       closedCount: closed.length,
       cumulativePnl: closed.reduce((total, position) => total.plus(position.total_pnl), new Decimal(0)).toString(),
       cumulativeFunding: ledger.reduce((total, position) => total.plus(position.funding_pnl), new Decimal(0)).toString(),
-      cumulativeFees: fees.toString(), positions, cohorts,
+      cumulativeFees: fees.toString(), positions, cohorts, variants: this.latestVariants(),
     };
+  }
+
+  private latestVariants(): FundingResearchVariant[] {
+    const rows = this.database.prepare(`SELECT variants.*, observations.asset, observations.long_venue,
+      observations.short_venue FROM funding_research_variants variants
+      JOIN funding_scan_observations observations ON observations.id = variants.observation_id
+      ORDER BY variants.evaluated_at DESC LIMIT 60`).all() as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: String(row.id), observationId: String(row.observation_id), evaluatedAt: String(row.evaluated_at),
+      asset: String(row.asset), longVenue: String(row.long_venue), shortVenue: String(row.short_venue),
+      variant: String(row.variant) as FundingResearchVariant['variant'],
+      hedgeModel: String(row.hedge_model) as FundingResearchVariant['hedgeModel'],
+      state: String(row.state) as FundingResearchVariant['state'],
+      expectedNetPnl: row.expected_net_pnl === null ? null : String(row.expected_net_pnl),
+      expectedNetAnnualized: row.expected_net_annualized === null ? null : String(row.expected_net_annualized),
+      tradingFees: row.trading_fees === null ? null : String(row.trading_fees),
+      fillProbability: row.fill_probability === null ? null : String(row.fill_probability),
+      breakEvenHours: row.break_even_hours === null ? null : String(row.break_even_hours),
+      reason: String(row.reason), details: JSON.parse(String(row.details_json)) as Record<string, unknown>,
+    }));
   }
 
   private withHistoryStats(observation: FundingScanObservation, dayAgo: string): FundingScanObservation {
     const directions = this.database.prepare(`SELECT observed_at, long_venue, short_venue, raw_funding_pnl
-      FROM funding_scan_observations WHERE asset = ? AND observed_at >= ? AND cohort_clone = 0
+      FROM funding_scan_observations WHERE asset = ? AND observed_at >= ? AND cohort_clone = 0 AND data_valid = 1
       AND ((long_venue = ? AND short_venue = ?) OR (long_venue = ? AND short_venue = ?))
       ORDER BY observed_at DESC`).all(observation.asset, dayAgo, observation.longVenue, observation.shortVenue,
       observation.shortVenue, observation.longVenue) as Array<{ observed_at: string; long_venue: string;
@@ -369,17 +438,12 @@ export class FundingResearchEngine {
         edgeIsContinuous = false;
       }
     }
-    const settlements = this.database.prepare(`SELECT funding_pnl FROM funding_research_positions
-      WHERE asset = ? AND settled_events > 0
-      AND ((long_venue = ? AND short_venue = ?) OR (long_venue = ? AND short_venue = ?))`)
-      .all(observation.asset, observation.longVenue, observation.shortVenue,
-        observation.shortVenue, observation.longVenue) as Array<{ funding_pnl: string }>;
-    const hits = settlements.filter((item) => new Decimal(item.funding_pnl).gt(0)).length;
     return { ...observation,
       edgeDurationMinutes: Math.max(0, Math.round((Date.parse(observation.observedAt) - Date.parse(edgeStart)) / 60_000)),
       directionFlips24h: flips,
-      settlementHitRate: settlements.length > 0 ? new Decimal(hits).div(settlements.length).toString() : null,
-      settlementSamples: settlements.length };
+      // 命中率来自交易所真实历史结算窗口，不再拿模拟到账结果冒充真实流水。
+      settlementHitRate: observation.persistenceProbability ?? null,
+      settlementSamples: observation.persistenceSamples ?? 0 };
   }
 
   details(id: string): { position: FundingResearchPosition; evaluations: FundingResearchEvaluation[];
@@ -405,6 +469,7 @@ export class FundingResearchEngine {
         side: String(item.side), fundingTime: String(item.funding_time), fundingRate: String(item.funding_rate),
         notionalUsd: String(item.notional_usd), expectedAmount: String(item.expected_amount),
         amount: item.amount === null ? null : String(item.amount), state: String(item.state),
+        amountSource: String(item.amount_source ?? 'PREDICTED_SNAPSHOT'),
         settledAt: item.settled_at === null ? null : String(item.settled_at),
       }));
     return { position: fromPosition(row), evaluations, settlements };
@@ -426,10 +491,15 @@ export class FundingResearchEngine {
       && item.entryShortNotional !== null && item.entryFees !== null && item.rawAnnualized !== null
       && item.netAnnualized !== null).sort((left, right) => new Decimal(right.netAnnualized!).cmp(left.netAnnualized!))[0];
     if (!best) return changed;
+    await this.recordVariants(best, fees, observedAt);
     for (const cohort of ['ONE_SETTLEMENT', 'ROLLING'] as const) {
       const openCount = (this.database.prepare(`SELECT COUNT(*) AS count FROM funding_research_positions
         WHERE state = 'OPEN' AND cohort = ?`).get(cohort) as { count: number }).count;
       if (openCount >= this.options.maxOpenPositions) continue;
+      const latestClosed = this.database.prepare(`SELECT reopen_after FROM funding_research_positions
+        WHERE state = 'CLOSED' AND cohort = ? ORDER BY closed_at DESC LIMIT 1`)
+        .get(cohort) as { reopen_after: string | null } | undefined;
+      if (latestClosed?.reopen_after && latestClosed.reopen_after > observedAt) continue;
       // observation_id 有历史唯一约束；第二组复制同一时点快照，保证两组入场基线完全一致。
       const cohortObservation = cohort === 'ONE_SETTLEMENT' ? best : { ...best, id: randomUUID(), cohortClone: true };
       if (cohort === 'ROLLING') this.persistObservations([cohortObservation]);
@@ -453,7 +523,8 @@ export class FundingResearchEngine {
        cohort_clone, stablecoin_risk_buffer)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     this.database.transaction(() => {
-      for (const item of observations) statement.run(item.id, item.scanId, item.observedAt, item.asset,
+      for (const item of observations) {
+        statement.run(item.id, item.scanId, item.observedAt, item.asset,
         item.longVenue, item.shortVenue, item.quantity, item.status, item.strictEligible ? 1 : 0,
         item.researchEligible ? 1 : 0, item.primaryReason, JSON.stringify(item.reasons), item.marketQuality,
         item.longRate, item.shortRate, item.longEvents, item.shortEvents, item.entryLongPrice,
@@ -463,8 +534,139 @@ export class FundingResearchEngine {
         item.netPnl, item.rawAnnualized, item.netAnnualized, item.breakEvenHours,
         item.entrySlippageBps, item.exitSlippageBps, item.basisBps, item.longQuote, item.shortQuote,
         item.longQuoteToUsd, item.shortQuoteToUsd, item.liquidityUsd, item.executionSupport, item.cohortClone ? 1 : 0,
-        item.stablecoinRiskBuffer);
+          item.stablecoinRiskBuffer);
+        this.database.prepare(`UPDATE funding_scan_observations SET data_valid = ?, invalid_reason = ?,
+          persistence_probability = ?, persistence_samples = ?, retention_factor_used = ?,
+          historical_edge_p10 = ?, historical_edge_median = ?, requested_notional_usd = ? WHERE id = ?`)
+          .run(item.dataValid === false ? 0 : 1, item.invalidReason ?? null, item.persistenceProbability ?? null,
+            item.persistenceSamples ?? 0, item.retentionFactorUsed ?? null, item.historicalEdgeP10 ?? null,
+            item.historicalEdgeMedian ?? null, item.requestedNotionalUsd ?? null, item.id);
+      }
     })();
+  }
+
+  private persistVariant(observation: FundingScanObservation, observedAt: string,
+    values: Omit<FundingResearchVariant, 'id' | 'observationId' | 'evaluatedAt' | 'asset' | 'longVenue' | 'shortVenue'>): void {
+    this.database.prepare(`INSERT INTO funding_research_variants
+      (id, observation_id, evaluated_at, variant, hedge_model, state, expected_net_pnl,
+       expected_net_annualized, trading_fees, fill_probability, break_even_hours, reason, details_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(observation_id, variant) DO UPDATE SET evaluated_at = excluded.evaluated_at,
+        state = excluded.state, expected_net_pnl = excluded.expected_net_pnl,
+        expected_net_annualized = excluded.expected_net_annualized, trading_fees = excluded.trading_fees,
+        fill_probability = excluded.fill_probability, break_even_hours = excluded.break_even_hours,
+        reason = excluded.reason, details_json = excluded.details_json`)
+      .run(randomUUID(), observation.id, observedAt, values.variant, values.hedgeModel, values.state,
+        values.expectedNetPnl, values.expectedNetAnnualized, values.tradingFees, values.fillProbability,
+        values.breakEvenHours, values.reason, JSON.stringify(values.details));
+  }
+
+  /**
+   * 同一候选同时保存三种执行口径。Maker 和现货组合都是反事实研究，绝不会创建交易订单。
+   */
+  private async recordVariants(observation: FundingScanObservation, fees: readonly GateFeeRate[], observedAt: string): Promise<void> {
+    if (!observation.netPnl || !observation.tradingFees || !observation.entryLongNotional
+      || !observation.entryShortNotional || !observation.conservativeFundingPnl || !observation.quantity) return;
+    const capital = new Decimal(observation.entryLongNotional).plus(observation.entryShortNotional).div(2);
+    const horizonHours = this.options.horizonHours ?? 24;
+    const annualized = (pnl: Decimal, basis: Decimal = capital) => pnl.div(basis).mul(8760).div(horizonHours);
+    this.persistVariant(observation, observedAt, {
+      variant: 'TAKER_TAKER', hedgeModel: 'PERP_PERP', state: 'PRICED',
+      expectedNetPnl: observation.netPnl, expectedNetAnnualized: observation.netAnnualized,
+      tradingFees: observation.tradingFees, fillProbability: '1', breakEvenHours: observation.breakEvenHours,
+      reason: 'executable_taker_baseline', details: { cohortModels: ['ONE_SETTLEMENT', 'ROLLING'] },
+    });
+
+    const longSymbol = crossExFutureSymbol(observation.longVenue, observation.asset);
+    const shortSymbol = crossExFutureSymbol(observation.shortVenue, observation.asset);
+    const longMaker = makerFeeFor(fees, observation.longVenue, longSymbol);
+    const shortMaker = makerFeeFor(fees, observation.shortVenue, shortSymbol);
+    const longTaker = feeFor(fees, observation.longVenue, longSymbol);
+    const shortTaker = feeFor(fees, observation.shortVenue, shortSymbol);
+    if (longMaker && shortMaker && longTaker && shortTaker && observation.exitLongPrice && observation.exitShortPrice) {
+      const quantity = new Decimal(observation.quantity);
+      const longTurnover = new Decimal(observation.entryLongNotional).plus(quantity.mul(observation.exitLongPrice));
+      const shortTurnover = new Decimal(observation.entryShortNotional).plus(quantity.mul(observation.exitShortPrice));
+      const makerLongFees = longTurnover.mul(longMaker).plus(shortTurnover.mul(shortTaker));
+      const makerShortFees = longTurnover.mul(longTaker).plus(shortTurnover.mul(shortMaker));
+      const mixedFees = Decimal.min(makerLongFees, makerShortFees);
+      const conditionalNet = new Decimal(observation.netPnl).plus(observation.tradingFees).minus(mixedFees);
+      const fillProbability = new Decimal(this.options.makerFillProbability ?? '0.35');
+      const failedHedgePenalty = capital.mul(this.options.makerLegRiskBps ?? '5').div(10_000);
+      const expectedNet = conditionalNet.mul(fillProbability)
+        .minus(failedHedgePenalty.mul(new Decimal(1).minus(fillProbability)));
+      const friction = mixedFees.plus(failedHedgePenalty).minus(new Decimal(observation.immediateRoundTripPnl ?? '0'));
+      const breakEven = new Decimal(observation.conservativeFundingPnl).gt(0)
+        ? Decimal.max(0, friction).mul(horizonHours).div(observation.conservativeFundingPnl) : null;
+      this.persistVariant(observation, observedAt, {
+        variant: 'MAKER_TAKER', hedgeModel: 'PERP_PERP', state: 'PRICED',
+        expectedNetPnl: expectedNet.toString(), expectedNetAnnualized: annualized(expectedNet).toString(),
+        tradingFees: mixedFees.toString(), fillProbability: fillProbability.toString(),
+        breakEvenHours: breakEven?.toString() ?? null, reason: 'counterfactual_fill_adjusted',
+        details: { conditionalNetPnl: conditionalNet.toString(), failedHedgePenalty: failedHedgePenalty.toString(),
+          makerLeg: makerLongFees.lte(makerShortFees) ? 'LONG' : 'SHORT' },
+      });
+    } else {
+      this.persistVariant(observation, observedAt, { variant: 'MAKER_TAKER', hedgeModel: 'PERP_PERP', state: 'UNAVAILABLE',
+        expectedNetPnl: null, expectedNetAnnualized: null, tradingFees: null, fillProbability: null,
+        breakEvenHours: null, reason: 'maker_fee_missing', details: {} });
+    }
+
+    await this.recordSpotPerpVariant(observation, fees, observedAt, capital, horizonHours);
+  }
+
+  private async recordSpotPerpVariant(observation: FundingScanObservation, fees: readonly GateFeeRate[],
+    observedAt: string, fallbackCapital: Decimal, horizonHours: number): Promise<void> {
+    const unavailable = (reason: string, details: Record<string, unknown> = {}) => this.persistVariant(observation, observedAt, {
+      variant: 'SPOT_PERP', hedgeModel: 'SPOT_PERP', state: 'UNAVAILABLE', expectedNetPnl: null,
+      expectedNetAnnualized: null, tradingFees: null, fillProbability: null, breakEvenHours: null, reason, details,
+    });
+    if (!this.options.spotMarket || !new Decimal(observation.shortRate).gt(0)
+      || !['GATE', 'BINANCE', 'OKX'].includes(observation.shortVenue)) {
+      unavailable('spot_perp_not_supported_for_candidate');
+      return;
+    }
+    try {
+      const spot = await this.options.spotMarket.query(observation.shortVenue, observation.asset);
+      const quantity = new Decimal(observation.quantity!);
+      if (new Decimal(spot.askSize).lt(quantity) || new Decimal(spot.bidSize).lt(quantity)) {
+        unavailable('spot_bbo_depth_insufficient', { availableBuy: spot.askSize, availableSell: spot.bidSize });
+        return;
+      }
+      const feeRow = fees.find((item) => item.exchange_type === observation.shortVenue);
+      const futureSymbol = crossExFutureSymbol(observation.shortVenue, observation.asset);
+      const futureFee = feeFor(fees, observation.shortVenue, futureSymbol);
+      if (!feeRow || !futureFee || !observation.entryShortPrice || !observation.exitShortPrice
+        || !observation.entryShortNotional) {
+        unavailable('spot_perp_fee_or_price_missing');
+        return;
+      }
+      const spotFee = new Decimal(feeRow.spot_taker_fee);
+      const spotEntry = quantity.mul(spot.askPrice);
+      const spotExit = quantity.mul(spot.bidPrice);
+      const futureEntry = new Decimal(observation.entryShortNotional);
+      const futureExit = quantity.mul(observation.exitShortPrice);
+      const pricePnl = spotExit.minus(spotEntry).plus(futureEntry).minus(futureExit);
+      const funding = futureEntry.mul(observation.shortRate).mul(observation.shortEvents)
+        .mul(observation.retentionFactorUsed ?? this.options.fundingRetentionFactor ?? '0.5');
+      const tradingFees = spotEntry.plus(spotExit).mul(spotFee).plus(futureEntry.plus(futureExit).mul(futureFee));
+      const capital = Decimal.max(spotEntry, fallbackCapital);
+      const risk = capital.mul(new Decimal(this.options.stressSlippageBps ?? '5')
+        .plus(this.options.adverseExitBasisBps ?? '10')).div(10_000);
+      const net = funding.plus(pricePnl).minus(tradingFees).minus(risk);
+      const friction = tradingFees.plus(risk).minus(pricePnl);
+      const breakEven = funding.gt(0) ? Decimal.max(0, friction).mul(horizonHours).div(funding) : null;
+      this.persistVariant(observation, observedAt, {
+        variant: 'SPOT_PERP', hedgeModel: 'SPOT_PERP', state: 'PRICED', expectedNetPnl: net.toString(),
+        expectedNetAnnualized: net.div(capital).mul(8760).div(horizonHours).toString(), tradingFees: tradingFees.toString(),
+        fillProbability: '1', breakEvenHours: breakEven?.toString() ?? null, reason: 'same_venue_cash_and_carry',
+        details: { venue: observation.shortVenue, spotEntry: spot.askPrice, spotExit: spot.bidPrice,
+          perpEntry: observation.entryShortPrice, perpExit: observation.exitShortPrice,
+          fundingPnl: funding.toString(), pricePnl: pricePnl.toString(), riskBuffer: risk.toString() },
+      });
+    } catch (error) {
+      unavailable('spot_book_unavailable', { error: error instanceof Error ? error.message : 'unknown' });
+    }
   }
 
   private open(observation: FundingScanObservation, funding: readonly GateFundingInfo[], observedAt: string,
@@ -573,6 +775,11 @@ export class FundingResearchEngine {
         decision = holding.decision;
         reason = holding.reason;
         unprofitableCount = holding.unprofitableCount;
+        if (decision === 'EXIT' && reason === 'hold_value_not_positive' && settledLegs < 2) {
+          // 研究组至少先观察两条腿各一次结算；普通收益判负不能在结算前制造两分钟开平仓循环。
+          decision = 'EXIT_PENDING';
+          reason = 'research_waiting_first_settlement';
+        }
         holdingDetails = { rawHoldingFunding: holding.rawFunding,
           conservativeHoldingFunding: holding.conservativeFunding, holdRiskBuffer: holding.riskBuffer,
           holdValue: holding.holdValue, fundingEdge: holding.fundingEdge,
@@ -598,7 +805,7 @@ export class FundingResearchEngine {
       basisBps.toString(), exitSlippageBps.toString(), settledEvents, nextSettlement.next, reason, unprofitableCount,
       observedAt, observedAt, position.id);
     if (decision === 'EXIT') this.close(position, observedAt, reason, longExit.average, shortExit.average,
-      exitFees, pricePnl, totalPnl, settledEvents);
+      exitFees, pricePnl, totalPnl, settledEvents, nextSettlement.next);
   }
 
   private refreshSettlements(positionId: string, asset: string, longVenue: ExecutionVenue,
@@ -679,14 +886,17 @@ export class FundingResearchEngine {
 
   private close(position: ResearchPositionRow, observedAt: string, reason: string,
     longExitPrice: Decimal, shortExitPrice: Decimal, exitFees: Decimal, pricePnl: Decimal,
-    totalPnl: Decimal, settledEvents: number): void {
+    totalPnl: Decimal, settledEvents: number, nextSettlementAt: string | null): void {
+    // 关闭后至少冷却到下一次结算，避免同一负收益快照一分钟后再次开仓烧手续费。
+    const fallback = new Date(Date.parse(observedAt) + 60 * 60_000).toISOString();
+    const reopenAfter = nextSettlementAt && nextSettlementAt > observedAt ? nextSettlementAt : fallback;
     this.database.transaction(() => {
       this.database.prepare(`UPDATE funding_research_positions SET state = 'CLOSED', monitor_state = 'EXIT',
         exit_long_price = ?, exit_short_price = ?, exit_fees = ?, price_pnl = ?, total_pnl = ?,
-        current_exit_pnl = ?, settled_events = ?, last_reason = ?, closed_at = ?, last_evaluated_at = ?, updated_at = ?
+        current_exit_pnl = ?, settled_events = ?, last_reason = ?, reopen_after = ?, closed_at = ?, last_evaluated_at = ?, updated_at = ?
         WHERE id = ? AND state = 'OPEN'`).run(longExitPrice.toString(), shortExitPrice.toString(),
         exitFees.toString(), pricePnl.toString(), totalPnl.toString(), totalPnl.toString(), settledEvents,
-        reason, observedAt, observedAt, observedAt, position.id);
+        reason, reopenAfter, observedAt, observedAt, observedAt, position.id);
       this.database.prepare(`UPDATE funding_research_settlements SET state = 'CANCELLED', updated_at = ?
         WHERE position_id = ? AND state = 'PENDING'`).run(observedAt, position.id);
     })();

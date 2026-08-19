@@ -95,6 +95,8 @@ export interface BackendConfig {
     stablecoinRiskBps: string;
     rollingSoftReviewMs: number;
     rollingHardHoldingMs: number;
+    makerFillProbability: string;
+    makerLegRiskBps: string;
   };
 }
 
@@ -363,6 +365,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       stablecoinRiskBps: parseNonNegativeDecimal(environment.GCT_FUNDING_RESEARCH_STABLECOIN_RISK_BPS ?? '5', 'GCT_FUNDING_RESEARCH_STABLECOIN_RISK_BPS'),
       rollingSoftReviewMs: fundingResearchRollingSoftReviewMs,
       rollingHardHoldingMs: fundingResearchRollingHardHoldingMs,
+      makerFillProbability: parseUnitInterval(environment.GCT_FUNDING_RESEARCH_MAKER_FILL_PROBABILITY ?? '0.35', 'GCT_FUNDING_RESEARCH_MAKER_FILL_PROBABILITY'),
+      makerLegRiskBps: parseNonNegativeDecimal(environment.GCT_FUNDING_RESEARCH_MAKER_LEG_RISK_BPS ?? '5', 'GCT_FUNDING_RESEARCH_MAKER_LEG_RISK_BPS'),
     },
   };
 }

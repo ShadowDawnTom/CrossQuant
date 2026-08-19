@@ -26,7 +26,8 @@ const PRUNE_INTERVAL_MS = ONE_DAY_MS;
 const HYPERLIQUID_TAIL_SPACING_MS = 2_000;
 const SYMBOL_VENUE = /^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT)_FUTURE_/;
 const DEFAULT_MAX_REQUEST_SYMBOLS = 50;
-const DEFAULT_MAX_BACKGROUND_SYMBOLS = 140;
+// 50 个资产 × 7 个交易所仍需完整保留在历史工作集，避免尾部交易所被 LRU 静默挤出。
+const DEFAULT_MAX_BACKGROUND_SYMBOLS = 350;
 
 export interface FundingHistoryServiceOptions {
   freshMs?: number;
@@ -87,6 +88,7 @@ export class FundingHistoryService {
   private readonly failures = new Map<string, { until: number; retryable: boolean }>();
   private readonly venueTails = new Map<string, Promise<void>>();
   private readonly venueLastStartedAt = new Map<string, number>();
+  private readonly venueCooldownUntil = new Map<string, number>();
   private readonly freshMs: number;
   private readonly backgroundIntervalMs: number;
   private readonly failureCacheMs: number;
@@ -151,6 +153,12 @@ export class FundingHistoryService {
     this.backgroundController?.abort();
     await this.backgroundRun;
     this.backgroundController = null;
+  }
+
+  /** 把策略扫描池加入后台真实结算历史工作集；这里只登记，不阻塞当前扫描或页面请求。 */
+  trackSymbols(symbols: readonly string[]): void {
+    for (const symbol of [...new Set(symbols)]) this.touchSymbol(symbol);
+    if (this.backgroundEnabled) void this.refreshCachedSymbols();
   }
 
   async loadMany(
@@ -386,6 +394,10 @@ export class FundingHistoryService {
   ): Promise<FundingHistoryEntry> {
     const endTime = this.now();
     const startTime = endTime - requiredWindowMs;
+    const venue = SYMBOL_VENUE.exec(symbol)?.[1] ?? 'UNKNOWN';
+    if ((this.venueCooldownUntil.get(venue) ?? 0) > endTime) {
+      return this.readEntry(symbol, endTime, requiredWindowMs);
+    }
     const coverage = readFundingHistoryCoverage(this.database, symbol);
     const coversWindow = coverage !== null && coverage.coveredFrom <= startTime;
     const tailIsFresh = coverage !== null && coverage.coveredTo >= endTime - this.freshMs;
@@ -413,10 +425,13 @@ export class FundingHistoryService {
           return this.readEntry(symbol, endTime, requiredWindowMs);
         }
         const reason = error instanceof Error ? error.message : 'PUBLIC_DATA_ERROR';
+        const bybitIpLimited = venue === 'BYBIT' && error instanceof PublicMarketDataError
+          && error.code === 'UPSTREAM_HTTP_403';
+        if (bybitIpLimited) this.venueCooldownUntil.set(venue, endTime + 10 * 60_000);
         recordFundingHistoryFailure(this.database, symbol, fetchedAt, reason);
         this.failures.set(symbol, {
-          until: endTime + this.failureCacheMs,
-          retryable: isRetryablePublicMarketDataError(error),
+          until: endTime + (bybitIpLimited ? 10 * 60_000 : this.failureCacheMs),
+          retryable: bybitIpLimited || isRetryablePublicMarketDataError(error),
         });
         this.warn(symbol, reason);
       }

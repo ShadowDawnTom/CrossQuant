@@ -26,6 +26,7 @@ const CURRENT_SCHEMA_TABLES = [
   'funding_research_evaluations',
   'funding_research_positions',
   'funding_research_settlements',
+  'funding_research_variants',
   'funding_rate_history',
   'funding_scan_observations',
   'hyperliquid_perp_metadata',

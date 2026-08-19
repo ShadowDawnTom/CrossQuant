@@ -11,6 +11,7 @@ import {
   usdLevels,
 } from './execution-market-hub.js';
 import { FundingArbitrageError, type FundingArbitrageEngine } from './funding-arbitrage-engine.js';
+import { persistenceAdjustedRetention, type FundingPersistenceStats } from './funding-persistence.js';
 
 const LIVE_VENUES = new Set<ExecutionVenue>(LIVE_EXECUTION_VENUES);
 const SYMBOL = /^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT)_FUTURE_([A-Z0-9]+)_(USD|USDC|USDT)$/;
@@ -31,6 +32,7 @@ export interface FundingCandidateScannerOptions {
   liquidityDepthBps?: string;
   maxPairsPerAsset?: number;
   stablecoinRiskBps?: string;
+  persistenceStats?: (longSymbol: string, shortSymbol: string, nowMs: number) => FundingPersistenceStats;
   onFundingData?: (funding: readonly GateFundingInfo[], fees: readonly GateFeeRate[],
     observations: readonly FundingScanObservation[]) => void | Promise<void>;
   now?: () => number;
@@ -88,6 +90,14 @@ export interface FundingScanObservation {
   settlementHitRate?: string | null;
   settlementSamples?: number;
   cohortClone?: boolean;
+  dataValid?: boolean;
+  invalidReason?: string | null;
+  persistenceProbability?: string | null;
+  persistenceSamples?: number;
+  retentionFactorUsed?: string;
+  historicalEdgeP10?: string | null;
+  historicalEdgeMedian?: string | null;
+  requestedNotionalUsd?: string;
 }
 
 function eventCount(item: GateFundingInfo, now: number, horizonMs: number): number {
@@ -249,6 +259,10 @@ export class FundingCandidateScanner {
           longQuote: symbolQuote(long.symbol), shortQuote: symbolQuote(short.symbol),
           executionSupport: LIVE_VENUES.has(longVenue) && LIVE_VENUES.has(shortVenue)
             ? 'LIVE_READY' as const : 'RESEARCH_ONLY' as const,
+          requestedNotionalUsd: strictAssets.has(asset) ? this.options.targetNotionalUsd
+            : this.options.researchTargetNotionalUsd ?? this.options.targetNotionalUsd,
+          dataValid: true,
+          invalidReason: null,
         };
         const reject = (primaryReason: string, marketQuality: string | null = null,
           reasons: string[] = [primaryReason]): void => {
@@ -318,10 +332,17 @@ export class FundingCandidateScanner {
         // 这里用当前盘口模拟立即往返，只估算此刻交易摩擦，不预测未来退出时的基差。
         const immediateRoundTripPnl = longExit.notional.minus(longEntry.notional)
           .plus(shortEntry.notional).minus(shortExit.notional);
+        if (immediateRoundTripPnl.gt(0)) {
+          reject('crossed_order_book', pair.quality, ['crossed_order_book']);
+          continue;
+        }
         const entryFees = longEntry.notional.mul(longFee).plus(shortEntry.notional.mul(shortFee));
         const exitFees = longExit.notional.mul(longFee).plus(shortExit.notional.mul(shortFee));
         const tradingFees = entryFees.plus(exitFees);
-        const retention = new Decimal(this.options.fundingRetentionFactor);
+        const persistence = this.options.persistenceStats?.(long.symbol, short.symbol, this.now()) ?? {
+          probability: null, samples: 0, positiveWindows: 0, directionFlips: 0, medianEdge: null, p10Edge: null,
+        };
+        const retention = new Decimal(persistenceAdjustedRetention(this.options.fundingRetentionFactor, persistence));
         const conservativeFundingPnl = snapshotFundingPnl.gt(0) ? snapshotFundingPnl.mul(retention) : snapshotFundingPnl;
         const stressBuffer = capital.mul(new Decimal(this.options.stressSlippageBps)
           .plus(this.options.adverseExitBasisBps)).div(10_000);
@@ -380,7 +401,10 @@ export class FundingCandidateScanner {
           entrySlippageBps: entrySlippageBps.toString(), exitSlippageBps: exitSlippageBps.toString(),
           basisBps: basisBps.toString(), longQuoteToUsd: pair.longBook.quoteToUsd,
           shortQuoteToUsd: pair.shortBook.quoteToUsd, liquidityUsd: liquidityUsd.toString(),
-          stablecoinRiskBuffer: stablecoinRiskBuffer.toString() });
+          stablecoinRiskBuffer: stablecoinRiskBuffer.toString(),
+          persistenceProbability: persistence.probability, persistenceSamples: persistence.samples,
+          retentionFactorUsed: retention.toString(), historicalEdgeP10: persistence.p10Edge,
+          historicalEdgeMedian: persistence.medianEdge });
       }
     }
     // 持仓监控复用本轮认证数据，避免再打一遍 funding_info 和 fee 接口触发限频。

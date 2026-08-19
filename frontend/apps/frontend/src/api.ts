@@ -198,6 +198,9 @@ export interface FundingScanObservation {
   stablecoinRiskBuffer: string | null;
   edgeDurationMinutes?: number; directionFlips24h?: number; settlementHitRate?: string | null;
   settlementSamples?: number;
+  dataValid?: boolean; invalidReason?: string | null; persistenceProbability?: string | null;
+  persistenceSamples?: number; retentionFactorUsed?: string; historicalEdgeP10?: string | null;
+  historicalEdgeMedian?: string | null; requestedNotionalUsd?: string;
 }
 export interface FundingResearchPosition {
   id: string; observationId: string; mode: 'RESEARCH'; cohort: 'ONE_SETTLEMENT' | 'ROLLING'; asset: string; longVenue: string; shortVenue: string;
@@ -209,6 +212,7 @@ export interface FundingResearchPosition {
   exitSlippageBps: string | null; settledEvents: number; dataFailureCount: number;
   nextSettlementAt: string | null; lastReason: string | null; openedAt: string; closedAt: string | null;
   lastEvaluatedAt: string | null; updatedAt: string; unprofitableCount: number; longQuote: string; shortQuote: string;
+  reopenAfter: string | null;
 }
 export interface FundingResearchEvaluation {
   id: string; positionId: string; observedAt: string; decision: string; reason: string; marketQuality: string;
@@ -219,7 +223,14 @@ export interface FundingResearchEvaluation {
 export interface FundingResearchSettlement {
   id: string; positionId: string; symbol: string; venue: string; side: string; fundingTime: string;
   fundingRate: string; notionalUsd: string; expectedAmount: string; amount: string | null;
-  state: string; settledAt: string | null;
+  state: string; amountSource: string; settledAt: string | null;
+}
+export interface FundingResearchVariant {
+  id: string; observationId: string; evaluatedAt: string; asset: string; longVenue: string; shortVenue: string;
+  variant: 'TAKER_TAKER' | 'MAKER_TAKER' | 'SPOT_PERP'; hedgeModel: 'PERP_PERP' | 'SPOT_PERP';
+  state: 'PRICED' | 'UNAVAILABLE'; expectedNetPnl: string | null; expectedNetAnnualized: string | null;
+  tradingFees: string | null; fillProbability: string | null; breakEvenHours: string | null;
+  reason: string; details: Record<string, unknown>;
 }
 export interface FundingResearchSummary {
   enabled: boolean; targetNotionalUsd: string; maxOpenPositions: number; minimumSettledEvents: number;
@@ -229,6 +240,7 @@ export interface FundingResearchSummary {
   cumulativeFees: string; positions: FundingResearchPosition[];
   cohorts: Array<{ cohort: 'ONE_SETTLEMENT' | 'ROLLING'; openCount: number; closedCount: number;
     cumulativePnl: string; cumulativeFunding: string; cumulativeFees: string }>;
+  variants: FundingResearchVariant[];
 }
 
 interface RuntimeSchema<T> {
@@ -288,7 +300,7 @@ const FundingResearchSummarySchema: RuntimeSchema<FundingResearchSummary> = {
     const data = value as Partial<FundingResearchSummary> | null;
     return data && typeof data.enabled === 'boolean' && typeof data.openCount === 'number'
       && typeof data.scan24h?.observations === 'number' && Array.isArray(data.latestObservations)
-      && Array.isArray(data.positions) && Array.isArray(data.rejectionReasons)
+      && Array.isArray(data.positions) && Array.isArray(data.rejectionReasons) && Array.isArray(data.variants)
       ? { success: true, data: data as FundingResearchSummary } : { success: false };
   },
 };
