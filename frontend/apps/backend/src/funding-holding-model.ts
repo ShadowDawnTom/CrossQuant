@@ -38,6 +38,8 @@ export interface FundingHoldingModelInput {
   minimumHoldValueUsd: string;
   previousUnprofitableCount: number;
   unprofitableConfirmationCount: number;
+  previousReversalCount?: number;
+  reversalConfirmationCount?: number;
   settlementGuardMs: number;
   openedAtMs: number;
   softReviewMs: number;
@@ -55,6 +57,7 @@ export interface FundingHoldingModelResult {
   holdValue: string;
   fundingEdge: string;
   unprofitableCount: number;
+  reversalCount: number;
   inSettlementGuard: boolean;
 }
 
@@ -91,6 +94,9 @@ function eventsForLeg(
  * 当前立即平仓 PnL 由执行层单独计算并展示。
  */
 export function evaluateFundingHolding(input: FundingHoldingModelInput): FundingHoldingModelResult {
+  // 实盘和旧调用方未传新参数时仍保持“一次确认即退出”，避免这次模拟实验暗改实盘语义。
+  const previousReversalCount = input.previousReversalCount ?? 0;
+  const reversalConfirmationCount = input.reversalConfirmationCount ?? 1;
   const retention = new Decimal(input.fundingRetentionFactor);
   const events = [
     ...eventsForLeg(input.long, input.nowMs, input.eventsPerLeg, retention),
@@ -115,19 +121,23 @@ export function evaluateFundingHolding(input: FundingHoldingModelInput): Funding
   if (hardExpired) {
     return { decision: 'EXIT', reason: 'hard_holding_limit', events, nextSettlementAt, rawFunding: rawFunding.toString(),
       conservativeFunding: conservativeFunding.toString(), riskBuffer: riskBuffer.toString(), holdValue: holdValue.toString(),
-      fundingEdge: fundingEdge.toString(), unprofitableCount: input.previousUnprofitableCount, inSettlementGuard };
+      fundingEdge: fundingEdge.toString(), unprofitableCount: input.previousUnprofitableCount,
+      reversalCount: previousReversalCount, inSettlementGuard };
   }
   if (rawFunding.lte(0)) {
-    return { decision: 'EXIT', reason: 'funding_direction_reversed', events, nextSettlementAt,
+    const reversalCount = previousReversalCount + 1;
+    const confirmed = reversalCount >= reversalConfirmationCount;
+    return { decision: confirmed ? 'EXIT' : 'EXIT_PENDING',
+      reason: confirmed ? 'funding_direction_reversed' : 'funding_reversal_confirmation_pending', events, nextSettlementAt,
       rawFunding: rawFunding.toString(), conservativeFunding: conservativeFunding.toString(), riskBuffer: riskBuffer.toString(),
-      holdValue: holdValue.toString(), fundingEdge: fundingEdge.toString(),
-      unprofitableCount: input.unprofitableConfirmationCount, inSettlementGuard };
+      holdValue: holdValue.toString(), fundingEdge: fundingEdge.toString(), unprofitableCount: 0,
+      reversalCount, inSettlementGuard };
   }
   if (inSettlementGuard) {
     return { decision: 'SETTLEMENT_GUARD', reason: 'settlement_guard_active', events, nextSettlementAt,
       rawFunding: rawFunding.toString(), conservativeFunding: conservativeFunding.toString(), riskBuffer: riskBuffer.toString(),
       holdValue: holdValue.toString(), fundingEdge: fundingEdge.toString(),
-      unprofitableCount: input.previousUnprofitableCount, inSettlementGuard };
+      unprofitableCount: input.previousUnprofitableCount, reversalCount: 0, inSettlementGuard };
   }
 
   const unprofitable = holdValue.lte(minimum);
@@ -135,15 +145,17 @@ export function evaluateFundingHolding(input: FundingHoldingModelInput): Funding
   if (unprofitableCount >= input.unprofitableConfirmationCount) {
     return { decision: 'EXIT', reason: 'hold_value_not_positive', events, nextSettlementAt,
       rawFunding: rawFunding.toString(), conservativeFunding: conservativeFunding.toString(), riskBuffer: riskBuffer.toString(),
-      holdValue: holdValue.toString(), fundingEdge: fundingEdge.toString(), unprofitableCount, inSettlementGuard };
+      holdValue: holdValue.toString(), fundingEdge: fundingEdge.toString(), unprofitableCount,
+      reversalCount: 0, inSettlementGuard };
   }
   if (unprofitable) {
     return { decision: 'EXIT_PENDING', reason: 'hold_value_confirmation_pending', events, nextSettlementAt,
       rawFunding: rawFunding.toString(), conservativeFunding: conservativeFunding.toString(), riskBuffer: riskBuffer.toString(),
-      holdValue: holdValue.toString(), fundingEdge: fundingEdge.toString(), unprofitableCount, inSettlementGuard };
+      holdValue: holdValue.toString(), fundingEdge: fundingEdge.toString(), unprofitableCount,
+      reversalCount: 0, inSettlementGuard };
   }
   return { decision: softExpired ? 'REVIEW_REQUIRED' : 'HOLD', reason: softExpired ? 'soft_review_due' : 'hold_value_positive',
     events, nextSettlementAt, rawFunding: rawFunding.toString(), conservativeFunding: conservativeFunding.toString(),
     riskBuffer: riskBuffer.toString(), holdValue: holdValue.toString(), fundingEdge: fundingEdge.toString(),
-    unprofitableCount, inSettlementGuard };
+    unprofitableCount, reversalCount: 0, inSettlementGuard };
 }

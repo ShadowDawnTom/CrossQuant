@@ -43,6 +43,13 @@ function funding(now: number): GateFundingInfo[] {
   ];
 }
 
+function reversedFunding(now: number): GateFundingInfo[] {
+  return [
+    { symbol: 'BINANCE_FUTURE_SOL_USDT', funding_rate: '0.00005', funding_time: String(now + 60_000), funding_interval: '60' },
+    { symbol: 'GATE_FUTURE_SOL_USDT', funding_rate: '-0.00003', funding_time: String(now + 60_000), funding_interval: '60' },
+  ];
+}
+
 const fees: GateFeeRate[] = ['BINANCE', 'GATE'].map((venue) => ({ exchange_type: venue,
   spot_maker_fee: '0', spot_taker_fee: '0', future_maker_fee: '0.0002', future_taker_fee: '0.0005' }));
 
@@ -122,5 +129,37 @@ describe('FundingResearchEngine', () => {
     expect(engine.list()).toEqual([]);
     expect(engine.summary()).toMatchObject({ enabled: false, scan24h: { observations: 1, rejected: 1 },
       rejectionReasons: [{ reason: 'market_not_synchronized', count: 1 }] });
+  });
+
+  it('滚动组只在方向持续翻转后退出，并在冷却期内禁止重复开仓', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'funding-research-reversal-'));
+    const database = openDatabase(join(directory, 'test.sqlite'), resolve(process.cwd(), '../../migrations'));
+    resources.push({ directory, database });
+    let currentTime = Date.parse('2026-08-15T00:00:00.000Z');
+    const engine = new FundingResearchEngine(database, market(() => currentTime), {
+      enabled: true, modelVersion: 'rolling_v2', targetNotionalUsd: '5', maxOpenPositions: 1,
+      minimumSettledEvents: 1, reversalExitConfirmationCount: 2, holdingExitConfirmationCount: 30,
+      reentryCooldownMs: 8 * 60 * 60_000, stressSlippageBps: '0', adverseExitBasisBps: '0',
+      fundingRetentionFactor: '0.5',
+    }, () => currentTime);
+
+    await engine.observe([observation(currentTime)], funding(currentTime), fees);
+    currentTime += 1_000;
+    await engine.observe([observation(currentTime)], reversedFunding(currentTime), fees);
+    expect(engine.list().find((item) => item.cohort === 'ROLLING')).toMatchObject({
+      state: 'OPEN', monitorState: 'EXIT_PENDING', lastReason: 'funding_reversal_confirmation_pending',
+      reversalCount: 1,
+    });
+
+    currentTime += 1_000;
+    await engine.observe([observation(currentTime)], reversedFunding(currentTime), fees);
+    const rolling = engine.list().find((item) => item.cohort === 'ROLLING')!;
+    expect(rolling).toMatchObject({ state: 'CLOSED', monitorState: 'EXIT', lastReason: 'funding_direction_reversed',
+      reversalCount: 2, modelVersion: 'rolling_v2' });
+    expect(Date.parse(rolling.reopenAfter!)).toBeGreaterThanOrEqual(currentTime + 8 * 60 * 60_000);
+
+    currentTime += 1_000;
+    await engine.observe([observation(currentTime)], funding(currentTime), fees);
+    expect(engine.list().filter((item) => item.cohort === 'ROLLING')).toHaveLength(1);
   });
 });

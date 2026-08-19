@@ -18,11 +18,14 @@ interface DepthFill {
 
 export interface FundingResearchOptions {
   enabled: boolean;
+  modelVersion?: string;
   targetNotionalUsd: string;
   maxOpenPositions: number;
   minimumSettledEvents: number;
   holdingEventsPerLeg?: number;
   holdingExitConfirmationCount?: number;
+  reversalExitConfirmationCount?: number;
+  reentryCooldownMs?: number;
   minimumHoldValueUsd?: string;
   settlementGuardMs?: number;
   fundingRetentionFactor?: string;
@@ -77,6 +80,8 @@ interface ResearchPositionRow {
   updated_at: string;
   cohort: FundingResearchCohort;
   unprofitable_count: number;
+  reversal_count: number;
+  research_model_version: string;
   long_quote: string;
   short_quote: string;
   reopen_after: string | null;
@@ -120,6 +125,8 @@ export interface FundingResearchPosition {
   lastEvaluatedAt: string | null;
   updatedAt: string;
   unprofitableCount: number;
+  reversalCount: number;
+  modelVersion: string;
   longQuote: string;
   shortQuote: string;
   reopenAfter: string | null;
@@ -161,6 +168,10 @@ export interface FundingResearchSettlement {
 
 export interface FundingResearchSummary {
   enabled: boolean;
+  modelVersion: string;
+  holdExitConfirmations: number;
+  reversalExitConfirmations: number;
+  reentryCooldownMs: number;
   targetNotionalUsd: string;
   maxOpenPositions: number;
   minimumSettledEvents: number;
@@ -196,6 +207,7 @@ export interface FundingResearchVariant {
   breakEvenHours: string | null;
   reason: string;
   details: Record<string, unknown>;
+  modelVersion: string;
 }
 
 function feeFor(fees: readonly GateFeeRate[], venue: ExecutionVenue, marketSymbol: string): Decimal | null {
@@ -259,6 +271,8 @@ function fromPosition(row: ResearchPositionRow): FundingResearchPosition {
     lastReason: row.last_reason, openedAt: row.opened_at, closedAt: row.closed_at,
     lastEvaluatedAt: row.last_evaluated_at, updatedAt: row.updated_at,
     unprofitableCount: row.unprofitable_count,
+    reversalCount: row.reversal_count,
+    modelVersion: row.research_model_version,
     longQuote: row.long_quote, shortQuote: row.short_quote,
     reopenAfter: row.reopen_after,
   };
@@ -316,12 +330,37 @@ function observationFromRow(row: Record<string, unknown>): FundingScanObservatio
 export class FundingResearchEngine {
   private active: Promise<number> | null = null;
 
+  private get modelVersion(): string {
+    return this.options.modelVersion ?? 'rolling_v2';
+  }
+
   constructor(
     private readonly database: Database.Database,
     private readonly market: ExecutionMarketReader,
     private readonly options: FundingResearchOptions,
     private readonly now: () => number = Date.now,
-  ) {}
+  ) {
+    this.archiveLegacyOpenPositions();
+  }
+
+  /**
+   * 每个研究模型使用独立账本。版本切换时保留历史，只关闭旧模型的模拟仓位和未到期模拟结算；
+   * 这里不接触真实订单表，配置未来升级到 v3 时也不会把两个实验口径混在一起。
+   */
+  private archiveLegacyOpenPositions(): void {
+    const observedAt = new Date(this.now()).toISOString();
+    this.database.transaction(() => {
+      this.database.prepare(`UPDATE funding_research_settlements SET state = 'CANCELLED', updated_at = ?
+        WHERE state = 'PENDING' AND position_id IN (
+          SELECT id FROM funding_research_positions WHERE state = 'OPEN' AND research_model_version <> ?
+        )`).run(observedAt, this.modelVersion);
+      this.database.prepare(`UPDATE funding_research_positions SET state = 'CLOSED', monitor_state = 'EXIT',
+        total_pnl = COALESCE(current_exit_pnl, total_pnl), last_reason = 'research_model_restarted',
+        closed_at = ?, last_evaluated_at = ?, updated_at = ?
+        WHERE state = 'OPEN' AND research_model_version <> ?`)
+        .run(observedAt, observedAt, observedAt, this.modelVersion);
+    })();
+  }
 
   observe(observations: readonly FundingScanObservation[], funding: readonly GateFundingInfo[],
     fees: readonly GateFeeRate[]): Promise<number> {
@@ -331,19 +370,21 @@ export class FundingResearchEngine {
   }
 
   list(limit = 50): FundingResearchPosition[] {
-    return (this.database.prepare('SELECT * FROM funding_research_positions ORDER BY opened_at DESC LIMIT ?')
-      .all(Math.max(1, Math.min(500, limit))) as ResearchPositionRow[]).map(fromPosition);
+    return (this.database.prepare(`SELECT * FROM funding_research_positions
+      WHERE research_model_version = ? ORDER BY opened_at DESC LIMIT ?`)
+      .all(this.modelVersion, Math.max(1, Math.min(500, limit))) as ResearchPositionRow[]).map(fromPosition);
   }
 
   latestExecutionObservations(): FundingScanObservation[] {
     const last = this.database.prepare(`SELECT scan_id FROM funding_scan_observations
-      ORDER BY observed_at DESC, id DESC LIMIT 1`).get() as { scan_id: string } | undefined;
+      WHERE research_model_version = ? ORDER BY observed_at DESC, id DESC LIMIT 1`)
+      .get(this.modelVersion) as { scan_id: string } | undefined;
     if (!last) return [];
     const rows = (this.database.prepare(`SELECT * FROM funding_scan_observations WHERE scan_id = ? AND cohort_clone = 0
-      AND data_valid = 1
+      AND data_valid = 1 AND research_model_version = ?
       ORDER BY research_eligible DESC, strict_eligible DESC,
       CASE WHEN net_annualized IS NULL THEN 1 ELSE 0 END, CAST(net_annualized AS REAL) DESC`)
-      .all(last.scan_id) as Array<Record<string, unknown>>).map(observationFromRow);
+      .all(last.scan_id, this.modelVersion) as Array<Record<string, unknown>>).map(observationFromRow);
     const seen = new Set<string>();
     return rows.filter((item) => !seen.has(item.asset) && Boolean(seen.add(item.asset)));
   }
@@ -351,23 +392,27 @@ export class FundingResearchEngine {
   summary(): FundingResearchSummary {
     const dayAgo = new Date(this.now() - 24 * 60 * 60_000).toISOString();
     const lastScan = this.database.prepare(`SELECT scan_id, observed_at FROM funding_scan_observations
-      ORDER BY observed_at DESC, id DESC LIMIT 1`).get() as { scan_id: string; observed_at: string } | undefined;
+      WHERE research_model_version = ? ORDER BY observed_at DESC, id DESC LIMIT 1`)
+      .get(this.modelVersion) as { scan_id: string; observed_at: string } | undefined;
     const scan24h = this.database.prepare(`SELECT COUNT(*) AS observations,
       COALESCE(SUM(strict_eligible), 0) AS liveEligible,
       COALESCE(SUM(research_eligible), 0) AS researchEligible,
       COALESCE(SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END), 0) AS rejected
-      FROM funding_scan_observations WHERE observed_at >= ? AND cohort_clone = 0 AND data_valid = 1`).get(dayAgo) as Record<string, number>;
+      FROM funding_scan_observations WHERE observed_at >= ? AND cohort_clone = 0 AND data_valid = 1
+      AND research_model_version = ?`).get(dayAgo, this.modelVersion) as Record<string, number>;
     const rejectionReasons = this.database.prepare(`SELECT primary_reason AS reason, COUNT(*) AS count
       FROM funding_scan_observations WHERE observed_at >= ? AND status = 'REJECTED' AND cohort_clone = 0 AND data_valid = 1
-      GROUP BY primary_reason ORDER BY count DESC, reason LIMIT 20`).all(dayAgo) as Array<{ reason: string; count: number }>;
+      AND research_model_version = ? GROUP BY primary_reason ORDER BY count DESC, reason LIMIT 20`)
+      .all(dayAgo, this.modelVersion) as Array<{ reason: string; count: number }>;
     const latestObservations = !lastScan ? [] : (this.database.prepare(`SELECT * FROM funding_scan_observations
-      WHERE scan_id = ? AND cohort_clone = 0 AND data_valid = 1 ORDER BY research_eligible DESC, strict_eligible DESC,
+      WHERE scan_id = ? AND cohort_clone = 0 AND data_valid = 1 AND research_model_version = ?
+      ORDER BY research_eligible DESC, strict_eligible DESC,
       CASE WHEN net_annualized IS NULL THEN 1 ELSE 0 END, CAST(net_annualized AS REAL) DESC LIMIT 40`)
-      .all(lastScan.scan_id) as Array<Record<string, unknown>>).map(observationFromRow)
+      .all(lastScan.scan_id, this.modelVersion) as Array<Record<string, unknown>>).map(observationFromRow)
       .map((item) => this.withHistoryStats(item, dayAgo));
     const positions = this.list(100);
     const ledger = this.database.prepare(`SELECT cohort, state, funding_pnl, entry_fees, exit_fees, total_pnl
-      FROM funding_research_positions`).all() as Array<{ cohort: FundingResearchCohort; state: string; funding_pnl: string;
+      FROM funding_research_positions WHERE research_model_version = ?`).all(this.modelVersion) as Array<{ cohort: FundingResearchCohort; state: string; funding_pnl: string;
         entry_fees: string; exit_fees: string; total_pnl: string }>;
     const closed = ledger.filter((position) => position.state === 'CLOSED');
     const fees = ledger.reduce((total, position) => total.plus(position.entry_fees).plus(position.exit_fees), new Decimal(0));
@@ -381,7 +426,11 @@ export class FundingResearchEngine {
         cumulativeFees: rows.reduce((total, item) => total.plus(item.entry_fees).plus(item.exit_fees), new Decimal(0)).toString() };
     });
     return {
-      enabled: this.options.enabled, targetNotionalUsd: this.options.targetNotionalUsd,
+      enabled: this.options.enabled, modelVersion: this.modelVersion,
+      holdExitConfirmations: this.options.holdingExitConfirmationCount ?? 30,
+      reversalExitConfirmations: this.options.reversalExitConfirmationCount ?? 15,
+      reentryCooldownMs: this.options.reentryCooldownMs ?? 8 * 60 * 60_000,
+      targetNotionalUsd: this.options.targetNotionalUsd,
       maxOpenPositions: this.options.maxOpenPositions, minimumSettledEvents: this.options.minimumSettledEvents,
       lastScanAt: lastScan?.observed_at ?? null,
       scan24h: { observations: Number(scan24h.observations), liveEligible: Number(scan24h.liveEligible),
@@ -399,7 +448,8 @@ export class FundingResearchEngine {
     const rows = this.database.prepare(`SELECT variants.*, observations.asset, observations.long_venue,
       observations.short_venue FROM funding_research_variants variants
       JOIN funding_scan_observations observations ON observations.id = variants.observation_id
-      ORDER BY variants.evaluated_at DESC LIMIT 60`).all() as Array<Record<string, unknown>>;
+      WHERE variants.research_model_version = ?
+      ORDER BY variants.evaluated_at DESC LIMIT 60`).all(this.modelVersion) as Array<Record<string, unknown>>;
     return rows.map((row) => ({
       id: String(row.id), observationId: String(row.observation_id), evaluatedAt: String(row.evaluated_at),
       asset: String(row.asset), longVenue: String(row.long_venue), shortVenue: String(row.short_venue),
@@ -412,14 +462,17 @@ export class FundingResearchEngine {
       fillProbability: row.fill_probability === null ? null : String(row.fill_probability),
       breakEvenHours: row.break_even_hours === null ? null : String(row.break_even_hours),
       reason: String(row.reason), details: JSON.parse(String(row.details_json)) as Record<string, unknown>,
+      modelVersion: String(row.research_model_version),
     }));
   }
 
   private withHistoryStats(observation: FundingScanObservation, dayAgo: string): FundingScanObservation {
     const directions = this.database.prepare(`SELECT observed_at, long_venue, short_venue, raw_funding_pnl
       FROM funding_scan_observations WHERE asset = ? AND observed_at >= ? AND cohort_clone = 0 AND data_valid = 1
+      AND research_model_version = ?
       AND ((long_venue = ? AND short_venue = ?) OR (long_venue = ? AND short_venue = ?))
-      ORDER BY observed_at DESC`).all(observation.asset, dayAgo, observation.longVenue, observation.shortVenue,
+      ORDER BY observed_at DESC`).all(observation.asset, dayAgo, this.modelVersion,
+      observation.longVenue, observation.shortVenue,
       observation.shortVenue, observation.longVenue) as Array<{ observed_at: string; long_venue: string;
         short_venue: string; raw_funding_pnl: string | null }>;
     let flips = 0;
@@ -494,11 +547,12 @@ export class FundingResearchEngine {
     await this.recordVariants(best, fees, observedAt);
     for (const cohort of ['ONE_SETTLEMENT', 'ROLLING'] as const) {
       const openCount = (this.database.prepare(`SELECT COUNT(*) AS count FROM funding_research_positions
-        WHERE state = 'OPEN' AND cohort = ?`).get(cohort) as { count: number }).count;
+        WHERE state = 'OPEN' AND cohort = ? AND research_model_version = ?`)
+        .get(cohort, this.modelVersion) as { count: number }).count;
       if (openCount >= this.options.maxOpenPositions) continue;
       const latestClosed = this.database.prepare(`SELECT reopen_after FROM funding_research_positions
-        WHERE state = 'CLOSED' AND cohort = ? ORDER BY closed_at DESC LIMIT 1`)
-        .get(cohort) as { reopen_after: string | null } | undefined;
+        WHERE state = 'CLOSED' AND cohort = ? AND research_model_version = ? ORDER BY closed_at DESC LIMIT 1`)
+        .get(cohort, this.modelVersion) as { reopen_after: string | null } | undefined;
       if (latestClosed?.reopen_after && latestClosed.reopen_after > observedAt) continue;
       // observation_id 有历史唯一约束；第二组复制同一时点快照，保证两组入场基线完全一致。
       const cohortObservation = cohort === 'ONE_SETTLEMENT' ? best : { ...best, id: randomUUID(), cohortClone: true };
@@ -537,28 +591,32 @@ export class FundingResearchEngine {
           item.stablecoinRiskBuffer);
         this.database.prepare(`UPDATE funding_scan_observations SET data_valid = ?, invalid_reason = ?,
           persistence_probability = ?, persistence_samples = ?, retention_factor_used = ?,
-          historical_edge_p10 = ?, historical_edge_median = ?, requested_notional_usd = ? WHERE id = ?`)
+          historical_edge_p10 = ?, historical_edge_median = ?, requested_notional_usd = ?,
+          research_model_version = ? WHERE id = ?`)
           .run(item.dataValid === false ? 0 : 1, item.invalidReason ?? null, item.persistenceProbability ?? null,
             item.persistenceSamples ?? 0, item.retentionFactorUsed ?? null, item.historicalEdgeP10 ?? null,
-            item.historicalEdgeMedian ?? null, item.requestedNotionalUsd ?? null, item.id);
+            item.historicalEdgeMedian ?? null, item.requestedNotionalUsd ?? null, this.modelVersion, item.id);
       }
     })();
   }
 
   private persistVariant(observation: FundingScanObservation, observedAt: string,
-    values: Omit<FundingResearchVariant, 'id' | 'observationId' | 'evaluatedAt' | 'asset' | 'longVenue' | 'shortVenue'>): void {
+    values: Omit<FundingResearchVariant, 'id' | 'observationId' | 'evaluatedAt' | 'asset' | 'longVenue' | 'shortVenue'
+      | 'modelVersion'>): void {
     this.database.prepare(`INSERT INTO funding_research_variants
       (id, observation_id, evaluated_at, variant, hedge_model, state, expected_net_pnl,
-       expected_net_annualized, trading_fees, fill_probability, break_even_hours, reason, details_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       expected_net_annualized, trading_fees, fill_probability, break_even_hours, reason, details_json,
+       research_model_version)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(observation_id, variant) DO UPDATE SET evaluated_at = excluded.evaluated_at,
         state = excluded.state, expected_net_pnl = excluded.expected_net_pnl,
         expected_net_annualized = excluded.expected_net_annualized, trading_fees = excluded.trading_fees,
         fill_probability = excluded.fill_probability, break_even_hours = excluded.break_even_hours,
-        reason = excluded.reason, details_json = excluded.details_json`)
+        reason = excluded.reason, details_json = excluded.details_json,
+        research_model_version = excluded.research_model_version`)
       .run(randomUUID(), observation.id, observedAt, values.variant, values.hedgeModel, values.state,
         values.expectedNetPnl, values.expectedNetAnnualized, values.tradingFees, values.fillProbability,
-        values.breakEvenHours, values.reason, JSON.stringify(values.details));
+        values.breakEvenHours, values.reason, JSON.stringify(values.details), this.modelVersion);
   }
 
   /**
@@ -677,14 +735,14 @@ export class FundingResearchEngine {
         (id, observation_id, asset, long_venue, short_venue, quantity, target_notional_usd, state,
          monitor_state, entry_raw_annualized, entry_net_annualized, entry_long_price, entry_short_price,
          entry_long_notional, entry_short_notional, entry_fees, entry_slippage_bps, opened_at, created_at, updated_at,
-         cohort, long_quote, short_quote)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+         cohort, long_quote, short_quote, research_model_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(id, observation.id, observation.asset, observation.longVenue, observation.shortVenue,
           observation.quantity, this.options.targetNotionalUsd, observation.rawAnnualized,
           observation.netAnnualized, observation.entryLongPrice, observation.entryShortPrice,
           observation.entryLongNotional, observation.entryShortNotional, observation.entryFees,
           observation.entrySlippageBps, observedAt, observedAt, observedAt, cohort,
-          observation.longQuote, observation.shortQuote);
+          observation.longQuote, observation.shortQuote, this.modelVersion);
       this.refreshSettlements(id, observation.asset, observation.longVenue, observation.shortVenue,
         new Decimal(observation.entryLongNotional!), new Decimal(observation.entryShortNotional!), funding, observedAt);
       return id;
@@ -740,9 +798,14 @@ export class FundingResearchEngine {
       WHERE position_id = ? AND state = 'SETTLED'`).get(position.id) as { count: number }).count;
     const nextSettlement = this.database.prepare(`SELECT MIN(funding_time) AS next FROM funding_research_settlements
       WHERE position_id = ? AND state = 'PENDING'`).get(position.id) as { next: string | null };
+    const nextPairSettlement = this.database.prepare(`SELECT MAX(first_funding_time) AS next FROM (
+      SELECT MIN(funding_time) AS first_funding_time FROM funding_research_settlements
+      WHERE position_id = ? AND state = 'PENDING' GROUP BY symbol
+    )`).get(position.id) as { next: string | null };
     let decision: string;
     let reason: string;
     let unprofitableCount = position.unprofitable_count;
+    let reversalCount = position.reversal_count;
     let holdingDetails: Record<string, unknown> = {};
     if (position.cohort === 'ONE_SETTLEMENT') {
       // “一次结算”必须两条腿都真正跨过结算点，不能一所先结算就把另一条待验证事件取消。
@@ -766,7 +829,9 @@ export class FundingResearchEngine {
             .plus(position.long_quote === position.short_quote ? 0 : this.options.stablecoinRiskBps ?? '5').toString(),
           minimumHoldValueUsd: this.options.minimumHoldValueUsd ?? '0',
           previousUnprofitableCount: position.unprofitable_count,
-          unprofitableConfirmationCount: this.options.holdingExitConfirmationCount ?? 3,
+          unprofitableConfirmationCount: this.options.holdingExitConfirmationCount ?? 30,
+          previousReversalCount: position.reversal_count,
+          reversalConfirmationCount: this.options.reversalExitConfirmationCount ?? 15,
           settlementGuardMs: this.options.settlementGuardMs ?? 30_000,
           openedAtMs: Date.parse(position.opened_at),
           softReviewMs: this.options.rollingSoftReviewMs ?? 3 * 24 * 60 * 60_000,
@@ -775,6 +840,7 @@ export class FundingResearchEngine {
         decision = holding.decision;
         reason = holding.reason;
         unprofitableCount = holding.unprofitableCount;
+        reversalCount = holding.reversalCount;
         if (decision === 'EXIT' && reason === 'hold_value_not_positive' && settledLegs < 2) {
           // 研究组至少先观察两条腿各一次结算；普通收益判负不能在结算前制造两分钟开平仓循环。
           decision = 'EXIT_PENDING';
@@ -783,7 +849,11 @@ export class FundingResearchEngine {
         holdingDetails = { rawHoldingFunding: holding.rawFunding,
           conservativeHoldingFunding: holding.conservativeFunding, holdRiskBuffer: holding.riskBuffer,
           holdValue: holding.holdValue, fundingEdge: holding.fundingEdge,
-          inSettlementGuard: holding.inSettlementGuard };
+          inSettlementGuard: holding.inSettlementGuard,
+          unprofitableCount: holding.unprofitableCount,
+          unprofitableRequired: this.options.holdingExitConfirmationCount ?? 30,
+          reversalCount: holding.reversalCount,
+          reversalRequired: this.options.reversalExitConfirmationCount ?? 15 };
       } catch {
         this.unavailable(position, observedAt, 'funding_schedule_unavailable');
         return;
@@ -799,13 +869,13 @@ export class FundingResearchEngine {
     });
     this.database.prepare(`UPDATE funding_research_positions SET monitor_state = ?, current_exit_pnl = ?,
       price_pnl = ?, exit_fees = ?, current_basis_bps = ?, exit_slippage_bps = ?, settled_events = ?,
-      data_failure_count = 0, next_settlement_at = ?, last_reason = ?, unprofitable_count = ?,
+      data_failure_count = 0, next_settlement_at = ?, last_reason = ?, unprofitable_count = ?, reversal_count = ?,
       last_evaluated_at = ?, updated_at = ?
       WHERE id = ?`).run(decision, totalPnl.toString(), pricePnl.toString(), exitFees.toString(),
-      basisBps.toString(), exitSlippageBps.toString(), settledEvents, nextSettlement.next, reason, unprofitableCount,
+      basisBps.toString(), exitSlippageBps.toString(), settledEvents, nextSettlement.next, reason, unprofitableCount, reversalCount,
       observedAt, observedAt, position.id);
     if (decision === 'EXIT') this.close(position, observedAt, reason, longExit.average, shortExit.average,
-      exitFees, pricePnl, totalPnl, settledEvents, nextSettlement.next);
+      exitFees, pricePnl, totalPnl, settledEvents, nextPairSettlement.next);
   }
 
   private refreshSettlements(positionId: string, asset: string, longVenue: ExecutionVenue,
@@ -888,8 +958,8 @@ export class FundingResearchEngine {
     longExitPrice: Decimal, shortExitPrice: Decimal, exitFees: Decimal, pricePnl: Decimal,
     totalPnl: Decimal, settledEvents: number, nextSettlementAt: string | null): void {
     // 关闭后至少冷却到下一次结算，避免同一负收益快照一分钟后再次开仓烧手续费。
-    const fallback = new Date(Date.parse(observedAt) + 60 * 60_000).toISOString();
-    const reopenAfter = nextSettlementAt && nextSettlementAt > observedAt ? nextSettlementAt : fallback;
+    const cooldown = new Date(Date.parse(observedAt) + (this.options.reentryCooldownMs ?? 8 * 60 * 60_000)).toISOString();
+    const reopenAfter = nextSettlementAt && nextSettlementAt > cooldown ? nextSettlementAt : cooldown;
     this.database.transaction(() => {
       this.database.prepare(`UPDATE funding_research_positions SET state = 'CLOSED', monitor_state = 'EXIT',
         exit_long_price = ?, exit_short_price = ?, exit_fees = ?, price_pnl = ?, total_pnl = ?,

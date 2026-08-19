@@ -84,6 +84,7 @@ export interface BackendConfig {
   };
   fundingResearch: {
     enabled: boolean;
+    modelVersion: string;
     assets: string[];
     targetNotionalUsd: string;
     maxOpenPositions: number;
@@ -95,6 +96,9 @@ export interface BackendConfig {
     stablecoinRiskBps: string;
     rollingSoftReviewMs: number;
     rollingHardHoldingMs: number;
+    rollingHoldExitConfirmations: number;
+    rollingReversalExitConfirmations: number;
+    reentryCooldownMs: number;
     makerFillProbability: string;
     makerLegRiskBps: string;
   };
@@ -209,6 +213,10 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
   const fundingScanAssets = parseAssetList(environment.GCT_FUNDING_SCAN_ASSETS ?? executionMarketSymbols.join(','), 'GCT_FUNDING_SCAN_ASSETS');
   const fundingResearchAssets = parseAssetList(environment.GCT_FUNDING_RESEARCH_ASSETS ?? DEFAULT_RESEARCH_ASSETS, 'GCT_FUNDING_RESEARCH_ASSETS');
   const fundingResearchEnabled = environment.GCT_FUNDING_RESEARCH_ENABLED === '1';
+  const fundingResearchModelVersion = (environment.GCT_FUNDING_RESEARCH_MODEL_VERSION ?? 'rolling_v2').trim();
+  if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(fundingResearchModelVersion)) {
+    throw new Error('GCT_FUNDING_RESEARCH_MODEL_VERSION must use lowercase letters, digits, underscores, or hyphens');
+  }
   if (executionMarketSymbols.length > 50 || fundingResearchAssets.length > 50) {
     throw new Error('execution and research asset lists must not exceed 50 assets');
   }
@@ -354,6 +362,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     fundingResearch: {
       // 探索模拟只写本地研究账本，不能复用或放宽实盘候选阈值。
       enabled: fundingResearchEnabled,
+      modelVersion: fundingResearchModelVersion,
       assets: fundingResearchAssets,
       targetNotionalUsd: parsePositiveDecimal(environment.GCT_FUNDING_RESEARCH_TARGET_NOTIONAL_USD ?? '5', 'GCT_FUNDING_RESEARCH_TARGET_NOTIONAL_USD'),
       maxOpenPositions: fundingResearchMaxOpenPositions,
@@ -365,6 +374,18 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       stablecoinRiskBps: parseNonNegativeDecimal(environment.GCT_FUNDING_RESEARCH_STABLECOIN_RISK_BPS ?? '5', 'GCT_FUNDING_RESEARCH_STABLECOIN_RISK_BPS'),
       rollingSoftReviewMs: fundingResearchRollingSoftReviewMs,
       rollingHardHoldingMs: fundingResearchRollingHardHoldingMs,
+      rollingHoldExitConfirmations: parsePositiveInteger(
+        environment.GCT_FUNDING_RESEARCH_HOLD_EXIT_CONFIRMATIONS ?? '30',
+        'GCT_FUNDING_RESEARCH_HOLD_EXIT_CONFIRMATIONS',
+      ),
+      rollingReversalExitConfirmations: parsePositiveInteger(
+        environment.GCT_FUNDING_RESEARCH_REVERSAL_EXIT_CONFIRMATIONS ?? '15',
+        'GCT_FUNDING_RESEARCH_REVERSAL_EXIT_CONFIRMATIONS',
+      ),
+      reentryCooldownMs: parsePositiveInteger(
+        environment.GCT_FUNDING_RESEARCH_REENTRY_COOLDOWN_MS ?? '28800000',
+        'GCT_FUNDING_RESEARCH_REENTRY_COOLDOWN_MS',
+      ),
       makerFillProbability: parseUnitInterval(environment.GCT_FUNDING_RESEARCH_MAKER_FILL_PROBABILITY ?? '0.35', 'GCT_FUNDING_RESEARCH_MAKER_FILL_PROBABILITY'),
       makerLegRiskBps: parseNonNegativeDecimal(environment.GCT_FUNDING_RESEARCH_MAKER_LEG_RISK_BPS ?? '5', 'GCT_FUNDING_RESEARCH_MAKER_LEG_RISK_BPS'),
     },

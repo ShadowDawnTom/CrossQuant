@@ -141,9 +141,12 @@ describe('local API request coordination', () => {
 
   it('validates isolated funding research summaries and details', async () => {
     const position = { id: 'research-1', observationId: 'observation-1', mode: 'RESEARCH', asset: 'SOL',
-      longVenue: 'BINANCE', shortVenue: 'GATE', quantity: '0.05', state: 'OPEN', monitorState: 'HOLD' };
+      longVenue: 'BINANCE', shortVenue: 'GATE', quantity: '0.05', state: 'OPEN', monitorState: 'HOLD',
+      modelVersion: 'rolling_v2', reversalCount: 0 };
     const fetchMock = vi.fn(async (path: string) => path === '/api/funding-research'
-      ? new Response(JSON.stringify({ enabled: true, targetNotionalUsd: '5', maxOpenPositions: 1,
+      ? new Response(JSON.stringify({ enabled: true, modelVersion: 'rolling_v2', holdExitConfirmations: 30,
+        reversalExitConfirmations: 15, reentryCooldownMs: 28_800_000,
+        targetNotionalUsd: '5', maxOpenPositions: 1,
         minimumSettledEvents: 1, lastScanAt: '2026-08-15T00:00:00.000Z',
         scan24h: { observations: 18, liveEligible: 0, researchEligible: 12, rejected: 6 },
         rejectionReasons: [{ reason: 'market_not_synchronized', count: 6 }], latestObservations: [],
@@ -152,7 +155,7 @@ describe('local API request coordination', () => {
       : new Response(JSON.stringify({ position, evaluations: [], settlements: [] })));
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(api.fundingResearchSummary()).resolves.toMatchObject({ enabled: true, openCount: 1,
+    await expect(api.fundingResearchSummary()).resolves.toMatchObject({ enabled: true, modelVersion: 'rolling_v2', openCount: 1,
       scan24h: { researchEligible: 12 }, positions: [{ mode: 'RESEARCH' }] });
     await expect(api.fundingResearchDetails('research-1')).resolves.toMatchObject({
       position: { id: 'research-1', mode: 'RESEARCH' }, evaluations: [], settlements: [],

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError, type FundingResearchEvaluation, type FundingResearchSettlement,
   type FundingResearchSummary } from './api.js';
 
-function decimal(value: string | null | undefined, digits = 4): string {
+function decimal(value: string | number | null | undefined, digits = 4): string {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed.toFixed(digits) : '—';
 }
@@ -35,6 +35,8 @@ const reasonLabel: Record<string, string> = {
   market_not_live_synchronized: '退出行情未同步', exit_depth_insufficient: '退出深度不足',
   hold_value_positive: '下一结算窗口保守价值为正', hold_value_confirmation_pending: '继续持有价值等待连续确认',
   hold_value_not_positive: '继续持有价值连续不为正', funding_direction_reversed: '资金费方向翻转',
+  funding_reversal_confirmation_pending: '资金费翻转等待连续确认',
+  research_model_restarted: '旧模型归档，重新起跑',
   soft_review_due: '滚动组达到72小时重点观察', hard_holding_limit: '滚动组达到7天硬上限',
   settlement_guard_active: '处于结算保护窗口', funding_schedule_unavailable: '结算计划不可用',
   crossed_order_book: '本地盘口交叉，已隔离并重建', executable_taker_baseline: '四笔 Taker 基准',
@@ -93,7 +95,7 @@ export function FundingResearchPanel() {
         <i />{summary?.enabled ? '独立模拟运行中' : '探索模拟未开启'}
       </span>
     </header>
-    <p className="funding-research-notice">每轮从同步盘口和流动性过滤后的市场选择最优组合，对比一次结算、滚动持仓、Maker/Taker 反事实和同所现货/永续四条影子口径；目标每腿 {summary?.targetNotionalUsd ?? '5'} U，但合约步长可能抬高实际金额。毛快照 APR 只表示当前费率外推，所有研究都不会发送交易所订单。</p>
+    <p className="funding-research-notice">每轮从同步盘口和流动性过滤后的市场选择最优组合，对比一次结算、滚动持仓、Maker/Taker 反事实和同所现货/永续四条影子口径；目标每腿 {summary?.targetNotionalUsd ?? '5'} U，但合约步长可能抬高实际金额。滚动组采用 {summary?.modelVersion ?? 'rolling_v2'}：普通价值转负连续确认 {summary?.holdExitConfirmations ?? 30} 次、方向翻转连续确认 {summary?.reversalExitConfirmations ?? 15} 次，平仓后至少冷却 {decimal((summary?.reentryCooldownMs ?? 28_800_000) / 3_600_000, 0)} 小时。毛快照 APR 只表示当前费率外推，所有研究都不会发送交易所订单。</p>
     {error && <p className="funding-paper-error" role="alert">研究数据读取失败：{error}</p>}
 
     <div className="funding-research-stats">
@@ -177,7 +179,9 @@ export function FundingResearchPanel() {
           : summary.positions.map((position) => <article key={position.id} className={`research-position state-${position.state.toLowerCase()}`}>
             <div className="paper-position-head">
               <div><span className="research-status">{position.cohort === 'ONE_SETTLEMENT' ? '一次结算组' : '滚动持仓组'}</span><strong>{position.asset}</strong><span>{position.longVenue} 多 / {position.shortVenue} 空</span></div>
-              <span className="paper-position-state">{position.state === 'OPEN' ? '等待真实结算时点' : '研究已平仓'}</span>
+              <span className="paper-position-state">{position.state === 'OPEN'
+                ? position.cohort === 'ROLLING' ? '滚动持仓监控中' : '等待真实结算时点'
+                : '研究已平仓'}</span>
             </div>
             <div className="paper-position-metrics">
               <span><small>模拟 PnL</small>{decimal(position.state === 'OPEN' ? position.currentExitPnl : position.totalPnl)} U</span>
@@ -189,6 +193,9 @@ export function FundingResearchPanel() {
               <span><small>入场毛快照 APR</small>{percent(position.entryRawAnnualized)}</span>
               <span><small>入场保守净收益年化</small>{percent(position.entryNetAnnualized)}</span>
               <span><small>平仓后最早重开</small>{time(position.reopenAfter)}</span>
+              <span><small>价值转负确认</small>{position.unprofitableCount} / {summary.holdExitConfirmations}</span>
+              <span><small>方向翻转确认</small>{position.reversalCount} / {summary.reversalExitConfirmations}</span>
+              <span><small>研究模型</small>{position.modelVersion}</span>
             </div>
             <div className="paper-position-actions">
               <small>{reason(position.lastReason ?? 'research_waiting_first_settlement')} · 开仓 {time(position.openedAt)}</small>

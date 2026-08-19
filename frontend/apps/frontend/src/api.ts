@@ -211,7 +211,8 @@ export interface FundingResearchPosition {
   currentExitPnl: string | null; currentBasisBps: string | null; entrySlippageBps: string | null;
   exitSlippageBps: string | null; settledEvents: number; dataFailureCount: number;
   nextSettlementAt: string | null; lastReason: string | null; openedAt: string; closedAt: string | null;
-  lastEvaluatedAt: string | null; updatedAt: string; unprofitableCount: number; longQuote: string; shortQuote: string;
+  lastEvaluatedAt: string | null; updatedAt: string; unprofitableCount: number; reversalCount: number;
+  modelVersion: string; longQuote: string; shortQuote: string;
   reopenAfter: string | null;
 }
 export interface FundingResearchEvaluation {
@@ -230,10 +231,11 @@ export interface FundingResearchVariant {
   variant: 'TAKER_TAKER' | 'MAKER_TAKER' | 'SPOT_PERP'; hedgeModel: 'PERP_PERP' | 'SPOT_PERP';
   state: 'PRICED' | 'UNAVAILABLE'; expectedNetPnl: string | null; expectedNetAnnualized: string | null;
   tradingFees: string | null; fillProbability: string | null; breakEvenHours: string | null;
-  reason: string; details: Record<string, unknown>;
+  reason: string; details: Record<string, unknown>; modelVersion: string;
 }
 export interface FundingResearchSummary {
-  enabled: boolean; targetNotionalUsd: string; maxOpenPositions: number; minimumSettledEvents: number;
+  enabled: boolean; modelVersion: string; holdExitConfirmations: number; reversalExitConfirmations: number;
+  reentryCooldownMs: number; targetNotionalUsd: string; maxOpenPositions: number; minimumSettledEvents: number;
   lastScanAt: string | null; scan24h: { observations: number; liveEligible: number; researchEligible: number; rejected: number };
   rejectionReasons: Array<{ reason: string; count: number }>; latestObservations: FundingScanObservation[];
   openCount: number; closedCount: number; cumulativePnl: string; cumulativeFunding: string;
@@ -298,7 +300,9 @@ const FundingPaperDetailsSchema: RuntimeSchema<{ position: FundingPaperPosition;
 const FundingResearchSummarySchema: RuntimeSchema<FundingResearchSummary> = {
   safeParse(value) {
     const data = value as Partial<FundingResearchSummary> | null;
-    return data && typeof data.enabled === 'boolean' && typeof data.openCount === 'number'
+    return data && typeof data.enabled === 'boolean' && typeof data.modelVersion === 'string'
+      && typeof data.holdExitConfirmations === 'number' && typeof data.reversalExitConfirmations === 'number'
+      && typeof data.reentryCooldownMs === 'number' && typeof data.openCount === 'number'
       && typeof data.scan24h?.observations === 'number' && Array.isArray(data.latestObservations)
       && Array.isArray(data.positions) && Array.isArray(data.rejectionReasons) && Array.isArray(data.variants)
       ? { success: true, data: data as FundingResearchSummary } : { success: false };

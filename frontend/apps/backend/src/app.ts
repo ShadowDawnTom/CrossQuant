@@ -707,11 +707,14 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   const spotMarketReader = new SpotMarketReader(fetch);
   const fundingResearchEngine = new FundingResearchEngine(database, executionMarketHub, {
     enabled: config.fundingResearch.enabled,
+    modelVersion: config.fundingResearch.modelVersion,
     targetNotionalUsd: config.fundingResearch.targetNotionalUsd,
     maxOpenPositions: config.fundingResearch.maxOpenPositions,
     minimumSettledEvents: config.fundingResearch.minimumSettledEvents,
     holdingEventsPerLeg: config.fundingArbitrage.holdingEventsPerLeg,
-    holdingExitConfirmationCount: config.fundingArbitrage.holdingExitConfirmationCount,
+    holdingExitConfirmationCount: config.fundingResearch.rollingHoldExitConfirmations,
+    reversalExitConfirmationCount: config.fundingResearch.rollingReversalExitConfirmations,
+    reentryCooldownMs: config.fundingResearch.reentryCooldownMs,
     minimumHoldValueUsd: config.fundingArbitrage.minimumHoldValueUsd,
     settlementGuardMs: config.fundingArbitrage.settlementGuardMs,
     fundingRetentionFactor: config.fundingArbitrage.fundingRetentionFactor,

@@ -46,8 +46,8 @@ describe('database migrations', () => {
 
     expect(readDatabaseStatus(first)).toEqual({
       state: 'ok',
-      migrationCount: 24,
-      currentMigration: '0024_funding_research_quality.sql',
+      migrationCount: 25,
+      currentMigration: '0025_long_horizon_research.sql',
     });
     const orderColumns = first.prepare('PRAGMA table_info(execution_orders)').all() as Array<{ name: string }>;
     expect(orderColumns.map((column) => column.name)).toContain('failure_reason');
@@ -60,7 +60,7 @@ describe('database migrations', () => {
     first.close();
 
     const reopened = openDatabase(location.path, migrationsDir);
-    expect(readDatabaseStatus(reopened).migrationCount).toBe(24);
+    expect(readDatabaseStatus(reopened).migrationCount).toBe(25);
     reopened.close();
   });
 
@@ -87,6 +87,48 @@ describe('database migrations', () => {
     database.close();
   });
 
+  it('升级长持仓模型时归档旧模拟仓位并保留历史账本', () => {
+    const location = temporaryDatabasePath();
+    const sourceMigrations = resolve(process.cwd(), '../../migrations');
+    const legacyMigrations = mkdtempSync(join(tmpdir(), 'gate-crossex-legacy-migrations-'));
+    temporaryDirectories.push(legacyMigrations);
+    for (const file of readdirSync(sourceMigrations).filter((name) => name.endsWith('.sql') && name < '0025_')) {
+      cpSync(join(sourceMigrations, file), join(legacyMigrations, file));
+    }
+    const legacy = openDatabase(location.path, legacyMigrations);
+    legacy.exec(`
+      INSERT INTO funding_scan_observations
+        (id, scan_id, observed_at, asset, long_venue, short_venue, status, primary_reason,
+         reasons_json, long_rate, short_rate, long_events, short_events)
+      VALUES ('legacy-observation', 'legacy-scan', '2026-08-19T00:00:00.000Z', 'SOL', 'GATE', 'BYBIT',
+        'RESEARCH_ELIGIBLE', 'test', '[]', '-0.001', '0.001', 1, 1);
+      INSERT INTO funding_research_positions
+        (id, observation_id, asset, long_venue, short_venue, quantity, target_notional_usd, state,
+         monitor_state, entry_raw_annualized, entry_net_annualized, entry_long_price, entry_short_price,
+         entry_long_notional, entry_short_notional, opened_at, created_at, updated_at)
+      VALUES ('legacy-position', 'legacy-observation', 'SOL', 'GATE', 'BYBIT', '1', '5', 'OPEN',
+        'HOLD', '1', '-1', '100', '101', '5', '5', '2026-08-19T00:00:00.000Z',
+        '2026-08-19T00:00:00.000Z', '2026-08-19T00:00:00.000Z');
+      INSERT INTO funding_research_settlements
+        (id, position_id, symbol, venue, side, funding_time, funding_rate, notional_usd,
+         expected_amount, state, created_at, updated_at)
+      VALUES ('legacy-settlement', 'legacy-position', 'GATE_FUTURE_SOL_USDT', 'GATE', 'LONG',
+        '2030-01-01T00:00:00.000Z', '-0.001', '5', '0.005', 'PENDING',
+        '2026-08-19T00:00:00.000Z', '2026-08-19T00:00:00.000Z');
+    `);
+    legacy.close();
+
+    const upgraded = openDatabase(location.path, sourceMigrations);
+    expect(upgraded.prepare('SELECT state, last_reason, research_model_version FROM funding_research_positions WHERE id = ?')
+      .get('legacy-position')).toMatchObject({ state: 'CLOSED', last_reason: 'research_model_restarted',
+        research_model_version: 'rolling_v1' });
+    expect(upgraded.prepare('SELECT state FROM funding_research_settlements WHERE id = ?').get('legacy-settlement'))
+      .toEqual({ state: 'CANCELLED' });
+    expect(upgraded.prepare('SELECT COUNT(*) AS count FROM funding_scan_observations WHERE id = ?')
+      .get('legacy-observation')).toEqual({ count: 1 });
+    upgraded.close();
+  });
+
   it('repairs the legacy audit table created by the original bootstrap code', () => {
     const location = temporaryDatabasePath();
     const legacy = new Database(location.path);
@@ -103,7 +145,7 @@ describe('database migrations', () => {
     const database = openDatabase(location.path, resolve(process.cwd(), '../../migrations'));
     const columns = database.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain('correlation_id');
-    expect(readDatabaseStatus(database).currentMigration).toBe('0024_funding_research_quality.sql');
+    expect(readDatabaseStatus(database).currentMigration).toBe('0025_long_horizon_research.sql');
     database.close();
   });
 

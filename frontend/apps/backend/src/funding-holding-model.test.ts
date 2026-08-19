@@ -17,6 +17,8 @@ function input(overrides: Partial<FundingHoldingModelInput> = {}): FundingHoldin
     minimumHoldValueUsd: '0',
     previousUnprofitableCount: 0,
     unprofitableConfirmationCount: 3,
+    previousReversalCount: 0,
+    reversalConfirmationCount: 15,
     settlementGuardMs: 30_000,
     openedAtMs: now - 60_000,
     softReviewMs: 72 * 60 * 60_000,
@@ -46,12 +48,20 @@ describe('evaluateFundingHolding', () => {
     expect(third).toMatchObject({ decision: 'EXIT', reason: 'hold_value_not_positive', unprofitableCount: 3 });
   });
 
-  it('资金费总方向反转时不等待三轮确认', () => {
-    const result = evaluateFundingHolding(input({
+  it('资金费总方向反转必须经过独立的连续确认，恢复后清零', () => {
+    const first = evaluateFundingHolding(input({
       long: { ...input().long, fundingRate: '0.0005', fundingTime: String(now + 10_000) },
       short: { ...input().short, fundingRate: '0.0001', fundingTime: String(now + 10_000) },
     }));
-    expect(result).toMatchObject({ decision: 'EXIT', reason: 'funding_direction_reversed' });
+    expect(first).toMatchObject({ decision: 'EXIT_PENDING', reason: 'funding_reversal_confirmation_pending',
+      reversalCount: 1, unprofitableCount: 0 });
+    const confirmed = evaluateFundingHolding(input({
+      long: { ...input().long, fundingRate: '0.0005', fundingTime: String(now + 10_000) },
+      short: { ...input().short, fundingRate: '0.0001', fundingTime: String(now + 10_000) },
+      previousReversalCount: 14,
+    }));
+    expect(confirmed).toMatchObject({ decision: 'EXIT', reason: 'funding_direction_reversed', reversalCount: 15 });
+    expect(evaluateFundingHolding(input({ previousReversalCount: 8 }))).toMatchObject({ decision: 'HOLD', reversalCount: 0 });
   });
 
   it('结算保护窗口内不执行普通收益退出', () => {

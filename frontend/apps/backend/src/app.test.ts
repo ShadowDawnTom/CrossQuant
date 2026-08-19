@@ -498,7 +498,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 24, currentMigration: '0024_funding_research_quality.sql' },
+      database: { migrationCount: 25, currentMigration: '0025_long_horizon_research.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',
