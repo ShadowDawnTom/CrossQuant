@@ -64,6 +64,16 @@ describe('database migrations', () => {
     reopened.close();
   });
 
+  it('允许大库跳过阻塞启动的全页检查，但仍校验迁移和当前 schema', () => {
+    const location = temporaryDatabasePath();
+    const migrationsDir = resolve(process.cwd(), '../../migrations');
+    openDatabase(location.path, migrationsDir).close();
+
+    const reopened = openDatabase(location.path, migrationsDir, { startupIntegrityMaxBytes: 0 });
+    expect(readDatabaseStatus(reopened)).toMatchObject({ state: 'ok', currentMigration: '0025_long_horizon_research.sql' });
+    reopened.close();
+  });
+
   it('installs indexes for execution-ledger hot paths', () => {
     const location = temporaryDatabasePath();
     const database = openDatabase(location.path, resolve(process.cwd(), '../../migrations'));

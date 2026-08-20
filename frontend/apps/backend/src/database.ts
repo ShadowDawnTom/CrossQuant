@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 export interface DatabaseStatus {
@@ -36,6 +36,12 @@ const CURRENT_SCHEMA_TABLES = [
 function migrationChecksum(sql: string): string {
   return createHash('sha256').update(sql).digest('hex');
 }
+
+export interface OpenDatabaseOptions {
+  startupIntegrityMaxBytes?: number;
+}
+
+const DEFAULT_STARTUP_INTEGRITY_MAX_BYTES = 256 * 1024 * 1024;
 
 /**
  * Windows 和 Linux 的发布包可能只改变 SQL 换行符。旧库保留原始字节校验值，
@@ -82,7 +88,8 @@ function assertCurrentSchema(database: Database.Database): void {
   }
 }
 
-export function openDatabase(databasePath: string, migrationsDir: string): Database.Database {
+export function openDatabase(databasePath: string, migrationsDir: string,
+  options: OpenDatabaseOptions = {}): Database.Database {
   const onDisk = databasePath !== ':memory:';
   const dataDirectory = dirname(databasePath);
   if (onDisk) {
@@ -136,7 +143,10 @@ export function openDatabase(databasePath: string, migrationsDir: string): Datab
       })();
     }
 
-    assertDatabaseIntegrity(database);
+    const startupIntegrityMaxBytes = options.startupIntegrityMaxBytes ?? DEFAULT_STARTUP_INTEGRITY_MAX_BYTES;
+    // 大库每次重启做全页 quick_check 会把磁盘读满并让网页长时间 502。迁移校验和 schema 检查仍同步执行，
+    // 全库完整性检查改到停机维护窗口；小库、内存库和测试库继续在启动时检查。
+    if (!onDisk || statSync(databasePath).size <= startupIntegrityMaxBytes) assertDatabaseIntegrity(database);
     if (migrationFiles.includes('0014_database_maintenance.sql')) assertCurrentSchema(database);
     database.pragma('optimize');
     return database;
