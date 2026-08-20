@@ -323,6 +323,43 @@ function observationFromRow(row: Record<string, unknown>): FundingScanObservatio
   };
 }
 
+interface FundingScanSummaryRow {
+  scan_id: string;
+  observed_at: string;
+  observations: number;
+  live_eligible: number;
+  research_eligible: number;
+  rejected: number;
+  rejection_reasons_json: string;
+  observation_ids_json: string;
+}
+
+function rankedObservations(observations: readonly FundingScanObservation[]): FundingScanObservation[] {
+  return [...observations].sort((left, right) => {
+    if (left.researchEligible !== right.researchEligible) return right.researchEligible ? 1 : -1;
+    if (left.strictEligible !== right.strictEligible) return right.strictEligible ? 1 : -1;
+    if (left.netAnnualized === null) return right.netAnnualized === null ? 0 : 1;
+    if (right.netAnnualized === null) return -1;
+    return new Decimal(right.netAnnualized).cmp(left.netAnnualized);
+  });
+}
+
+function parseStringArray(value: string): string[] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch { return []; }
+}
+
+function parseReasonCounts(value: string): Record<string, number> {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, number] =>
+      typeof entry[1] === 'number' && Number.isFinite(entry[1]) && entry[1] >= 0));
+  } catch { return {}; }
+}
+
 /**
  * 探索模拟只消费扫描器给出的纸面机会并写本地账本。
  * 它没有交易运行时或账户依赖，因此无法调用下单接口，也不会改变实盘候选状态。
@@ -375,40 +412,50 @@ export class FundingResearchEngine {
       .all(this.modelVersion, Math.max(1, Math.min(500, limit))) as ResearchPositionRow[]).map(fromPosition);
   }
 
+  private latestScanSummary(): FundingScanSummaryRow | undefined {
+    return this.database.prepare(`SELECT * FROM funding_scan_summaries
+      WHERE research_model_version = ? ORDER BY observed_at DESC LIMIT 1`)
+      .get(this.modelVersion) as FundingScanSummaryRow | undefined;
+  }
+
+  private summaryObservations(summary: FundingScanSummaryRow, limit = 60): FundingScanObservation[] {
+    const ids = parseStringArray(summary.observation_ids_json).slice(0, Math.max(1, Math.min(60, limit)));
+    if (ids.length === 0) return [];
+    const rows = this.database.prepare(`SELECT * FROM funding_scan_observations
+      WHERE id IN (${ids.map(() => '?').join(', ')})`).all(...ids) as Array<Record<string, unknown>>;
+    const byId = new Map(rows.map((row) => [String(row.id), observationFromRow(row)]));
+    return ids.flatMap((id) => byId.has(id) ? [byId.get(id)!] : []);
+  }
+
   latestExecutionObservations(): FundingScanObservation[] {
-    const last = this.database.prepare(`SELECT scan_id FROM funding_scan_observations
-      WHERE research_model_version = ? ORDER BY observed_at DESC, id DESC LIMIT 1`)
-      .get(this.modelVersion) as { scan_id: string } | undefined;
-    if (!last) return [];
-    const rows = (this.database.prepare(`SELECT * FROM funding_scan_observations WHERE scan_id = ? AND cohort_clone = 0
-      AND data_valid = 1 AND research_model_version = ?
-      ORDER BY research_eligible DESC, strict_eligible DESC,
-      CASE WHEN net_annualized IS NULL THEN 1 ELSE 0 END, CAST(net_annualized AS REAL) DESC`)
-      .all(last.scan_id, this.modelVersion) as Array<Record<string, unknown>>).map(observationFromRow);
+    const latest = this.latestScanSummary();
+    if (!latest) return [];
+    const rows = this.summaryObservations(latest);
     const seen = new Set<string>();
     return rows.filter((item) => !seen.has(item.asset) && Boolean(seen.add(item.asset)));
   }
 
   summary(): FundingResearchSummary {
     const dayAgo = new Date(this.now() - 24 * 60 * 60_000).toISOString();
-    const lastScan = this.database.prepare(`SELECT scan_id, observed_at FROM funding_scan_observations
-      WHERE research_model_version = ? ORDER BY observed_at DESC, id DESC LIMIT 1`)
-      .get(this.modelVersion) as { scan_id: string; observed_at: string } | undefined;
-    const scan24h = this.database.prepare(`SELECT COUNT(*) AS observations,
-      COALESCE(SUM(strict_eligible), 0) AS liveEligible,
-      COALESCE(SUM(research_eligible), 0) AS researchEligible,
-      COALESCE(SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END), 0) AS rejected
-      FROM funding_scan_observations WHERE observed_at >= ? AND cohort_clone = 0 AND data_valid = 1
-      AND research_model_version = ?`).get(dayAgo, this.modelVersion) as Record<string, number>;
-    const rejectionReasons = this.database.prepare(`SELECT primary_reason AS reason, COUNT(*) AS count
-      FROM funding_scan_observations WHERE observed_at >= ? AND status = 'REJECTED' AND cohort_clone = 0 AND data_valid = 1
-      AND research_model_version = ? GROUP BY primary_reason ORDER BY count DESC, reason LIMIT 20`)
-      .all(dayAgo, this.modelVersion) as Array<{ reason: string; count: number }>;
-    const latestObservations = !lastScan ? [] : (this.database.prepare(`SELECT * FROM funding_scan_observations
-      WHERE scan_id = ? AND cohort_clone = 0 AND data_valid = 1 AND research_model_version = ?
-      ORDER BY research_eligible DESC, strict_eligible DESC,
-      CASE WHEN net_annualized IS NULL THEN 1 ELSE 0 END, CAST(net_annualized AS REAL) DESC LIMIT 40`)
-      .all(lastScan.scan_id, this.modelVersion) as Array<Record<string, unknown>>).map(observationFromRow)
+    const scanRows = this.database.prepare(`SELECT * FROM funding_scan_summaries
+      WHERE research_model_version = ? AND observed_at >= ? ORDER BY observed_at DESC`)
+      .all(this.modelVersion, dayAgo) as FundingScanSummaryRow[];
+    const lastScan = scanRows[0] ?? this.latestScanSummary();
+    const scan24h = scanRows.reduce((total, row) => ({
+      observations: total.observations + row.observations,
+      liveEligible: total.liveEligible + row.live_eligible,
+      researchEligible: total.researchEligible + row.research_eligible,
+      rejected: total.rejected + row.rejected,
+    }), { observations: 0, liveEligible: 0, researchEligible: 0, rejected: 0 });
+    const reasonCounts = new Map<string, number>();
+    for (const row of scanRows) {
+      for (const [reason, count] of Object.entries(parseReasonCounts(row.rejection_reasons_json))) {
+        reasonCounts.set(reason, (reasonCounts.get(reason) ?? 0) + count);
+      }
+    }
+    const rejectionReasons = [...reasonCounts].map(([reason, count]) => ({ reason, count }))
+      .sort((left, right) => right.count - left.count || left.reason.localeCompare(right.reason)).slice(0, 20);
+    const latestObservations = !lastScan ? [] : this.summaryObservations(lastScan, 40)
       .map((item) => this.withHistoryStats(item, dayAgo));
     const positions = this.list(100);
     const ledger = this.database.prepare(`SELECT cohort, state, funding_pnl, entry_fees, exit_fees, total_pnl
@@ -433,8 +480,7 @@ export class FundingResearchEngine {
       targetNotionalUsd: this.options.targetNotionalUsd,
       maxOpenPositions: this.options.maxOpenPositions, minimumSettledEvents: this.options.minimumSettledEvents,
       lastScanAt: lastScan?.observed_at ?? null,
-      scan24h: { observations: Number(scan24h.observations), liveEligible: Number(scan24h.liveEligible),
-        researchEligible: Number(scan24h.researchEligible), rejected: Number(scan24h.rejected) },
+      scan24h,
       rejectionReasons, latestObservations,
       openCount: ledger.filter((position) => position.state === 'OPEN').length,
       closedCount: closed.length,
@@ -467,14 +513,19 @@ export class FundingResearchEngine {
   }
 
   private withHistoryStats(observation: FundingScanObservation, dayAgo: string): FundingScanObservation {
-    const directions = this.database.prepare(`SELECT observed_at, long_venue, short_venue, raw_funding_pnl
-      FROM funding_scan_observations WHERE asset = ? AND observed_at >= ? AND cohort_clone = 0 AND data_valid = 1
-      AND research_model_version = ?
-      AND ((long_venue = ? AND short_venue = ?) OR (long_venue = ? AND short_venue = ?))
-      ORDER BY observed_at DESC`).all(observation.asset, dayAgo, this.modelVersion,
-      observation.longVenue, observation.shortVenue,
-      observation.shortVenue, observation.longVenue) as Array<{ observed_at: string; long_venue: string;
-        short_venue: string; raw_funding_pnl: string | null }>;
+    const readDirection = (longVenue: string, shortVenue: string) => this.database.prepare(`
+      SELECT observed_at, long_venue, short_venue, raw_funding_pnl
+      FROM funding_scan_observations
+      WHERE asset = ? AND long_venue = ? AND short_venue = ? AND observed_at >= ?
+        AND cohort_clone = 0 AND data_valid = 1
+      ORDER BY observed_at DESC LIMIT 750`).all(observation.asset, longVenue, shortVenue, dayAgo) as Array<{
+        observed_at: string; long_venue: string; short_venue: string; raw_funding_pnl: string | null;
+      }>;
+    // 精确命中现有 pair-time 索引并限制返回量；旧 OR 查询会为前端每张卡片扫描整天原始明细。
+    const directions = [
+      ...readDirection(observation.longVenue, observation.shortVenue),
+      ...readDirection(observation.shortVenue, observation.longVenue),
+    ].sort((left, right) => right.observed_at.localeCompare(left.observed_at)).slice(0, 1_500);
     let flips = 0;
     let previous: string | null = null;
     let edgeStart = observation.observedAt;
@@ -576,6 +627,22 @@ export class FundingResearchEngine {
        long_quote, short_quote, long_quote_to_usd, short_quote_to_usd, liquidity_usd, execution_support,
        cohort_clone, stablecoin_risk_buffer)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const summaryStatement = this.database.prepare(`INSERT INTO funding_scan_summaries
+      (scan_id, research_model_version, observed_at, observations, live_eligible, research_eligible,
+       rejected, rejection_reasons_json, observation_ids_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(scan_id) DO UPDATE SET research_model_version = excluded.research_model_version,
+        observed_at = excluded.observed_at, observations = excluded.observations,
+        live_eligible = excluded.live_eligible, research_eligible = excluded.research_eligible,
+        rejected = excluded.rejected, rejection_reasons_json = excluded.rejection_reasons_json,
+        observation_ids_json = excluded.observation_ids_json`);
+    const summaryGroups = new Map<string, FundingScanObservation[]>();
+    for (const item of observations) {
+      if (item.cohortClone || item.dataValid === false) continue;
+      const group = summaryGroups.get(item.scanId) ?? [];
+      group.push(item);
+      summaryGroups.set(item.scanId, group);
+    }
     this.database.transaction(() => {
       for (const item of observations) {
         statement.run(item.id, item.scanId, item.observedAt, item.asset,
@@ -596,6 +663,18 @@ export class FundingResearchEngine {
           .run(item.dataValid === false ? 0 : 1, item.invalidReason ?? null, item.persistenceProbability ?? null,
             item.persistenceSamples ?? 0, item.retentionFactorUsed ?? null, item.historicalEdgeP10 ?? null,
             item.historicalEdgeMedian ?? null, item.requestedNotionalUsd ?? null, this.modelVersion, item.id);
+      }
+      for (const [scanId, items] of summaryGroups) {
+        const rejectionReasons: Record<string, number> = {};
+        for (const item of items.filter((entry) => entry.status === 'REJECTED')) {
+          rejectionReasons[item.primaryReason] = (rejectionReasons[item.primaryReason] ?? 0) + 1;
+        }
+        const rankedIds = rankedObservations(items).slice(0, 60).map((item) => item.id);
+        summaryStatement.run(scanId, this.modelVersion, items[0]!.observedAt, items.length,
+          items.filter((item) => item.strictEligible).length,
+          items.filter((item) => item.researchEligible).length,
+          items.filter((item) => item.status === 'REJECTED').length,
+          JSON.stringify(rejectionReasons), JSON.stringify(rankedIds));
       }
     })();
   }

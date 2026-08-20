@@ -239,10 +239,18 @@ export class FundingPaperEngine {
     const cumulativeFunding = sum(ledger.map((position) => position.funding_pnl));
     const cumulativeFees = sum(ledger.map((position) => new Decimal(position.entry_fees).plus(position.exit_fees).toString()));
     const winners = closed.filter((position) => new Decimal(position.total_pnl).gt(0)).length;
-    const fundingData = this.database.prepare(`SELECT COUNT(*) AS count, MAX(observed_at) AS latest
-      FROM funding_rate_snapshots`).get() as { count: number; latest: string | null };
-    const executionData = this.database.prepare(`SELECT COUNT(*) AS count, MAX(sampled_at) AS latest
-      FROM execution_market_samples`).get() as { count: number; latest: string | null };
+    // 两张原始样本表会增长到千万级；每次前端轮询做 COUNT/MAX 会同步阻塞整个 Node 事件循环。
+    // sqlite_sequence 表示累计写入量，最新时间按自增主键读取，两个查询都只访问常数行。
+    const fundingData = this.database.prepare(`SELECT
+      COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'funding_rate_snapshots'), 0) AS count,
+      (SELECT observed_at FROM funding_rate_snapshots ORDER BY id DESC LIMIT 1) AS latest`).get() as {
+        count: number; latest: string | null;
+      };
+    const executionData = this.database.prepare(`SELECT
+      COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'execution_market_samples'), 0) AS count,
+      (SELECT sampled_at FROM execution_market_samples ORDER BY id DESC LIMIT 1) AS latest`).get() as {
+        count: number; latest: string | null;
+      };
     return {
       enabled: this.options.enabled, openCount: open.length, closedCount: closed.length,
       winRate: closed.length === 0 ? '0' : new Decimal(winners).div(closed.length).toString(),

@@ -29,6 +29,7 @@ const CURRENT_SCHEMA_TABLES = [
   'funding_research_variants',
   'funding_rate_history',
   'funding_scan_observations',
+  'funding_scan_summaries',
   'hyperliquid_perp_metadata',
   'schema_migrations',
 ] as const;
@@ -74,13 +75,16 @@ export function assertDatabaseIntegrity(database: Database.Database): void {
   if (result !== 'ok') throw new Error(`SQLite integrity check failed: ${String(result)}`);
 }
 
-function assertCurrentSchema(database: Database.Database): void {
+function assertCurrentSchema(database: Database.Database, includeScanSummaries: boolean): void {
+  const requiredTables = includeScanSummaries
+    ? CURRENT_SCHEMA_TABLES
+    : CURRENT_SCHEMA_TABLES.filter((table) => table !== 'funding_scan_summaries');
   const rows = database.prepare(`
     SELECT name FROM sqlite_master
-    WHERE type = 'table' AND name IN (${CURRENT_SCHEMA_TABLES.map(() => '?').join(', ')})
-  `).all(...CURRENT_SCHEMA_TABLES) as Array<{ name: string }>;
+    WHERE type = 'table' AND name IN (${requiredTables.map(() => '?').join(', ')})
+  `).all(...requiredTables) as Array<{ name: string }>;
   const present = new Set(rows.map((row) => row.name));
-  const missing = CURRENT_SCHEMA_TABLES.filter((table) => !present.has(table));
+  const missing = requiredTables.filter((table) => !present.has(table));
   if (missing.length > 0) throw new Error(`Database schema is missing required tables: ${missing.join(', ')}`);
   const auditColumns = database.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
   if (!auditColumns.some((column) => column.name === 'correlation_id')) {
@@ -147,7 +151,9 @@ export function openDatabase(databasePath: string, migrationsDir: string,
     // 大库每次重启做全页 quick_check 会把磁盘读满并让网页长时间 502。迁移校验和 schema 检查仍同步执行，
     // 全库完整性检查改到停机维护窗口；小库、内存库和测试库继续在启动时检查。
     if (!onDisk || statSync(databasePath).size <= startupIntegrityMaxBytes) assertDatabaseIntegrity(database);
-    if (migrationFiles.includes('0014_database_maintenance.sql')) assertCurrentSchema(database);
+    if (migrationFiles.includes('0014_database_maintenance.sql')) {
+      assertCurrentSchema(database, migrationFiles.includes('0026_funding_scan_summaries.sql'));
+    }
     database.pragma('optimize');
     return database;
   } catch (error) {

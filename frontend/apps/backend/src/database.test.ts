@@ -46,8 +46,8 @@ describe('database migrations', () => {
 
     expect(readDatabaseStatus(first)).toEqual({
       state: 'ok',
-      migrationCount: 25,
-      currentMigration: '0025_long_horizon_research.sql',
+      migrationCount: 26,
+      currentMigration: '0026_funding_scan_summaries.sql',
     });
     const orderColumns = first.prepare('PRAGMA table_info(execution_orders)').all() as Array<{ name: string }>;
     expect(orderColumns.map((column) => column.name)).toContain('failure_reason');
@@ -60,7 +60,7 @@ describe('database migrations', () => {
     first.close();
 
     const reopened = openDatabase(location.path, migrationsDir);
-    expect(readDatabaseStatus(reopened).migrationCount).toBe(25);
+    expect(readDatabaseStatus(reopened).migrationCount).toBe(26);
     reopened.close();
   });
 
@@ -70,7 +70,7 @@ describe('database migrations', () => {
     openDatabase(location.path, migrationsDir).close();
 
     const reopened = openDatabase(location.path, migrationsDir, { startupIntegrityMaxBytes: 0 });
-    expect(readDatabaseStatus(reopened)).toMatchObject({ state: 'ok', currentMigration: '0025_long_horizon_research.sql' });
+    expect(readDatabaseStatus(reopened)).toMatchObject({ state: 'ok', currentMigration: '0026_funding_scan_summaries.sql' });
     reopened.close();
   });
 
@@ -155,7 +155,7 @@ describe('database migrations', () => {
     const database = openDatabase(location.path, resolve(process.cwd(), '../../migrations'));
     const columns = database.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain('correlation_id');
-    expect(readDatabaseStatus(database).currentMigration).toBe('0025_long_horizon_research.sql');
+    expect(readDatabaseStatus(database).currentMigration).toBe('0026_funding_scan_summaries.sql');
     database.close();
   });
 
