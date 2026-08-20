@@ -233,14 +233,40 @@ export class FundingCandidateScanner {
         return { first, second, firstEvents, secondEvents, rawEdge: firstTotal.minus(secondTotal).abs() };
       })).filter((item) => item.firstEvents > 0 || item.secondEvents > 0)
         .sort((left, right) => right.rawEdge.cmp(left.rawEdge));
-      // 研究池只深算毛费率最优的少数组合；严格池仍保留四家已支持执行器的全部组合。
-      const selected = combinations.filter((item, index) => {
-        if (index < maxPairsPerAsset) return true;
-        if (!strictAssets.has(asset)) return false;
-        const firstVenue = SYMBOL.exec(item.first.symbol)?.[1] as ExecutionVenue | undefined;
-        const secondVenue = SYMBOL.exec(item.second.symbol)?.[1] as ExecutionVenue | undefined;
-        return Boolean(firstVenue && secondVenue && LIVE_VENUES.has(firstVenue) && LIVE_VENUES.has(secondVenue));
-      });
+      // 毛费率第一名可能来自尚未接入执行器或盘口未同步的交易所，不能让它占掉整个研究名额。
+      // 研究池额外保留可执行且已同步的最优组合；严格池仍检查四家执行器支持交易所的全部组合。
+      const selected: typeof combinations = [];
+      const addSelected = (item: (typeof combinations)[number]): void => {
+        if (!selected.includes(item)) selected.push(item);
+      };
+      combinations.slice(0, maxPairsPerAsset).forEach(addSelected);
+      if (strictAssets.has(asset)) {
+        combinations.forEach((item) => {
+          const firstVenue = SYMBOL.exec(item.first.symbol)?.[1] as ExecutionVenue | undefined;
+          const secondVenue = SYMBOL.exec(item.second.symbol)?.[1] as ExecutionVenue | undefined;
+          if (firstVenue && secondVenue && LIVE_VENUES.has(firstVenue) && LIVE_VENUES.has(secondVenue)) addSelected(item);
+        });
+      } else if (researchAssets.has(asset)) {
+        let synchronizedPairs = 0;
+        for (const item of combinations) {
+          const firstVenue = SYMBOL.exec(item.first.symbol)?.[1] as ExecutionVenue | undefined;
+          const secondVenue = SYMBOL.exec(item.second.symbol)?.[1] as ExecutionVenue | undefined;
+          if (!firstVenue || !secondVenue || !LIVE_VENUES.has(firstVenue) || !LIVE_VENUES.has(secondVenue)) continue;
+          const firstRule = ruleMap.get(item.first.symbol);
+          const secondRule = ruleMap.get(item.second.symbol);
+          if (!firstRule || !secondRule || firstRule.state !== 'live' || secondRule.state !== 'live') continue;
+          const firstTotal = new Decimal(item.first.funding_rate).mul(item.firstEvents);
+          const secondTotal = new Decimal(item.second.funding_rate).mul(item.secondEvents);
+          const [longVenue, shortVenue] = firstTotal.lte(secondTotal)
+            ? [firstVenue, secondVenue] as const : [secondVenue, firstVenue] as const;
+          try {
+            if (this.market.pair(asset, longVenue, shortVenue, this.now()).quality !== 'LIVE_SYNCHRONIZED') continue;
+          } catch { continue; }
+          addSelected(item);
+          synchronizedPairs += 1;
+          if (synchronizedPairs >= maxPairsPerAsset) break;
+        }
+      }
       for (const combination of selected) {
         const { first, second, firstEvents, secondEvents } = combination;
         const firstMatch = SYMBOL.exec(first.symbol);

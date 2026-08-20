@@ -96,6 +96,57 @@ describe('FundingCandidateScanner', () => {
     expect(Number((observations[0] as { tradingFees: string }).tradingFees)).toBeGreaterThan(0);
   });
 
+  it('毛费率最优组合不可用时继续评估已同步的执行器组合', async () => {
+    const symbols = {
+      BINANCE: 'BINANCE_FUTURE_SOL_USDT', OKX: 'OKX_FUTURE_SOL_USDT',
+      KRAKEN: 'KRAKEN_FUTURE_SOL_USD', HYPERLIQUID: 'HYPERLIQUID_FUTURE_SOL_USDC',
+    } as const;
+    const rule = (venue: keyof typeof symbols) => ({ symbol: symbols[venue], exchange_type: venue,
+      business_type: 'FUTURE', state: 'live', min_size: '0.01', min_notional: '5', lot_size: '0.01',
+      tick_size: '0.01', max_num_orders: '10', max_market_size: '100', max_limit_size: '100',
+      contract_size: '1', liquidation_fee: '0', delist_time: '0' });
+    const testGateway = {
+      querySymbols: async () => (Object.keys(symbols) as Array<keyof typeof symbols>).map(rule),
+      queryFeeRates: async () => Object.keys(symbols).map((venue) => ({ exchange_type: venue,
+        spot_maker_fee: '0', spot_taker_fee: '0', future_maker_fee: '0.0002', future_taker_fee: '0.0005' })),
+      queryFundingInfo: async () => [
+        { symbol: symbols.KRAKEN, funding_rate: '-0.01', funding_time: '2000000', funding_interval: '28800' },
+        { symbol: symbols.HYPERLIQUID, funding_rate: '0.01', funding_time: '2000000', funding_interval: '28800' },
+        { symbol: symbols.BINANCE, funding_rate: '-0.0001', funding_time: '2000000', funding_interval: '28800' },
+        { symbol: symbols.OKX, funding_rate: '0.0002', funding_time: '2000000', funding_interval: '28800' },
+      ],
+    } as unknown as TradingCrossExGateway;
+    const liveMarket = market();
+    const marketReader = {
+      ...liveMarket,
+      pair: (_asset: string, longVenue: string, shortVenue: string) => {
+        const pair = liveMarket.pair('SOL', 'BINANCE', 'OKX', NOW);
+        return [longVenue, shortVenue].some((venue) => venue === 'KRAKEN' || venue === 'HYPERLIQUID')
+          ? { ...pair, longVenue, shortVenue, quality: 'BOOTSTRAPPING' as const, reasons: ['venue_not_live'] }
+          : { ...pair, longVenue, shortVenue };
+      },
+    } as unknown as ExecutionMarketReader;
+    const observations: FundingScanObservation[] = [];
+    const scanner = new FundingCandidateScanner(testGateway,
+      async () => ({ apiKey: 'key', apiSecret: 'secret' }), marketReader,
+      { observeAuthoritativeCandidate: vi.fn() } as unknown as FundingArbitrageEngine,
+      { assets: ['SOL'], strictAssets: [], researchAssets: ['SOL'], targetNotionalUsd: '5',
+        researchTargetNotionalUsd: '5', horizonHours: 24, fundingRetentionFactor: '0.5',
+        stressSlippageBps: '5', adverseExitBasisBps: '10', minNetAnnualized: '0.1',
+        researchMaxSlippageBps: '10', minLiquidityUsd: '900', maxPairsPerAsset: 1,
+        onFundingData: async (_funding, _fees, rows) => { observations.push(...rows); }, now: () => NOW },
+    );
+
+    expect(await scanner.scan()).toBe(0);
+    expect(observations).toHaveLength(2);
+    expect(observations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ longVenue: 'KRAKEN', shortVenue: 'HYPERLIQUID',
+        status: 'REJECTED', primaryReason: 'market_not_synchronized' }),
+      expect.objectContaining({ longVenue: 'BINANCE', shortVenue: 'OKX',
+        status: 'RESEARCH_ELIGIBLE', researchEligible: true, marketQuality: 'LIVE_SYNCHRONIZED' }),
+    ]));
+  });
+
   it('跨 USD/USDC 报价先换算汇率、计提稳定币风险并保持仅研究标记', async () => {
     const makeBook = (venue: 'KRAKEN' | 'HYPERLIQUID', quote: 'USD' | 'USDC', rate: string) => ({
       venue, symbol: venue === 'KRAKEN' ? 'PF_SOLUSD' : 'SOL', base: 'SOL', quote,
