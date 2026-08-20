@@ -6,7 +6,8 @@ const EXECUTION_RETENTION_MS = 365 * DAY_MS;
 const MAX_AUDIT_EVENTS = 50_000;
 const MARKET_SAMPLE_RETENTION_MS = 30 * DAY_MS;
 const FUNDING_SNAPSHOT_RETENTION_MS = 30 * DAY_MS;
-const FUNDING_SCAN_RETENTION_MS = 3 * DAY_MS;
+// 参数回放至少需要跨多个结算周期和不同波动日；严格池缩到主流币后，14 天原始候选量仍可控。
+const FUNDING_SCAN_RETENTION_MS = 14 * DAY_MS;
 
 export interface DatabaseMaintenanceResult {
   auditEventsDeleted: number;

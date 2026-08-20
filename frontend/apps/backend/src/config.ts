@@ -99,6 +99,8 @@ export interface BackendConfig {
     rollingHoldExitConfirmations: number;
     rollingReversalExitConfirmations: number;
     reentryCooldownMs: number;
+    holdStressSlippageBps: string;
+    holdAdverseExitBasisBps: string;
     makerFillProbability: string;
     makerLegRiskBps: string;
   };
@@ -213,7 +215,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
   const fundingScanAssets = parseAssetList(environment.GCT_FUNDING_SCAN_ASSETS ?? executionMarketSymbols.join(','), 'GCT_FUNDING_SCAN_ASSETS');
   const fundingResearchAssets = parseAssetList(environment.GCT_FUNDING_RESEARCH_ASSETS ?? DEFAULT_RESEARCH_ASSETS, 'GCT_FUNDING_RESEARCH_ASSETS');
   const fundingResearchEnabled = environment.GCT_FUNDING_RESEARCH_ENABLED === '1';
-  const fundingResearchModelVersion = (environment.GCT_FUNDING_RESEARCH_MODEL_VERSION ?? 'rolling_v2').trim();
+  const fundingResearchModelVersion = (environment.GCT_FUNDING_RESEARCH_MODEL_VERSION ?? 'rolling_v3').trim();
   if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(fundingResearchModelVersion)) {
     throw new Error('GCT_FUNDING_RESEARCH_MODEL_VERSION must use lowercase letters, digits, underscores, or hyphens');
   }
@@ -375,16 +377,24 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       rollingSoftReviewMs: fundingResearchRollingSoftReviewMs,
       rollingHardHoldingMs: fundingResearchRollingHardHoldingMs,
       rollingHoldExitConfirmations: parsePositiveInteger(
-        environment.GCT_FUNDING_RESEARCH_HOLD_EXIT_CONFIRMATIONS ?? '30',
+        environment.GCT_FUNDING_RESEARCH_HOLD_EXIT_CONFIRMATIONS ?? '60',
         'GCT_FUNDING_RESEARCH_HOLD_EXIT_CONFIRMATIONS',
       ),
       rollingReversalExitConfirmations: parsePositiveInteger(
-        environment.GCT_FUNDING_RESEARCH_REVERSAL_EXIT_CONFIRMATIONS ?? '15',
+        environment.GCT_FUNDING_RESEARCH_REVERSAL_EXIT_CONFIRMATIONS ?? '30',
         'GCT_FUNDING_RESEARCH_REVERSAL_EXIT_CONFIRMATIONS',
       ),
       reentryCooldownMs: parsePositiveInteger(
-        environment.GCT_FUNDING_RESEARCH_REENTRY_COOLDOWN_MS ?? '28800000',
+        environment.GCT_FUNDING_RESEARCH_REENTRY_COOLDOWN_MS ?? '43200000',
         'GCT_FUNDING_RESEARCH_REENTRY_COOLDOWN_MS',
+      ),
+      holdStressSlippageBps: parseNonNegativeDecimal(
+        environment.GCT_FUNDING_RESEARCH_HOLD_STRESS_SLIPPAGE_BPS ?? '2',
+        'GCT_FUNDING_RESEARCH_HOLD_STRESS_SLIPPAGE_BPS',
+      ),
+      holdAdverseExitBasisBps: parseNonNegativeDecimal(
+        environment.GCT_FUNDING_RESEARCH_HOLD_ADVERSE_BASIS_BPS ?? '3',
+        'GCT_FUNDING_RESEARCH_HOLD_ADVERSE_BASIS_BPS',
       ),
       makerFillProbability: parseUnitInterval(environment.GCT_FUNDING_RESEARCH_MAKER_FILL_PROBABILITY ?? '0.35', 'GCT_FUNDING_RESEARCH_MAKER_FILL_PROBABILITY'),
       makerLegRiskBps: parseNonNegativeDecimal(environment.GCT_FUNDING_RESEARCH_MAKER_LEG_RISK_BPS ?? '5', 'GCT_FUNDING_RESEARCH_MAKER_LEG_RISK_BPS'),

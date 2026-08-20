@@ -28,6 +28,9 @@ const SYMBOL_VENUE = /^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT)_FUTUR
 const DEFAULT_MAX_REQUEST_SYMBOLS = 50;
 // 50 个资产 × 7 个交易所仍需完整保留在历史工作集，避免尾部交易所被 LRU 静默挤出。
 const DEFAULT_MAX_BACKGROUND_SYMBOLS = 350;
+const DEFAULT_MAX_BACKGROUND_VENUES = 2;
+const VENUE_NETWORK_BACKOFF_BASE_MS = 30_000;
+const VENUE_NETWORK_BACKOFF_MAX_MS = 10 * 60_000;
 
 export interface FundingHistoryServiceOptions {
   freshMs?: number;
@@ -37,6 +40,7 @@ export interface FundingHistoryServiceOptions {
   retentionMs?: number;
   maxRequestSymbols?: number;
   maxBackgroundSymbols?: number;
+  maxBackgroundVenues?: number;
   now?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
   /** Tests can disable pacing; production spaces costly Hyperliquid history calls. */
@@ -89,6 +93,7 @@ export class FundingHistoryService {
   private readonly venueTails = new Map<string, Promise<void>>();
   private readonly venueLastStartedAt = new Map<string, number>();
   private readonly venueCooldownUntil = new Map<string, number>();
+  private readonly venueFailureCounts = new Map<string, number>();
   private readonly freshMs: number;
   private readonly backgroundIntervalMs: number;
   private readonly failureCacheMs: number;
@@ -96,6 +101,7 @@ export class FundingHistoryService {
   private readonly retentionMs: number;
   private readonly maxRequestSymbols: number;
   private readonly maxBackgroundSymbols: number;
+  private readonly maxBackgroundVenues: number;
   private readonly recentSymbols = new Map<string, number>();
   private readonly now: () => number;
   private readonly sleep: (milliseconds: number) => Promise<void>;
@@ -103,6 +109,7 @@ export class FundingHistoryService {
   private readonly warn: (symbol: string, reason: string) => void;
   private lastPrunedAt: number | null = null;
   private backgroundEnabled = false;
+  private backgroundPaused = false;
   private backgroundTimer: ReturnType<typeof setInterval> | null = null;
   private backgroundRun: Promise<void> | null = null;
   private backgroundController: AbortController | null = null;
@@ -119,6 +126,7 @@ export class FundingHistoryService {
     this.retentionMs = options.retentionMs ?? DEFAULT_RETENTION_MS;
     this.maxRequestSymbols = options.maxRequestSymbols ?? DEFAULT_MAX_REQUEST_SYMBOLS;
     this.maxBackgroundSymbols = options.maxBackgroundSymbols ?? DEFAULT_MAX_BACKGROUND_SYMBOLS;
+    this.maxBackgroundVenues = Math.max(1, options.maxBackgroundVenues ?? DEFAULT_MAX_BACKGROUND_VENUES);
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? (async (milliseconds) => await new Promise((resolve) => setTimeout(resolve, milliseconds)));
     this.venueSpacingMs = {
@@ -153,6 +161,15 @@ export class FundingHistoryService {
     this.backgroundController?.abort();
     await this.backgroundRun;
     this.backgroundController = null;
+  }
+
+  /**
+   * 实时行情过载时暂停非关键历史回补；已有缓存仍可读，恢复后会从原覆盖点继续补齐。
+   */
+  setBackgroundPaused(paused: boolean): void {
+    if (this.backgroundPaused === paused) return;
+    this.backgroundPaused = paused;
+    if (!paused && this.backgroundEnabled) void this.refreshCachedSymbols();
   }
 
   /** 把策略扫描池加入后台真实结算历史工作集；这里只登记，不阻塞当前扫描或页面请求。 */
@@ -357,7 +374,7 @@ export class FundingHistoryService {
   }
 
   private refreshCachedSymbols(): Promise<void> {
-    if (!this.backgroundEnabled) return Promise.resolve();
+    if (!this.backgroundEnabled || this.backgroundPaused) return Promise.resolve();
     if (this.backgroundRun) return this.backgroundRun;
     const pending = (async () => {
       this.pruneIfNeeded();
@@ -372,12 +389,20 @@ export class FundingHistoryService {
         group.push(symbol);
         symbolsByVenue.set(venue, group);
       }
-      await Promise.all([...symbolsByVenue.values()].map(async (group) => {
-        for (const symbol of group) {
-          if (!this.backgroundEnabled || controller?.signal.aborted) return;
-          await this.refreshWithSignal(symbol, THIRTY_DAYS_MS, controller?.signal);
+      const groups = [...symbolsByVenue.values()];
+      let nextGroup = 0;
+      // 历史回补是低优先级任务。限制并行交易所数量，避免行情洪峰时与盘口和候选扫描争抢事件循环。
+      const workers = Array.from({ length: Math.min(this.maxBackgroundVenues, groups.length) }, async () => {
+        while (nextGroup < groups.length) {
+          const group = groups[nextGroup++];
+          if (!group) return;
+          for (const symbol of group) {
+            if (!this.backgroundEnabled || this.backgroundPaused || controller?.signal.aborted) return;
+            await this.refreshWithSignal(symbol, THIRTY_DAYS_MS, controller?.signal);
+          }
         }
-      }));
+      });
+      await Promise.all(workers);
     })().catch((error: unknown) => {
       this.warn('BACKGROUND', error instanceof Error ? error.message : 'FUNDING_BACKGROUND_ERROR');
     }).finally(() => {
@@ -420,18 +445,38 @@ export class FundingHistoryService {
         );
         replaceFundingHistoryRange(this.database, symbol, fetchStart, endTime, points, fetchedAt);
         this.failures.delete(symbol);
+        this.venueFailureCounts.delete(venue);
+        this.venueCooldownUntil.delete(venue);
       } catch (error) {
         if (signal?.aborted || (error instanceof PublicMarketDataError && error.code === 'ABORTED')) {
           return this.readEntry(symbol, endTime, requiredWindowMs);
         }
-        const reason = error instanceof Error ? error.message : 'PUBLIC_DATA_ERROR';
+        const reason = error instanceof PublicMarketDataError && error.diagnostic
+          ? `${error.message}:${error.diagnostic}`
+          : error instanceof Error ? error.message : 'PUBLIC_DATA_ERROR';
         const bybitIpLimited = venue === 'BYBIT' && error instanceof PublicMarketDataError
           && error.code === 'UPSTREAM_HTTP_403';
-        if (bybitIpLimited) this.venueCooldownUntil.set(venue, endTime + 10 * 60_000);
+        const retryable = bybitIpLimited || isRetryablePublicMarketDataError(error);
+        if (retryable) {
+          const failureCount = (this.venueFailureCounts.get(venue) ?? 0) + 1;
+          this.venueFailureCounts.set(venue, failureCount);
+          const exponentialBackoff = Math.min(
+            VENUE_NETWORK_BACKOFF_MAX_MS,
+            VENUE_NETWORK_BACKOFF_BASE_MS * 2 ** Math.min(failureCount - 1, 5),
+          );
+          const upstreamBackoff = error instanceof PublicMarketDataError ? error.retryAfterMs ?? 0 : 0;
+          const cooldownMs = bybitIpLimited
+            ? Math.max(VENUE_NETWORK_BACKOFF_MAX_MS, upstreamBackoff)
+            : Math.max(exponentialBackoff, upstreamBackoff);
+          // 同一交易所首个网络错误后整所退避，不能让剩余几十个币继续逐个超时。
+          this.venueCooldownUntil.set(venue, this.now() + cooldownMs);
+        } else {
+          this.venueFailureCounts.delete(venue);
+        }
         recordFundingHistoryFailure(this.database, symbol, fetchedAt, reason);
         this.failures.set(symbol, {
           until: endTime + (bybitIpLimited ? 10 * 60_000 : this.failureCacheMs),
-          retryable: bybitIpLimited || isRetryablePublicMarketDataError(error),
+          retryable,
         });
         this.warn(symbol, reason);
       }

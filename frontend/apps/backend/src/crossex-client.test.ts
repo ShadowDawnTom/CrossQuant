@@ -90,6 +90,15 @@ describe('Gate APIv4 signing', () => {
       .rejects.toEqual(new GateApiError(401, 'INVALID_SIGNATURE'));
   });
 
+  it('网络失败只暴露安全诊断码，不记录底层错误消息', async () => {
+    const failure = Object.assign(new TypeError('sensitive socket detail'), { code: 'ETIMEDOUT' });
+    const client = new GateCrossExClient(vi.fn(async () => { throw failure; }) as unknown as typeof fetch);
+
+    await expect(client.queryAccount({ apiKey: 'test-api-key', apiSecret: 'test-secret' })).rejects.toMatchObject({
+      label: 'NETWORK_ERROR', diagnostic: 'ETIMEDOUT',
+    });
+  });
+
   it('signs and sends only the documented CrossEx order create and cancel routes', async () => {
     const calls: Array<{ url: string; method: string; body: string | null; sign: string | null; channel: string | null }> = [];
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {

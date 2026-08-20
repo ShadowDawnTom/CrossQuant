@@ -9,6 +9,7 @@ import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { Decimal } from 'decimal.js';
 import { z } from 'zod';
 import { PublicMarketDataError, type PublicMarketDataGateway } from '@gate-crossex/public-data';
@@ -718,8 +719,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     minimumHoldValueUsd: config.fundingArbitrage.minimumHoldValueUsd,
     settlementGuardMs: config.fundingArbitrage.settlementGuardMs,
     fundingRetentionFactor: config.fundingArbitrage.fundingRetentionFactor,
-    stressSlippageBps: config.fundingArbitrage.stressSlippageBps,
-    adverseExitBasisBps: config.fundingArbitrage.adverseExitBasisBps,
+    stressSlippageBps: config.fundingResearch.holdStressSlippageBps,
+    adverseExitBasisBps: config.fundingResearch.holdAdverseExitBasisBps,
     rollingSoftReviewMs: config.fundingResearch.rollingSoftReviewMs,
     rollingHardHoldingMs: config.fundingResearch.rollingHardHoldingMs,
     stablecoinRiskBps: config.fundingResearch.stablecoinRiskBps,
@@ -990,6 +991,14 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   let fundingArbitrageMonitorTimer: ReturnType<typeof setInterval> | null = null;
   let fundingCandidateScanTimer: ReturnType<typeof setInterval> | null = null;
   let executionHealthMonitorTimer: ReturnType<typeof setInterval> | null = null;
+  let serviceLoadMonitorTimer: ReturnType<typeof setInterval> | null = null;
+  const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+  let historyPausedForLoad = false;
+  let historyPausedForScan = false;
+  let overloadWindows = 0;
+  let recoveryWindows = 0;
+  let fundingScanFailures = 0;
+  let fundingScanRun: Promise<void> | null = null;
   let previousExecutionHealth = executionMarketHub.health();
   const previousBookCounters = new Map<string, { rebuilds: number; sequenceGaps: number }>();
   const schedulePortfolioReconciliation = () => {
@@ -1000,6 +1009,46 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       schedulePortfolioReconciliation();
     }, interval);
     portfolioReconcileTimer.unref?.();
+  };
+
+  const applyHistoryPause = (): void => {
+    fundingHistoryService.setBackgroundPaused(historyPausedForLoad || historyPausedForScan);
+  };
+
+  const executeFundingCandidateScan = async (): Promise<void> => {
+    if (!fundingCandidateScanner) return;
+    try {
+      await fundingCandidateScanner.scan();
+      if (fundingScanFailures >= 2) {
+        void alertDispatcher.emit({ eventType: 'funding_scan_recovered', severity: 'info',
+          message: '资金费候选扫描已恢复，后台历史回补继续运行', details: { previousFailures: fundingScanFailures } });
+      }
+      fundingScanFailures = 0;
+      historyPausedForScan = false;
+      applyHistoryPause();
+    } catch (error) {
+      fundingScanFailures += 1;
+      historyPausedForScan = fundingScanFailures >= 2;
+      applyHistoryPause();
+      const reason = error instanceof GateApiError ? error.label : error instanceof Error ? error.name : 'UNKNOWN_ERROR';
+      const diagnostic = error instanceof GateApiError ? error.diagnostic : undefined;
+      app.log.warn({ err: error, fundingScanFailures }, 'authoritative funding candidate scan failed');
+      if (fundingScanFailures === 2) {
+        void alertDispatcher.emit({ eventType: 'funding_scan_degraded', severity: 'critical',
+          message: '资金费候选扫描连续失败，已暂停低优先级历史回补并保护实时行情',
+          details: { reason, diagnostic: diagnostic ?? null, consecutiveFailures: fundingScanFailures },
+          dedupKey: `funding-scan-degraded:${reason}:${diagnostic ?? 'none'}` });
+      }
+    }
+  };
+
+  const runFundingCandidateScan = (): Promise<void> => {
+    if (fundingScanRun) return fundingScanRun;
+    const pending = executeFundingCandidateScan().finally(() => {
+      if (fundingScanRun === pending) fundingScanRun = null;
+    });
+    fundingScanRun = pending;
+    return pending;
   };
 
   if (options.startMarketStream) {
@@ -1023,15 +1072,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       });
     }, 5_000);
     fundingArbitrageMonitorTimer.unref?.();
-    fundingCandidateScanTimer = setInterval(() => {
-      void fundingCandidateScanner?.scan().catch((error) => {
-        app.log.warn({ err: error }, 'authoritative funding candidate scan failed');
-      });
-    }, config.fundingArbitrage.scanIntervalMs);
+    fundingCandidateScanTimer = setInterval(() => void runFundingCandidateScan(), config.fundingArbitrage.scanIntervalMs);
     fundingCandidateScanTimer.unref?.();
-    setTimeout(() => void fundingCandidateScanner?.scan().catch((error) => {
-      app.log.warn({ err: error }, 'initial authoritative funding candidate scan failed');
-    }), 5_000).unref?.();
+    setTimeout(() => void runFundingCandidateScan(), 5_000).unref?.();
     void alertDispatcher.emit({ eventType: 'service_started', severity: 'info',
       message: 'CrossQuant 服务已启动', details: { fundingLiveEnabled: config.fundingArbitrage.enabled } });
     executionHealthMonitorTimer = setInterval(() => {
@@ -1065,6 +1108,33 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       previousExecutionHealth = current;
     }, 10_000);
     executionHealthMonitorTimer.unref?.();
+    eventLoopDelay.enable();
+    serviceLoadMonitorTimer = setInterval(() => {
+      const p99Ms = eventLoopDelay.percentile(99) / 1_000_000;
+      eventLoopDelay.reset();
+      if (p99Ms >= 250) {
+        overloadWindows += 1;
+        recoveryWindows = 0;
+      } else if (p99Ms < 100) {
+        recoveryWindows += 1;
+        overloadWindows = 0;
+      } else {
+        overloadWindows = 0;
+        recoveryWindows = 0;
+      }
+      if (!historyPausedForLoad && overloadWindows >= 3) {
+        historyPausedForLoad = true;
+        applyHistoryPause();
+        void alertDispatcher.emit({ eventType: 'event_loop_overloaded', severity: 'critical',
+          message: 'Node 事件循环持续过载，已暂停低优先级历史回补', details: { p99Ms: Math.round(p99Ms) } });
+      } else if (historyPausedForLoad && recoveryWindows >= 6) {
+        historyPausedForLoad = false;
+        applyHistoryPause();
+        void alertDispatcher.emit({ eventType: 'event_loop_recovered', severity: 'info',
+          message: 'Node 事件循环已恢复，后台历史回补继续运行', details: { p99Ms: Math.round(p99Ms) } });
+      }
+    }, 10_000);
+    serviceLoadMonitorTimer.unref?.();
     fundingHistoryService.startBackground();
     fundingHistoryService.trackSymbols(fundingScannerAssets.flatMap((asset) => (
       EXECUTION_VENUES.map((venue) => crossExFutureSymbol(venue, asset))
@@ -1094,6 +1164,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     if (fundingArbitrageMonitorTimer) clearInterval(fundingArbitrageMonitorTimer);
     if (fundingCandidateScanTimer) clearInterval(fundingCandidateScanTimer);
     if (executionHealthMonitorTimer) clearInterval(executionHealthMonitorTimer);
+    if (serviceLoadMonitorTimer) clearInterval(serviceLoadMonitorTimer);
+    eventLoopDelay.disable();
     livePortfolio.stop();
     marketHub.stop();
     executionMarketHub.stop();

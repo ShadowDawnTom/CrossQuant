@@ -114,6 +114,39 @@ describe('FundingResearchEngine', () => {
     expect(oneSettlement.reopenAfter).not.toBeNull();
   });
 
+  it('第一次双腿结算前不累计普通退出计数，结算后才重新连续确认', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'funding-research-long-hold-'));
+    const database = openDatabase(join(directory, 'test.sqlite'), resolve(process.cwd(), '../../migrations'));
+    resources.push({ directory, database });
+    let currentTime = Date.parse('2026-08-15T00:00:00.000Z');
+    const firstFundingSnapshotAt = currentTime;
+    const engine = new FundingResearchEngine(database, market(() => currentTime), {
+      enabled: true, modelVersion: 'rolling_v3', targetNotionalUsd: '5', maxOpenPositions: 1,
+      minimumSettledEvents: 1, holdingExitConfirmationCount: 2,
+      stressSlippageBps: '5', adverseExitBasisBps: '5', fundingRetentionFactor: '0.5',
+    }, () => currentTime);
+
+    await engine.observe([observation(currentTime)], funding(currentTime), fees);
+    currentTime += 1_000;
+    // 结算前交易所返回的 next_funding_time 不会跟着本地时钟向后滑动，测试也要保持同一结算事件。
+    await engine.observe([observation(currentTime)], funding(firstFundingSnapshotAt), fees);
+    expect(engine.list().find((item) => item.cohort === 'ROLLING')).toMatchObject({
+      state: 'OPEN', lastReason: 'research_waiting_first_settlement', unprofitableCount: 0,
+    });
+
+    currentTime += 60_000;
+    await engine.observe([observation(currentTime)], funding(currentTime), fees);
+    expect(engine.list().find((item) => item.cohort === 'ROLLING')).toMatchObject({
+      state: 'OPEN', lastReason: 'hold_value_confirmation_pending', unprofitableCount: 1, settledEvents: 2,
+    });
+
+    currentTime += 1_000;
+    await engine.observe([observation(currentTime)], funding(currentTime), fees);
+    expect(engine.list().find((item) => item.cohort === 'ROLLING')).toMatchObject({
+      state: 'CLOSED', lastReason: 'hold_value_not_positive', unprofitableCount: 2,
+    });
+  });
+
   it('关闭探索模拟时仍保存拒绝原因，但不会创建持仓', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'funding-research-disabled-'));
     const database = openDatabase(join(directory, 'test.sqlite'), resolve(process.cwd(), '../../migrations'));

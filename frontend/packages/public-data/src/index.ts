@@ -191,10 +191,29 @@ function positiveProduct(...factors: Array<number | null>): string | null {
 }
 
 export class PublicMarketDataError extends Error {
-  constructor(readonly code: string, readonly retryAfterMs: number | null = null) {
+  constructor(
+    readonly code: string,
+    readonly retryAfterMs: number | null = null,
+    readonly diagnostic: string | null = null,
+  ) {
     super(`Public market data request failed: ${code}`);
     this.name = 'PublicMarketDataError';
   }
+}
+
+function safeNetworkDiagnostic(error: unknown): string {
+  let current = error;
+  let fallback: string | null = null;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!current || typeof current !== 'object') break;
+    const record = current as { code?: unknown; name?: unknown; cause?: unknown };
+    if (typeof record.code === 'string' && /^[A-Z0-9_]{2,80}$/.test(record.code)) return record.code;
+    if (depth === 0 && typeof record.name === 'string' && /^[A-Za-z][A-Za-z0-9_]{1,79}$/.test(record.name)) {
+      fallback = record.name.toUpperCase();
+    }
+    current = record.cause;
+  }
+  return fallback ?? 'UNKNOWN_NETWORK_ERROR';
 }
 
 export function isRetryablePublicMarketDataError(error: unknown): error is PublicMarketDataError {
@@ -426,9 +445,9 @@ async function fetchJson(
       redirect: 'error',
       signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
     });
-  } catch {
+  } catch (error) {
     if (signal?.aborted) throw new PublicMarketDataError('ABORTED');
-    throw new PublicMarketDataError('NETWORK_ERROR');
+    throw new PublicMarketDataError('NETWORK_ERROR', null, safeNetworkDiagnostic(error));
   }
   const declaredLength = Number(response.headers.get('content-length'));
   if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
@@ -455,7 +474,7 @@ async function fetchJson(
     } catch (error) {
       if (error instanceof PublicMarketDataError) throw error;
       if (signal?.aborted) throw new PublicMarketDataError('ABORTED');
-      throw new PublicMarketDataError('NETWORK_ERROR');
+      throw new PublicMarketDataError('NETWORK_ERROR', null, safeNetworkDiagnostic(error));
     } finally {
       reader.releaseLock();
     }

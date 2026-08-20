@@ -95,7 +95,7 @@ export function FundingResearchPanel() {
         <i />{summary?.enabled ? '独立模拟运行中' : '探索模拟未开启'}
       </span>
     </header>
-    <p className="funding-research-notice">每轮从同步盘口和流动性过滤后的市场选择最优组合，对比一次结算、滚动持仓、Maker/Taker 反事实和同所现货/永续四条影子口径；目标每腿 {summary?.targetNotionalUsd ?? '5'} U，但合约步长可能抬高实际金额。滚动组采用 {summary?.modelVersion ?? 'rolling_v2'}：普通价值转负连续确认 {summary?.holdExitConfirmations ?? 30} 次、方向翻转连续确认 {summary?.reversalExitConfirmations ?? 15} 次，平仓后至少冷却 {decimal((summary?.reentryCooldownMs ?? 28_800_000) / 3_600_000, 0)} 小时。毛快照 APR 只表示当前费率外推，所有研究都不会发送交易所订单。</p>
+    <p className="funding-research-notice">每轮从同步盘口和流动性过滤后的市场选择最优组合，对比一次结算、滚动持仓、Maker/Taker 反事实和同所现货/永续四条影子口径；目标每腿 {summary?.targetNotionalUsd ?? '5'} U，但合约步长可能抬高实际金额。滚动组采用 {summary?.modelVersion ?? 'rolling_v3'}：第一次双腿结算前不累计普通退出计数，结算后普通价值转负连续确认 {summary?.holdExitConfirmations ?? 60} 次、方向翻转连续确认 {summary?.reversalExitConfirmations ?? 30} 次，平仓后至少冷却 {decimal((summary?.reentryCooldownMs ?? 43_200_000) / 3_600_000, 0)} 小时。毛快照 APR 只表示当前费率外推，所有研究都不会发送交易所订单。</p>
     {error && <p className="funding-paper-error" role="alert">研究数据读取失败：{error}</p>}
 
     <div className="funding-research-stats">

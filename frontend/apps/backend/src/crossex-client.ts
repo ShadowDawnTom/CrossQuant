@@ -271,10 +271,26 @@ export class GateApiError extends Error {
     readonly statusCode: number,
     readonly label: string,
     readonly retryAfterMs?: number,
+    readonly diagnostic?: string,
   ) {
     super(`Gate API request failed with ${label}`);
     this.name = 'GateApiError';
   }
+}
+
+function safeNetworkDiagnostic(error: unknown): string {
+  let current = error;
+  let fallback: string | null = null;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!current || typeof current !== 'object') break;
+    const record = current as { code?: unknown; name?: unknown; cause?: unknown };
+    if (typeof record.code === 'string' && /^[A-Z0-9_]{2,80}$/.test(record.code)) return record.code;
+    if (depth === 0 && typeof record.name === 'string' && /^[A-Za-z][A-Za-z0-9_]{1,79}$/.test(record.name)) {
+      fallback = record.name.toUpperCase();
+    }
+    current = record.cause;
+  }
+  return fallback ?? 'UNKNOWN_NETWORK_ERROR';
 }
 
 export interface SignGateRequestInput {
@@ -574,8 +590,8 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
           );
         }
         return received;
-      } catch {
-        throw new GateApiError(0, 'NETWORK_ERROR');
+      } catch (error) {
+        throw new GateApiError(0, 'NETWORK_ERROR', undefined, safeNetworkDiagnostic(error));
       }
     }, priority);
 
@@ -671,8 +687,8 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
         redirect: 'error',
         signal: AbortSignal.timeout(15_000),
       });
-    } catch {
-      throw new GateApiError(0, 'NETWORK_ERROR');
+    } catch (error) {
+      throw new GateApiError(0, 'NETWORK_ERROR', undefined, safeNetworkDiagnostic(error));
     }
 
     const responseText = await readBoundedResponseText(response, 10_000_000);
@@ -707,8 +723,8 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
         redirect: 'error',
         signal: AbortSignal.timeout(10_000),
       });
-    } catch {
-      throw new GateApiError(0, 'NETWORK_ERROR');
+    } catch (error) {
+      throw new GateApiError(0, 'NETWORK_ERROR', undefined, safeNetworkDiagnostic(error));
     }
 
     const responseText = await readBoundedResponseText(response, 2_000_000);
@@ -737,8 +753,8 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
         redirect: 'error',
         signal: AbortSignal.timeout(10_000),
       });
-    } catch {
-      throw new GateApiError(0, 'NETWORK_ERROR');
+    } catch (error) {
+      throw new GateApiError(0, 'NETWORK_ERROR', undefined, safeNetworkDiagnostic(error));
     }
 
     const responseText = await readBoundedResponseText(response, 1_000_000);

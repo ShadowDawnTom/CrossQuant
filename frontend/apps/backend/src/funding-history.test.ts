@@ -397,6 +397,27 @@ describe('funding history service', () => {
     });
   });
 
+  it('一个交易所网络失败后整所退避，不让剩余币种逐个超时', async () => {
+    const database = testDatabase();
+    const queryFundingHistory = vi.fn(async () => {
+      throw new PublicMarketDataError('NETWORK_ERROR');
+    });
+    const service = new FundingHistoryService(database, gatewayWithHistory(queryFundingHistory), {
+      now: () => NOW,
+      venueSpacingMs: NO_SPACING,
+    });
+
+    await expect(service.loadMany([
+      'BINANCE_FUTURE_BTC_USDT',
+      'BINANCE_FUTURE_ETH_USDT',
+      'BINANCE_FUTURE_SOL_USDT',
+    ])).resolves.toMatchObject({ entries: [
+      { status: 'unavailable' }, { status: 'unavailable' }, { status: 'unavailable' },
+    ] });
+
+    expect(queryFundingHistory).toHaveBeenCalledTimes(1);
+  });
+
   it('uses conservative Hyperliquid spacing for short and cold history windows', async () => {
     const shortDatabase = testDatabase();
     const shortSleep = vi.fn(async () => undefined);

@@ -63,13 +63,15 @@ describe('browser authentication config', () => {
       GCT_FUNDING_RESEARCH_ASSETS: 'BTC,ETH,SOL,DOGE,TRUMP',
     }).fundingResearch).toMatchObject({
       enabled: true,
-      modelVersion: 'rolling_v2',
+      modelVersion: 'rolling_v3',
       assets: ['BTC', 'ETH', 'SOL', 'DOGE', 'TRUMP'],
       targetNotionalUsd: '5',
       maxOpenPositions: 1,
-      rollingHoldExitConfirmations: 30,
-      rollingReversalExitConfirmations: 15,
-      reentryCooldownMs: 28_800_000,
+      rollingHoldExitConfirmations: 60,
+      rollingReversalExitConfirmations: 30,
+      reentryCooldownMs: 43_200_000,
+      holdStressSlippageBps: '2',
+      holdAdverseExitBasisBps: '3',
     });
     expect(() => loadConfig({ GCT_FUNDING_RESEARCH_MODEL_VERSION: 'Rolling V3' }))
       .toThrow('must use lowercase letters');

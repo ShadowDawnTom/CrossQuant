@@ -331,7 +331,7 @@ export class FundingResearchEngine {
   private active: Promise<number> | null = null;
 
   private get modelVersion(): string {
-    return this.options.modelVersion ?? 'rolling_v2';
+    return this.options.modelVersion ?? 'rolling_v3';
   }
 
   constructor(
@@ -345,7 +345,7 @@ export class FundingResearchEngine {
 
   /**
    * 每个研究模型使用独立账本。版本切换时保留历史，只关闭旧模型的模拟仓位和未到期模拟结算；
-   * 这里不接触真实订单表，配置未来升级到 v3 时也不会把两个实验口径混在一起。
+   * 这里不接触真实订单表，后续再切模型版本也不会把不同实验口径混在一起。
    */
   private archiveLegacyOpenPositions(): void {
     const observedAt = new Date(this.now()).toISOString();
@@ -427,9 +427,9 @@ export class FundingResearchEngine {
     });
     return {
       enabled: this.options.enabled, modelVersion: this.modelVersion,
-      holdExitConfirmations: this.options.holdingExitConfirmationCount ?? 30,
-      reversalExitConfirmations: this.options.reversalExitConfirmationCount ?? 15,
-      reentryCooldownMs: this.options.reentryCooldownMs ?? 8 * 60 * 60_000,
+      holdExitConfirmations: this.options.holdingExitConfirmationCount ?? 60,
+      reversalExitConfirmations: this.options.reversalExitConfirmationCount ?? 30,
+      reentryCooldownMs: this.options.reentryCooldownMs ?? 12 * 60 * 60_000,
       targetNotionalUsd: this.options.targetNotionalUsd,
       maxOpenPositions: this.options.maxOpenPositions, minimumSettledEvents: this.options.minimumSettledEvents,
       lastScanAt: lastScan?.observed_at ?? null,
@@ -829,9 +829,9 @@ export class FundingResearchEngine {
             .plus(position.long_quote === position.short_quote ? 0 : this.options.stablecoinRiskBps ?? '5').toString(),
           minimumHoldValueUsd: this.options.minimumHoldValueUsd ?? '0',
           previousUnprofitableCount: position.unprofitable_count,
-          unprofitableConfirmationCount: this.options.holdingExitConfirmationCount ?? 30,
+          unprofitableConfirmationCount: this.options.holdingExitConfirmationCount ?? 60,
           previousReversalCount: position.reversal_count,
-          reversalConfirmationCount: this.options.reversalExitConfirmationCount ?? 15,
+          reversalConfirmationCount: this.options.reversalExitConfirmationCount ?? 30,
           settlementGuardMs: this.options.settlementGuardMs ?? 30_000,
           openedAtMs: Date.parse(position.opened_at),
           softReviewMs: this.options.rollingSoftReviewMs ?? 3 * 24 * 60 * 60_000,
@@ -841,19 +841,20 @@ export class FundingResearchEngine {
         reason = holding.reason;
         unprofitableCount = holding.unprofitableCount;
         reversalCount = holding.reversalCount;
-        if (decision === 'EXIT' && reason === 'hold_value_not_positive' && settledLegs < 2) {
-          // 研究组至少先观察两条腿各一次结算；普通收益判负不能在结算前制造两分钟开平仓循环。
+        if (settledLegs < 2 && (reason === 'hold_value_not_positive' || reason === 'hold_value_confirmation_pending')) {
+          // 第一次双腿结算前不累计普通收益退出计数；否则一到账就会带着历史计数立即平仓，无法验证长持表现。
           decision = 'EXIT_PENDING';
           reason = 'research_waiting_first_settlement';
+          unprofitableCount = 0;
         }
         holdingDetails = { rawHoldingFunding: holding.rawFunding,
           conservativeHoldingFunding: holding.conservativeFunding, holdRiskBuffer: holding.riskBuffer,
           holdValue: holding.holdValue, fundingEdge: holding.fundingEdge,
           inSettlementGuard: holding.inSettlementGuard,
-          unprofitableCount: holding.unprofitableCount,
-          unprofitableRequired: this.options.holdingExitConfirmationCount ?? 30,
-          reversalCount: holding.reversalCount,
-          reversalRequired: this.options.reversalExitConfirmationCount ?? 15 };
+          unprofitableCount,
+          unprofitableRequired: this.options.holdingExitConfirmationCount ?? 60,
+          reversalCount,
+          reversalRequired: this.options.reversalExitConfirmationCount ?? 30 };
       } catch {
         this.unavailable(position, observedAt, 'funding_schedule_unavailable');
         return;
@@ -958,7 +959,7 @@ export class FundingResearchEngine {
     longExitPrice: Decimal, shortExitPrice: Decimal, exitFees: Decimal, pricePnl: Decimal,
     totalPnl: Decimal, settledEvents: number, nextSettlementAt: string | null): void {
     // 关闭后至少冷却到下一次结算，避免同一负收益快照一分钟后再次开仓烧手续费。
-    const cooldown = new Date(Date.parse(observedAt) + (this.options.reentryCooldownMs ?? 8 * 60 * 60_000)).toISOString();
+    const cooldown = new Date(Date.parse(observedAt) + (this.options.reentryCooldownMs ?? 12 * 60 * 60_000)).toISOString();
     const reopenAfter = nextSettlementAt && nextSettlementAt > cooldown ? nextSettlementAt : cooldown;
     this.database.transaction(() => {
       this.database.prepare(`UPDATE funding_research_positions SET state = 'CLOSED', monitor_state = 'EXIT',

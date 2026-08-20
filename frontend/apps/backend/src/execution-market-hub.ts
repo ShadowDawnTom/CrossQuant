@@ -170,13 +170,16 @@ function levels(value: unknown, multiplier = '1'): Level[] | null {
     const rawSize = Array.isArray(row) && row.length >= 2 ? row[1] : item?.s;
     const price = positiveText(rawPrice);
     if (!price || (typeof rawSize !== 'string' && typeof rawSize !== 'number')) return null;
-    try {
-      const quantity = new Decimal(String(rawSize));
-      if (!quantity.isFinite() || quantity.isNegative()) return null;
-      parsed.push([price, quantity.mul(multiplier).toString()]);
-    } catch {
-      return null;
+    const quantityText = String(rawSize);
+    const quantityNumber = Number(quantityText);
+    if (!Number.isFinite(quantityNumber) || quantityNumber < 0) return null;
+    if (multiplier === '1') {
+      // 大部分交易所已经推送基础币数量，热路径不必为每一档价格创建 Decimal 对象。
+      parsed.push([price, quantityText]);
+      continue;
     }
+    try { parsed.push([price, new Decimal(quantityText).mul(multiplier).toString()]); }
+    catch { return null; }
   }
   return parsed;
 }
@@ -246,12 +249,23 @@ function sortedLevels(source: Map<string, string>, descending: boolean): Level[]
     .slice(0, MAX_PUBLISHED_LEVELS);
 }
 
+function bestPrice(source: Map<string, string>, highest: boolean): number | null {
+  let best: number | null = null;
+  for (const priceText of source.keys()) {
+    const price = Number(priceText);
+    if (!Number.isFinite(price) || price <= 0) continue;
+    if (best === null || (highest ? price > best : price < best)) best = price;
+  }
+  return best;
+}
+
 function bookIsUncrossed(bids: Map<string, string>, asks: Map<string, string>): boolean {
-  const bestBid = sortedLevels(bids, true)[0];
-  const bestAsk = sortedLevels(asks, false)[0];
+  const bestBid = bestPrice(bids, true);
+  const bestAsk = bestPrice(asks, false);
   // 单侧暂时为空会由 isLive 拒绝，但仍要保留序列以便下一条增量恢复；只有两侧都有价时才判断交叉。
-  if (!bestBid || !bestAsk) return true;
-  return new Decimal(bestBid[0]).lt(bestAsk[0]);
+  if (bestBid === null || bestAsk === null) return true;
+  // 这里每秒会执行数千次；价格在解析时已经验证为有限正数，用数值比较可避免对整本盘口反复排序。
+  return bestBid < bestAsk;
 }
 
 /**

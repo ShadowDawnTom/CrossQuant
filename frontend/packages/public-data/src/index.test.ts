@@ -476,6 +476,17 @@ describe('realized funding history', () => {
       { timestamp: start + 1, rate: '0.1' },
     ]);
   });
+
+  it('保留安全的底层网络错误码，便于区分超时和 DNS 故障', async () => {
+    const cause = Object.assign(new Error('socket detail must not leak'), { code: 'ETIMEDOUT' });
+    const failure = Object.assign(new TypeError('fetch failed'), { cause });
+    const client = new VenuePublicMarketDataClient(vi.fn(async () => { throw failure; }) as unknown as typeof fetch);
+
+    await expect(client.queryFundingHistory('BINANCE_FUTURE_BTC_USDT', start, end)).rejects.toMatchObject({
+      code: 'NETWORK_ERROR',
+      diagnostic: 'ETIMEDOUT',
+    });
+  });
 });
 
 describe('bulk venue funding stats', () => {
