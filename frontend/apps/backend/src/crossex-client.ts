@@ -32,6 +32,7 @@ const IsolatedExchangeTypeSchema = z.enum([
 // lowercase letters/digits, under 20 chars. Do not send this order-specific header on
 // account-setting requests such as leverage updates.
 const BROKER_CHANNEL_ID = 'yourquantguy';
+const READ_ONLY_NETWORK_RETRY_DELAY_MS = 250;
 
 const GateAccountAssetSchema = z.object({
   coin: z.string(),
@@ -272,10 +273,15 @@ export class GateApiError extends Error {
     readonly label: string,
     readonly retryAfterMs?: number,
     readonly diagnostic?: string,
+    readonly endpoint?: string,
   ) {
     super(`Gate API request failed with ${label}`);
     this.name = 'GateApiError';
   }
+}
+
+function isRetryableReadNetworkError(error: unknown): error is GateApiError {
+  return error instanceof GateApiError && error.statusCode === 0 && error.label === 'NETWORK_ERROR';
 }
 
 function safeNetworkDiagnostic(error: unknown): string {
@@ -463,7 +469,15 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
   }
 
   async queryFeeRates(credentials: GateCredentials): Promise<GateFeeRate[]> {
-    return this.signedRequest('GET', FEE_ENDPOINT, '', '', credentials, z.array(GateFeeRateSchema), 'INVALID_FEE_RESPONSE');
+    const request = () => this.signedRequest(
+      'GET', FEE_ENDPOINT, '', '', credentials, z.array(GateFeeRateSchema), 'INVALID_FEE_RESPONSE', false, 'low',
+    );
+    try { return await request(); }
+    catch (error) {
+      if (!isRetryableReadNetworkError(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, READ_ONLY_NETWORK_RETRY_DELAY_MS));
+      return request();
+    }
   }
 
   async queryFundingInfo(credentials: GateCredentials, symbols: string[]): Promise<GateFundingInfo[]> {
@@ -488,8 +502,12 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
       try {
         rows.push(...await requestBatch());
       } catch (error) {
-        // 429 已把 Retry-After 写入全局认证队列；当前分批只重试一次，避免无限重放。
-        if (!(error instanceof GateApiError) || error.statusCode !== 429) throw error;
+        // 只读接口可安全重试一次；订单写入绝不能沿用这条路径，否则响应丢失时可能重复下单。
+        const rateLimited = error instanceof GateApiError && error.statusCode === 429;
+        if (!rateLimited && !isRetryableReadNetworkError(error)) throw error;
+        if (!rateLimited) {
+          await new Promise((resolve) => setTimeout(resolve, READ_ONLY_NETWORK_RETRY_DELAY_MS));
+        }
         rows.push(...await requestBatch());
       }
     }
@@ -573,6 +591,8 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
           method,
           headers: {
             Accept: 'application/json',
+            // 鉴权控制面请求量很低，主动关闭连接可避免复用公共行情留下的半关闭 keep-alive socket。
+            Connection: 'close',
             ...(body ? { 'Content-Type': 'application/json' } : {}),
             KEY: credentials.apiKey,
             Timestamp: timestamp,
@@ -591,7 +611,7 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
         }
         return received;
       } catch (error) {
-        throw new GateApiError(0, 'NETWORK_ERROR', undefined, safeNetworkDiagnostic(error));
+        throw new GateApiError(0, 'NETWORK_ERROR', undefined, safeNetworkDiagnostic(error), endpoint);
       }
     }, priority);
 

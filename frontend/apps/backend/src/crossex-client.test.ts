@@ -22,6 +22,7 @@ describe('Gate APIv4 signing', () => {
       expect(headers.get('Timestamp')).toBe('1700000000');
       expect(headers.get('SIGN')).toMatch(/^[a-f0-9]{128}$/);
       expect(headers.get('X-Gate-Channel-Id')).toBeNull();
+      expect(headers.get('Connection')).toBe('close');
       return new Response(JSON.stringify({
         available_margin: '100',
         margin_balance: '100',
@@ -238,6 +239,32 @@ describe('Gate APIv4 signing', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(rows[0]?.symbol).toBe('GATE_FUTURE_SOL_USDT');
+  });
+
+  it('资金费只读请求遇到连接超时只重试一次，且保留安全 endpoint 诊断', async () => {
+    let calls = 0;
+    const fetchMock = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) throw Object.assign(new TypeError('sensitive detail'), { code: 'ETIMEDOUT' });
+      return new Response(JSON.stringify([{ symbol: 'GATE_FUTURE_ZEC_USDT', funding_rate: '-0.000018',
+        funding_time: '1787241600000', funding_interval: '28800' }]), { status: 200 });
+    });
+    const client = new GateCrossExClient(fetchMock as typeof fetch, () => 1_700_000_000_000,
+      'https://api.gateio.ws/api/v4', 0, 0);
+
+    await expect(client.queryFundingInfo({ apiKey: 'test-api-key', apiSecret: 'test-secret' },
+      ['GATE_FUTURE_ZEC_USDT'])).resolves.toEqual([
+      expect.objectContaining({ symbol: 'GATE_FUTURE_ZEC_USDT' }),
+    ]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const alwaysFailing = new GateCrossExClient(vi.fn(async () => {
+      throw Object.assign(new TypeError('sensitive detail'), { code: 'ETIMEDOUT' });
+    }) as unknown as typeof fetch, () => 1_700_000_000_000, 'https://api.gateio.ws/api/v4', 0, 0);
+    await expect(alwaysFailing.queryFundingInfo({ apiKey: 'test-api-key', apiSecret: 'test-secret' },
+      ['GATE_FUTURE_ZEC_USDT'])).rejects.toMatchObject({
+      label: 'NETWORK_ERROR', diagnostic: 'ETIMEDOUT', endpoint: '/crossex/market/funding_info',
+    });
   });
 
   it('queries a single order by id or client text with the documented GET route', async () => {

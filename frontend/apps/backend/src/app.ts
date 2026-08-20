@@ -1032,11 +1032,13 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       applyHistoryPause();
       const reason = error instanceof GateApiError ? error.label : error instanceof Error ? error.name : 'UNKNOWN_ERROR';
       const diagnostic = error instanceof GateApiError ? error.diagnostic : undefined;
+      const endpoint = error instanceof GateApiError ? error.endpoint : undefined;
       app.log.warn({ err: error, fundingScanFailures }, 'authoritative funding candidate scan failed');
       if (fundingScanFailures === 2) {
         void alertDispatcher.emit({ eventType: 'funding_scan_degraded', severity: 'critical',
           message: '资金费候选扫描连续失败，已暂停低优先级历史回补并保护实时行情',
-          details: { reason, diagnostic: diagnostic ?? null, consecutiveFailures: fundingScanFailures },
+          details: { reason, diagnostic: diagnostic ?? null, endpoint: endpoint ?? null,
+            consecutiveFailures: fundingScanFailures },
           dedupKey: `funding-scan-degraded:${reason}:${diagnostic ?? 'none'}` });
       }
     }
