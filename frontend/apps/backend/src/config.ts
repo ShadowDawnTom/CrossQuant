@@ -156,7 +156,7 @@ function parseAssetList(value: string, name: string): string[] {
 const DEFAULT_RESEARCH_ASSETS = [
   'BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'ADA', 'SUI', 'AVAX', 'LINK', 'LTC',
   'BCH', 'DOT', 'UNI', 'AAVE', 'NEAR', 'APT', 'ARB', 'OP', 'INJ', 'ATOM',
-  'FIL', 'ETC', 'XLM', 'HBAR', 'TRX', 'SEI', 'JUP', 'TAO', 'WIF', 'PEPE',
+  'FIL', 'ETC', 'XLM', 'HBAR', 'TRX', 'SEI', 'JUP', 'TAO', 'WIF', 'PEPE', 'ZEC',
 ].join(',');
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): BackendConfig {
