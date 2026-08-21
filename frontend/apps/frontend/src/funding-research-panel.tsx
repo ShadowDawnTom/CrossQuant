@@ -26,6 +26,7 @@ const reasonLabel: Record<string, string> = {
   fee_rate_missing: '账户费率缺失', instrument_rule_missing: '合约规则缺失', instrument_not_live: '合约未开放',
   top_of_book_missing: '最优报价缺失', invalid_quantity_rule: '数量规则异常',
   invalid_executable_notional: '可执行名义金额异常', raw_funding_not_positive: '原始资金费优势不为正',
+  quantity_exceeds_market_limit: '取整数量超过合约市价单上限',
   live_threshold_passed: '达到实盘候选标准', research_liquidity_passed: '通过研究流动性检查',
   research_liquidity_below_threshold: '10bp 四向深度不足', quote_fx_unavailable: '稳定币汇率不可用或脱锚',
   executor_venue_not_supported: '组合含暂未接入实盘执行器的交易所',

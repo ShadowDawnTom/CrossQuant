@@ -346,6 +346,20 @@ export class FundingCandidateScanner {
         );
         const minimumQuantity = Decimal.max(longRule.min_size, shortRule.min_size, minimumNotional.div(Decimal.min(longPrice, shortPrice)));
         const quantity = minimumQuantity.div(step).ceil().mul(step);
+        let longMaxMarketSize: Decimal;
+        let shortMaxMarketSize: Decimal;
+        try {
+          longMaxMarketSize = new Decimal(longRule.max_market_size ?? '0');
+          shortMaxMarketSize = new Decimal(shortRule.max_market_size ?? '0');
+        } catch { reject('invalid_quantity_rule', pair.quality); continue; }
+        if (!longMaxMarketSize.gt(0) || !shortMaxMarketSize.gt(0)) {
+          reject('invalid_quantity_rule', pair.quality);
+          continue;
+        }
+        if (quantity.gt(longMaxMarketSize) || quantity.gt(shortMaxMarketSize)) {
+          reject('quantity_exceeds_market_limit', pair.quality);
+          continue;
+        }
         // 同一数量按盘口逐档吃单；深度不足必须 fail-closed，不能用不存在的顶层价格放行。
         const longEntry = executableFill(longAsks, quantity, 'BUY');
         const shortEntry = executableFill(shortBids, quantity, 'SELL');

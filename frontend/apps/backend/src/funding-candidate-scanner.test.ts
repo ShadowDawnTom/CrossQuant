@@ -119,6 +119,27 @@ describe('FundingCandidateScanner', () => {
     expect(Number(observations[0]?.entryLongNotional)).toBeGreaterThan(10);
   });
 
+  it('共同数量超过任一合约市价单上限时 fail-closed', async () => {
+    const observations: FundingScanObservation[] = [];
+    const testGateway = gateway();
+    const originalRules = testGateway.querySymbols.bind(testGateway);
+    testGateway.querySymbols = async () => (await originalRules()).map((rule) => ({
+      ...rule, max_market_size: '0.01',
+    }));
+    const scanner = new FundingCandidateScanner(testGateway,
+      async () => ({ apiKey: 'key', apiSecret: 'secret' }), market(),
+      { observeAuthoritativeCandidate: vi.fn() } as unknown as FundingArbitrageEngine,
+      { assets: ['SOL'], strictAssets: [], researchAssets: ['SOL'], targetNotionalUsd: '5',
+        researchTargetNotionalUsd: '5', researchMaxActualNotionalUsd: '10', horizonHours: 24,
+        fundingRetentionFactor: '0.5', stressSlippageBps: '5', adverseExitBasisBps: '10',
+        onFundingData: async (_funding, _fees, rows) => { observations.push(...rows); }, now: () => NOW },
+    );
+
+    expect(await scanner.scan()).toBe(0);
+    expect(observations[0]).toMatchObject({ researchEligible: false,
+      primaryReason: 'quantity_exceeds_market_limit' });
+  });
+
   it('毛费率最优组合不可用时继续评估已同步的执行器组合', async () => {
     const symbols = {
       BINANCE: 'BINANCE_FUTURE_SOL_USDT', OKX: 'OKX_FUTURE_SOL_USDT',

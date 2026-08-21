@@ -82,6 +82,12 @@ function fundingTimeIso(value: string): string | null {
   return Number.isFinite(parsed) && parsed > 0 ? new Date(parsed).toISOString() : null;
 }
 
+function delistTimeMs(rule: GateCrossExSymbol | null | undefined): number | null {
+  const parsed = Number(rule?.delist_time);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed < 1_000_000_000_000 ? parsed * 1_000 : parsed;
+}
+
 /**
  * 广域发现池只处理分钟级 REST 数据，不读取订单簿。它先用规则、Ticker、持仓量和费率持续性筛选，
  * 再把少量候选交给 WebSocket 热池；因此扩大币种不会线性放大完整盘口内存。
@@ -206,12 +212,16 @@ export class FundingDiscoveryService {
       Number.isFinite(Number(item.funding_time)) && Number(item.funding_time) > 0
       && Number.isFinite(Number(item.funding_interval)) && Number(item.funding_interval) > 0) : false;
     const rulesLive = Boolean(longRule && shortRule && longRule.state === 'live' && shortRule.state === 'live');
+    const longDelistAt = delistTimeMs(longRule);
+    const shortDelistAt = delistTimeMs(shortRule);
+    const delistingSoon = [longDelistAt, shortDelistAt].some((timestamp) =>
+      timestamp !== null && timestamp <= now + 7 * 24 * 60 * 60_000);
     const executionSupported = Boolean(best && EXECUTABLE_VENUES.has(best.longVenue) && EXECUTABLE_VENUES.has(best.shortVenue));
     const tickerValid = Boolean(longTicker?.lastPrice && shortTicker?.lastPrice && Number.isFinite(tickerAge) && tickerAge <= 10 * 60_000);
     const oiValid = Boolean(openInterest && openInterest.gte(this.options.minOpenInterestUsd));
     const reason = !best || !best.spread.gt(0) ? 'discovery_funding_edge_missing'
       : !longRule || !shortRule ? 'instrument_rule_missing'
-        : !rulesLive ? 'instrument_not_live_or_delisting'
+        : !rulesLive || delistingSoon ? 'instrument_not_live_or_delisting'
           : !executionSupported ? 'executor_venue_not_supported'
             : !scheduleValid ? 'funding_schedule_unavailable'
               : !longTicker || !shortTicker ? 'discovery_ticker_missing'
@@ -244,10 +254,12 @@ export class FundingDiscoveryService {
         shortNextFundingAt: best ? fundingTimeIso(best.short.funding_time) : null,
         longTicker, shortTicker,
         longRule: longRule ? { state: longRule.state, lotSize: longRule.lot_size, minSize: longRule.min_size,
-          minNotional: longRule.min_notional, maxMarketSize: longRule.max_market_size } : null,
+          minNotional: longRule.min_notional, maxMarketSize: longRule.max_market_size,
+          delistAt: longDelistAt === null ? null : new Date(longDelistAt).toISOString() } : null,
         shortRule: shortRule ? { state: shortRule.state, lotSize: shortRule.lot_size, minSize: shortRule.min_size,
-          minNotional: shortRule.min_notional, maxMarketSize: shortRule.max_market_size } : null,
-        tickerAgeMs: Number.isFinite(tickerAge) ? tickerAge : null, scheduleValid, executionSupported,
+          minNotional: shortRule.min_notional, maxMarketSize: shortRule.max_market_size,
+          delistAt: shortDelistAt === null ? null : new Date(shortDelistAt).toISOString() } : null,
+        tickerAgeMs: Number.isFinite(tickerAge) ? tickerAge : null, scheduleValid, executionSupported, delistingSoon,
       },
     };
   }

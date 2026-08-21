@@ -65,5 +65,12 @@ describe('FundingDiscoveryService', () => {
     expect(service.summary().assets.find((item) => item.asset === 'DOGE')).toMatchObject({
       inHotPool: true, eligibleForHotPool: false, primaryReason: 'discovery_open_interest_missing',
     });
+
+    const delistingRules = rules.map((rule) => rule.symbol.includes('_DOGE_')
+      ? { ...rule, delist_time: String(now + 24 * 60 * 60_000) } : rule);
+    expect(await service.observe(funding, delistingRules, overview)).toEqual(['SOL']);
+    expect(service.summary().assets.find((item) => item.asset === 'DOGE')).toMatchObject({
+      eligibleForHotPool: false, primaryReason: 'instrument_not_live_or_delisting',
+    });
   });
 });
