@@ -145,7 +145,7 @@ describe('FundingResearchEngine', () => {
     expect(oneSettlement.reopenAfter).not.toBeNull();
   });
 
-  it('第一次双腿结算前不累计普通退出计数，结算后才重新连续确认', async () => {
+  it('滚动组先完成双腿结算并满足最短持仓，之后才累计普通退出确认', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'funding-research-long-hold-'));
     const database = openDatabase(join(directory, 'test.sqlite'), resolve(process.cwd(), '../../migrations'));
     resources.push({ directory, database });
@@ -154,6 +154,7 @@ describe('FundingResearchEngine', () => {
     const engine = new FundingResearchEngine(database, market(() => currentTime), {
       enabled: true, modelVersion: 'rolling_v3', targetNotionalUsd: '5', maxOpenPositions: 1,
       minimumSettledEvents: 1, holdingExitConfirmationCount: 2,
+      rollingMinimumHoldingMs: 120_000,
       stressSlippageBps: '5', adverseExitBasisBps: '5', fundingRetentionFactor: '0.5',
     }, () => currentTime);
 
@@ -168,7 +169,13 @@ describe('FundingResearchEngine', () => {
     currentTime += 60_000;
     await engine.observe([observation(currentTime)], funding(currentTime), fees);
     expect(engine.list().find((item) => item.cohort === 'ROLLING')).toMatchObject({
-      state: 'OPEN', lastReason: 'hold_value_confirmation_pending', unprofitableCount: 1, settledEvents: 2,
+      state: 'OPEN', lastReason: 'research_minimum_holding_active', unprofitableCount: 0, settledEvents: 2,
+    });
+
+    currentTime += 60_000;
+    await engine.observe([observation(currentTime)], funding(currentTime), fees);
+    expect(engine.list().find((item) => item.cohort === 'ROLLING')).toMatchObject({
+      state: 'OPEN', lastReason: 'hold_value_confirmation_pending', unprofitableCount: 1,
     });
 
     currentTime += 1_000;
@@ -176,6 +183,68 @@ describe('FundingResearchEngine', () => {
     expect(engine.list().find((item) => item.cohort === 'ROLLING')).toMatchObject({
       state: 'CLOSED', lastReason: 'hold_value_not_positive', unprofitableCount: 2,
     });
+  });
+
+  it('不会把开仓前的过期资金费时点记入模拟收入', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'funding-research-past-settlement-'));
+    const database = openDatabase(join(directory, 'test.sqlite'), resolve(process.cwd(), '../../migrations'));
+    resources.push({ directory, database });
+    let currentTime = Date.parse('2026-08-15T08:00:59.000Z');
+    const staleFunding = () => funding(currentTime).map((row) => ({
+      ...row, funding_time: String(Date.parse('2026-08-15T08:00:00.000Z')), funding_interval: '60',
+    }));
+    const engine = new FundingResearchEngine(database, market(() => currentTime), {
+      enabled: true, modelVersion: 'rolling_v6', targetNotionalUsd: '5', maxOpenPositions: 1,
+      minimumSettledEvents: 1, stressSlippageBps: '0', adverseExitBasisBps: '0',
+    }, () => currentTime);
+
+    await engine.observe([observation(currentTime)], staleFunding(), fees);
+    const opened = engine.list().find((item) => item.cohort === 'ONE_SETTLEMENT')!;
+    expect(engine.details(opened.id)?.settlements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ fundingTime: '2026-08-15T08:01:00.000Z', state: 'PENDING' }),
+    ]));
+    expect(engine.details(opened.id)?.settlements.every((item) => Date.parse(item.fundingTime) > currentTime)).toBe(true);
+
+    currentTime += 500;
+    await engine.observe([], staleFunding(), fees);
+    expect(engine.list().find((item) => item.id === opened.id)).toMatchObject({ state: 'OPEN', settledEvents: 0 });
+  });
+
+  it('历史记录超过十条后仍逐个评估全部未平仓位', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'funding-research-open-monitor-'));
+    const database = openDatabase(join(directory, 'test.sqlite'), resolve(process.cwd(), '../../migrations'));
+    resources.push({ directory, database });
+    let currentTime = Date.parse('2026-08-15T00:00:00.000Z');
+    const engine = new FundingResearchEngine(database, market(() => currentTime), {
+      enabled: true, modelVersion: 'monitor_guard', targetNotionalUsd: '5', maxOpenPositions: 1,
+      minimumSettledEvents: 1,
+    }, () => currentTime);
+    await engine.observe([observation(currentTime)], funding(currentTime), fees);
+
+    const sourceObservation = database.prepare('SELECT * FROM funding_scan_observations LIMIT 1').get() as Record<string, unknown>;
+    const sourcePosition = database.prepare(`SELECT * FROM funding_research_positions
+      WHERE research_model_version = ? LIMIT 1`).get('monitor_guard') as Record<string, unknown>;
+    const insertClone = (table: string, row: Record<string, unknown>) => {
+      const columns = Object.keys(row);
+      database.prepare(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`)
+        .run(...columns.map((column) => row[column]));
+    };
+    for (let index = 0; index < 12; index += 1) {
+      const observationId = `history-observation-${index}`;
+      const openedAt = new Date(currentTime + (index + 1) * 1_000).toISOString();
+      insertClone('funding_scan_observations', { ...sourceObservation, id: observationId,
+        scan_id: `history-scan-${index}`, observed_at: openedAt });
+      insertClone('funding_research_positions', { ...sourcePosition, id: `history-position-${index}`,
+        observation_id: observationId, state: 'CLOSED', opened_at: openedAt, closed_at: openedAt,
+        created_at: openedAt, updated_at: openedAt, last_evaluated_at: openedAt });
+    }
+
+    currentTime += 20_000;
+    await engine.observe([], funding(currentTime), fees);
+    const open = database.prepare(`SELECT last_evaluated_at FROM funding_research_positions
+      WHERE research_model_version = ? AND state = 'OPEN'`).all('monitor_guard') as Array<{ last_evaluated_at: string }>;
+    expect(open).toHaveLength(2);
+    expect(open.every((item) => item.last_evaluated_at === new Date(currentTime).toISOString())).toBe(true);
   });
 
   it('关闭探索模拟时仍保存拒绝原因，但不会创建持仓', async () => {

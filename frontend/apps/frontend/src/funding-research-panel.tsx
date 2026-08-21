@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError, type FundingResearchEvaluation, type FundingResearchSettlement,
-  type FundingDiscoverySummary, type FundingResearchSummary } from './api.js';
+  type FundingDiscoverySummary, type FundingResearchPosition, type FundingResearchSummary } from './api.js';
 
 function decimal(value: string | number | null | undefined, digits = 4): string {
   const parsed = Number(value);
@@ -16,6 +16,16 @@ function time(value: string | null | undefined): string {
   if (!value) return '—';
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? new Date(parsed).toLocaleString('zh-CN', { hour12: false }) : '—';
+}
+
+/** 用已发生资金费对比当前四笔手续费和不利基差，展示长持到底回收了多少成本。 */
+function recovery(position: FundingResearchPosition): { ratio: number | null; remaining: number } {
+  const fees = Number(position.entryFees) + Number(position.exitFees);
+  const adversePrice = Math.max(0, -Number(position.pricePnl));
+  const funding = Number(position.fundingPnl);
+  const friction = fees + adversePrice;
+  return { ratio: Number.isFinite(friction) && friction > 0 ? funding / friction : null,
+    remaining: Math.max(0, friction - (Number.isFinite(funding) ? funding : 0)) };
 }
 
 const reasonLabel: Record<string, string> = {
@@ -37,6 +47,7 @@ const reasonLabel: Record<string, string> = {
   hold_value_positive: '下一结算窗口保守价值为正', hold_value_confirmation_pending: '继续持有价值等待连续确认',
   hold_value_not_positive: '继续持有价值连续不为正', funding_direction_reversed: '资金费方向翻转',
   funding_reversal_confirmation_pending: '资金费翻转等待连续确认',
+  research_minimum_holding_active: '24小时长持观察期内，仅记录普通价值转负',
   research_model_restarted: '旧模型归档，重新起跑',
   soft_review_due: '滚动组达到72小时重点观察', hard_holding_limit: '滚动组达到7天硬上限',
   settlement_guard_active: '处于结算保护窗口', funding_schedule_unavailable: '结算计划不可用',
@@ -110,7 +121,7 @@ export function FundingResearchPanel() {
         <i />{summary?.enabled ? '独立模拟运行中' : '探索模拟未开启'}
       </span>
     </header>
-    <p className="funding-research-notice">广域发现池只读取资金费、Ticker、交易规则和持仓量；排名靠前且持续确认的 {discovery?.hotPoolLimit ?? 10} 个币才接入完整订单簿。研究目标每腿 {summary?.targetNotionalUsd ?? '5'} U，规则取整后任一腿超过 {summary?.maxActualNotionalUsd ?? '10'} U 会直接拒绝。每个研究组最多同时持有 {summary?.maxOpenPositions ?? 3} 个不同组合。滚动组采用 {summary?.modelVersion ?? 'rolling_v5'}，所有研究都不会发送交易所订单。</p>
+    <p className="funding-research-notice">广域发现池只读取资金费、Ticker、交易规则和持仓量；排名靠前且持续确认的 {discovery?.hotPoolLimit ?? 10} 个币才接入完整订单簿。研究目标每腿 {summary?.targetNotionalUsd ?? '5'} U，规则取整后任一腿超过 {summary?.maxActualNotionalUsd ?? '10'} U 会直接拒绝。每个研究组最多同时持有 {summary?.maxOpenPositions ?? 3} 个不同组合。滚动组采用 {summary?.modelVersion ?? 'rolling_v6'}，普通价值转负在最初 {summary ? Math.round(summary.minimumHoldingMs / 3_600_000) : 24} 小时只记录不退出；资金费持续反转和硬风控仍可提前结束。所有研究都不会发送交易所订单。</p>
     {error && <p className="funding-paper-error" role="alert">研究数据读取失败：{error}</p>}
 
     <div className="funding-research-opportunities">
@@ -230,6 +241,8 @@ export function FundingResearchPanel() {
               <span><small>资金费</small>{decimal(position.fundingPnl)} U</span>
               <span><small>价差损益</small>{decimal(position.pricePnl)} U</span>
               <span><small>累计手续费</small>{decimal(String(Number(position.entryFees) + Number(position.exitFees)))} U</span>
+              <span><small>当前成本回收</small>{recovery(position).ratio === null ? '—' : percent(String(recovery(position).ratio))}</span>
+              <span><small>距当前回本</small>{decimal(recovery(position).remaining, 6)} U</span>
               <span><small>已结算事件</small>{position.settledEvents}</span>
               <span><small>下一结算</small>{time(position.nextSettlementAt)}</span>
               <span><small>入场毛快照 APR</small>{percent(position.entryRawAnnualized)}</span>
@@ -237,6 +250,7 @@ export function FundingResearchPanel() {
               <span><small>平仓后最早重开</small>{time(position.reopenAfter)}</span>
               <span><small>价值转负确认</small>{position.unprofitableCount} / {summary.holdExitConfirmations}</span>
               <span><small>方向翻转确认</small>{position.reversalCount} / {summary.reversalExitConfirmations}</span>
+              <span><small>滚动组最短观察</small>{Math.round(summary.minimumHoldingMs / 3_600_000)} 小时</span>
               <span><small>研究模型</small>{position.modelVersion}</span>
             </div>
             <div className="paper-position-actions">

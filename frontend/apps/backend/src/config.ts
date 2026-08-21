@@ -95,6 +95,7 @@ export interface BackendConfig {
     liquidityDepthBps: string;
     maxPairsPerAsset: number;
     stablecoinRiskBps: string;
+    rollingMinimumHoldingMs: number;
     rollingSoftReviewMs: number;
     rollingHardHoldingMs: number;
     rollingHoldExitConfirmations: number;
@@ -228,7 +229,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
   const fundingScanAssets = parseAssetList(environment.GCT_FUNDING_SCAN_ASSETS ?? executionMarketSymbols.join(','), 'GCT_FUNDING_SCAN_ASSETS');
   const fundingResearchAssets = parseAssetList(environment.GCT_FUNDING_RESEARCH_ASSETS ?? DEFAULT_RESEARCH_ASSETS, 'GCT_FUNDING_RESEARCH_ASSETS');
   const fundingResearchEnabled = environment.GCT_FUNDING_RESEARCH_ENABLED === '1';
-  const fundingResearchModelVersion = (environment.GCT_FUNDING_RESEARCH_MODEL_VERSION ?? 'rolling_v5').trim();
+  const fundingResearchModelVersion = (environment.GCT_FUNDING_RESEARCH_MODEL_VERSION ?? 'rolling_v6').trim();
   if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(fundingResearchModelVersion)) {
     throw new Error('GCT_FUNDING_RESEARCH_MODEL_VERSION must use lowercase letters, digits, underscores, or hyphens');
   }
@@ -269,6 +270,13 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
   );
   if (fundingResearchRollingSoftReviewMs >= fundingResearchRollingHardHoldingMs) {
     throw new Error('GCT_FUNDING_RESEARCH_ROLLING_SOFT_REVIEW_MS must be lower than rolling hard holding limit');
+  }
+  const fundingResearchRollingMinimumHoldingMs = parsePositiveInteger(
+    environment.GCT_FUNDING_RESEARCH_ROLLING_MIN_HOLDING_MS ?? '86400000',
+    'GCT_FUNDING_RESEARCH_ROLLING_MIN_HOLDING_MS',
+  );
+  if (fundingResearchRollingMinimumHoldingMs >= fundingResearchRollingHardHoldingMs) {
+    throw new Error('GCT_FUNDING_RESEARCH_ROLLING_MIN_HOLDING_MS must be lower than rolling hard holding limit');
   }
   const missingStrictBooks = fundingScanAssets.filter((asset) => !executionMarketSymbols.includes(asset));
   if (missingStrictBooks.length > 0) {
@@ -400,14 +408,15 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       liquidityDepthBps: parsePositiveDecimal(environment.GCT_FUNDING_RESEARCH_LIQUIDITY_DEPTH_BPS ?? '10', 'GCT_FUNDING_RESEARCH_LIQUIDITY_DEPTH_BPS'),
       maxPairsPerAsset: parsePositiveInteger(environment.GCT_FUNDING_RESEARCH_MAX_PAIRS_PER_ASSET ?? '1', 'GCT_FUNDING_RESEARCH_MAX_PAIRS_PER_ASSET'),
       stablecoinRiskBps: parseNonNegativeDecimal(environment.GCT_FUNDING_RESEARCH_STABLECOIN_RISK_BPS ?? '5', 'GCT_FUNDING_RESEARCH_STABLECOIN_RISK_BPS'),
+      rollingMinimumHoldingMs: fundingResearchRollingMinimumHoldingMs,
       rollingSoftReviewMs: fundingResearchRollingSoftReviewMs,
       rollingHardHoldingMs: fundingResearchRollingHardHoldingMs,
       rollingHoldExitConfirmations: parsePositiveInteger(
-        environment.GCT_FUNDING_RESEARCH_HOLD_EXIT_CONFIRMATIONS ?? '60',
+        environment.GCT_FUNDING_RESEARCH_HOLD_EXIT_CONFIRMATIONS ?? '180',
         'GCT_FUNDING_RESEARCH_HOLD_EXIT_CONFIRMATIONS',
       ),
       rollingReversalExitConfirmations: parsePositiveInteger(
-        environment.GCT_FUNDING_RESEARCH_REVERSAL_EXIT_CONFIRMATIONS ?? '30',
+        environment.GCT_FUNDING_RESEARCH_REVERSAL_EXIT_CONFIRMATIONS ?? '60',
         'GCT_FUNDING_RESEARCH_REVERSAL_EXIT_CONFIRMATIONS',
       ),
       reentryCooldownMs: parsePositiveInteger(

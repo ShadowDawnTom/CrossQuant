@@ -729,6 +729,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     fundingRetentionFactor: config.fundingArbitrage.fundingRetentionFactor,
     stressSlippageBps: config.fundingResearch.holdStressSlippageBps,
     adverseExitBasisBps: config.fundingResearch.holdAdverseExitBasisBps,
+    rollingMinimumHoldingMs: config.fundingResearch.rollingMinimumHoldingMs,
     rollingSoftReviewMs: config.fundingResearch.rollingSoftReviewMs,
     rollingHardHoldingMs: config.fundingResearch.rollingHardHoldingMs,
     stablecoinRiskBps: config.fundingResearch.stablecoinRiskBps,

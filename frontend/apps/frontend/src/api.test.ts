@@ -145,7 +145,7 @@ describe('local API request coordination', () => {
       modelVersion: 'rolling_v2', reversalCount: 0 };
     const fetchMock = vi.fn(async (path: string) => path === '/api/funding-research'
       ? new Response(JSON.stringify({ enabled: true, modelVersion: 'rolling_v2', holdExitConfirmations: 30,
-        reversalExitConfirmations: 15, reentryCooldownMs: 28_800_000,
+        reversalExitConfirmations: 15, minimumHoldingMs: 86_400_000, reentryCooldownMs: 28_800_000,
         targetNotionalUsd: '5', maxOpenPositions: 1,
         minimumSettledEvents: 1, lastScanAt: '2026-08-15T00:00:00.000Z',
         scan24h: { observations: 18, liveEligible: 0, researchEligible: 12, rejected: 6 },

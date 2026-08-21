@@ -32,6 +32,7 @@ export interface FundingResearchOptions {
   fundingRetentionFactor?: string;
   stressSlippageBps?: string;
   adverseExitBasisBps?: string;
+  rollingMinimumHoldingMs?: number;
   rollingSoftReviewMs?: number;
   rollingHardHoldingMs?: number;
   stablecoinRiskBps?: string;
@@ -172,6 +173,7 @@ export interface FundingResearchSummary {
   modelVersion: string;
   holdExitConfirmations: number;
   reversalExitConfirmations: number;
+  minimumHoldingMs: number;
   reentryCooldownMs: number;
   targetNotionalUsd: string;
   maxActualNotionalUsd: string;
@@ -370,7 +372,7 @@ export class FundingResearchEngine {
   private active: Promise<number> | null = null;
 
   private get modelVersion(): string {
-    return this.options.modelVersion ?? 'rolling_v5';
+    return this.options.modelVersion ?? 'rolling_v6';
   }
 
   constructor(
@@ -476,8 +478,9 @@ export class FundingResearchEngine {
     });
     return {
       enabled: this.options.enabled, modelVersion: this.modelVersion,
-      holdExitConfirmations: this.options.holdingExitConfirmationCount ?? 60,
-      reversalExitConfirmations: this.options.reversalExitConfirmationCount ?? 30,
+      holdExitConfirmations: this.options.holdingExitConfirmationCount ?? 180,
+      reversalExitConfirmations: this.options.reversalExitConfirmationCount ?? 60,
+      minimumHoldingMs: this.options.rollingMinimumHoldingMs ?? 24 * 60 * 60_000,
       reentryCooldownMs: this.options.reentryCooldownMs ?? 12 * 60 * 60_000,
       targetNotionalUsd: this.options.targetNotionalUsd,
       maxActualNotionalUsd: this.options.maxActualNotionalUsd ?? '10',
@@ -588,7 +591,11 @@ export class FundingResearchEngine {
     this.persistObservations(observations);
     this.settleDue(observedAt);
     let changed = 0;
-    for (const position of this.list(10).filter((item) => item.state === 'OPEN')) {
+    // 不能先截取最近历史再过滤 OPEN；历史平仓增多后，老滚动仓会被挤出监控范围。
+    const openPositions = this.database.prepare(`SELECT id FROM funding_research_positions
+      WHERE research_model_version = ? AND state = 'OPEN' ORDER BY opened_at, id`)
+      .all(this.modelVersion) as Array<{ id: string }>;
+    for (const position of openPositions) {
       this.evaluate(position.id, funding, fees, observedAt);
       changed += 1;
     }
@@ -837,7 +844,8 @@ export class FundingResearchEngine {
           observation.entrySlippageBps, observedAt, observedAt, observedAt, cohort,
           observation.longQuote, observation.shortQuote, this.modelVersion);
       this.refreshSettlements(id, observation.asset, observation.longVenue, observation.shortVenue,
-        new Decimal(observation.entryLongNotional!), new Decimal(observation.entryShortNotional!), funding, observedAt);
+        new Decimal(observation.entryLongNotional!), new Decimal(observation.entryShortNotional!),
+        funding, observedAt, observedAt);
       return id;
     } catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
@@ -862,7 +870,8 @@ export class FundingResearchEngine {
       return;
     }
     this.refreshSettlements(position.id, position.asset, position.long_venue, position.short_venue,
-      new Decimal(position.entry_long_notional), new Decimal(position.entry_short_notional), funding, observedAt);
+      new Decimal(position.entry_long_notional), new Decimal(position.entry_short_notional),
+      funding, position.opened_at, observedAt);
     let pair;
     try { pair = this.market.pair(position.asset, position.long_venue, position.short_venue, Date.parse(observedAt)); }
     catch { this.unavailable(position, observedAt, 'execution_pair_unavailable'); return; }
@@ -922,9 +931,9 @@ export class FundingResearchEngine {
             .plus(position.long_quote === position.short_quote ? 0 : this.options.stablecoinRiskBps ?? '5').toString(),
           minimumHoldValueUsd: this.options.minimumHoldValueUsd ?? '0',
           previousUnprofitableCount: position.unprofitable_count,
-          unprofitableConfirmationCount: this.options.holdingExitConfirmationCount ?? 60,
+          unprofitableConfirmationCount: this.options.holdingExitConfirmationCount ?? 180,
           previousReversalCount: position.reversal_count,
-          reversalConfirmationCount: this.options.reversalExitConfirmationCount ?? 30,
+          reversalConfirmationCount: this.options.reversalExitConfirmationCount ?? 60,
           settlementGuardMs: this.options.settlementGuardMs ?? 30_000,
           openedAtMs: Date.parse(position.opened_at),
           softReviewMs: this.options.rollingSoftReviewMs ?? 3 * 24 * 60 * 60_000,
@@ -945,9 +954,21 @@ export class FundingResearchEngine {
           holdValue: holding.holdValue, fundingEdge: holding.fundingEdge,
           inSettlementGuard: holding.inSettlementGuard,
           unprofitableCount,
-          unprofitableRequired: this.options.holdingExitConfirmationCount ?? 60,
+          unprofitableRequired: this.options.holdingExitConfirmationCount ?? 180,
           reversalCount,
-          reversalRequired: this.options.reversalExitConfirmationCount ?? 30 };
+          reversalRequired: this.options.reversalExitConfirmationCount ?? 60 };
+        const minimumHoldingActive = Date.parse(observedAt) - Date.parse(position.opened_at)
+          < (this.options.rollingMinimumHoldingMs ?? 24 * 60 * 60_000);
+        if (minimumHoldingActive && settledLegs === 2
+          && (reason === 'hold_value_not_positive' || reason === 'hold_value_confirmation_pending')) {
+          // 长周期研究先观察手续费摊薄；只延后普通价值退出，方向反转和硬上限仍可提前结束。
+          decision = 'HOLD';
+          reason = 'research_minimum_holding_active';
+          unprofitableCount = 0;
+          holdingDetails = { ...holdingDetails, minimumHoldingActive: true,
+            minimumHoldingUntil: new Date(Date.parse(position.opened_at)
+              + (this.options.rollingMinimumHoldingMs ?? 24 * 60 * 60_000)).toISOString() };
+        }
       } catch {
         this.unavailable(position, observedAt, 'funding_schedule_unavailable');
         return;
@@ -974,7 +995,7 @@ export class FundingResearchEngine {
 
   private refreshSettlements(positionId: string, asset: string, longVenue: ExecutionVenue,
     shortVenue: ExecutionVenue, longNotional: Decimal, shortNotional: Decimal,
-    funding: readonly GateFundingInfo[], observedAt: string): void {
+    funding: readonly GateFundingInfo[], openedAt: string, observedAt: string): void {
     const bySymbol = new Map(funding.map((item) => [item.symbol, item]));
     const legs = [
       { venue: longVenue, side: 'LONG', notional: longNotional },
@@ -992,7 +1013,18 @@ export class FundingResearchEngine {
         const marketSymbol = crossExFutureSymbol(leg.venue, asset);
         const item = bySymbol.get(marketSymbol);
         if (!item) continue;
-        const fundingTime = new Date(Number(item.funding_time)).toISOString();
+        const intervalMs = Number(item.funding_interval) * 1_000;
+        let fundingTimeMs = Number(item.funding_time);
+        const openedAtMs = Date.parse(openedAt);
+        const observedAtMs = Date.parse(observedAt);
+        if (!Number.isFinite(intervalMs) || intervalMs <= 0 || !Number.isFinite(fundingTimeMs)
+          || fundingTimeMs <= 0 || !Number.isFinite(openedAtMs) || !Number.isFinite(observedAtMs)) continue;
+        // 结算边界附近 API 可能短暂返回刚结束的时点；模拟仓只能领取开仓之后的下一次结算。
+        const scheduleFloorMs = Math.max(openedAtMs, observedAtMs);
+        if (fundingTimeMs <= scheduleFloorMs) {
+          fundingTimeMs += (Math.floor((scheduleFloorMs - fundingTimeMs) / intervalMs) + 1) * intervalMs;
+        }
+        const fundingTime = new Date(fundingTimeMs).toISOString();
         const amount = leg.notional.mul(item.funding_rate).mul(leg.side === 'LONG' ? -1 : 1);
         statement.run(randomUUID(), positionId, marketSymbol, leg.venue, leg.side, fundingTime,
           item.funding_rate, leg.notional.toString(), amount.toString(), observedAt, observedAt);
@@ -1002,11 +1034,20 @@ export class FundingResearchEngine {
 
   /** 研究账本使用结算前最后一条预测费率模拟到账，不把它标成交易所真实资金流水。 */
   private settleDue(observedAt: string): void {
-    const due = this.database.prepare(`SELECT * FROM funding_research_settlements
-      WHERE state = 'PENDING' AND funding_time <= ? ORDER BY funding_time`).all(observedAt) as Array<Record<string, unknown>>;
+    const due = this.database.prepare(`SELECT settlements.*, positions.opened_at
+      FROM funding_research_settlements settlements
+      JOIN funding_research_positions positions ON positions.id = settlements.position_id
+      WHERE settlements.state = 'PENDING' AND settlements.funding_time <= ?
+      ORDER BY settlements.funding_time`).all(observedAt) as Array<Record<string, unknown>>;
     const affected = new Set<string>();
     this.database.transaction(() => {
       for (const row of due) {
+        if (Date.parse(String(row.funding_time)) <= Date.parse(String(row.opened_at))) {
+          // 这是最终账本防线：任何开仓前或开仓同刻的事件都不能成为资金费收入。
+          this.database.prepare(`UPDATE funding_research_settlements SET state = 'CANCELLED', amount = NULL,
+            settled_at = NULL, updated_at = ? WHERE id = ? AND state = 'PENDING'`).run(observedAt, row.id);
+          continue;
+        }
         this.database.prepare(`UPDATE funding_research_settlements SET state = 'SETTLED', amount = expected_amount,
           settled_at = ?, updated_at = ? WHERE id = ? AND state = 'PENDING'`).run(observedAt, observedAt, row.id);
         affected.add(String(row.position_id));

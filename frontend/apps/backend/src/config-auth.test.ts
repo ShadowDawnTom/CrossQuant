@@ -65,19 +65,24 @@ describe('browser authentication config', () => {
       GCT_FUNDING_RESEARCH_ASSETS: 'BTC,ETH,SOL,DOGE,TRUMP',
     }).fundingResearch).toMatchObject({
       enabled: true,
-      modelVersion: 'rolling_v5',
+      modelVersion: 'rolling_v6',
       assets: ['BTC', 'ETH', 'SOL', 'DOGE', 'TRUMP'],
       targetNotionalUsd: '5',
       maxActualNotionalUsd: '10',
       maxOpenPositions: 3,
       discoveryHotPoolSize: 10,
-      rollingHoldExitConfirmations: 60,
-      rollingReversalExitConfirmations: 30,
+      rollingMinimumHoldingMs: 86_400_000,
+      rollingHoldExitConfirmations: 180,
+      rollingReversalExitConfirmations: 60,
       reentryCooldownMs: 43_200_000,
       holdStressSlippageBps: '2',
       holdAdverseExitBasisBps: '3',
     });
-    expect(() => loadConfig({ GCT_FUNDING_RESEARCH_MODEL_VERSION: 'Rolling V5' }))
+    expect(() => loadConfig({ GCT_FUNDING_RESEARCH_MODEL_VERSION: 'Rolling V6' }))
       .toThrow('must use lowercase letters');
+    expect(() => loadConfig({
+      GCT_FUNDING_RESEARCH_ROLLING_MIN_HOLDING_MS: '604800000',
+      GCT_FUNDING_RESEARCH_ROLLING_HARD_HOLDING_MS: '604800000',
+    })).toThrow('must be lower than rolling hard holding limit');
   });
 });

@@ -235,7 +235,7 @@ export interface FundingResearchVariant {
 }
 export interface FundingResearchSummary {
   enabled: boolean; modelVersion: string; holdExitConfirmations: number; reversalExitConfirmations: number;
-  reentryCooldownMs: number; targetNotionalUsd: string; maxActualNotionalUsd: string;
+  minimumHoldingMs: number; reentryCooldownMs: number; targetNotionalUsd: string; maxActualNotionalUsd: string;
   maxOpenPositions: number; minimumSettledEvents: number;
   lastScanAt: string | null; scan24h: { observations: number; liveEligible: number; researchEligible: number; rejected: number };
   rejectionReasons: Array<{ reason: string; count: number }>; latestObservations: FundingScanObservation[];
@@ -315,7 +315,8 @@ const FundingResearchSummarySchema: RuntimeSchema<FundingResearchSummary> = {
     const data = value as Partial<FundingResearchSummary> | null;
     return data && typeof data.enabled === 'boolean' && typeof data.modelVersion === 'string'
       && typeof data.holdExitConfirmations === 'number' && typeof data.reversalExitConfirmations === 'number'
-      && typeof data.reentryCooldownMs === 'number' && typeof data.openCount === 'number'
+      && typeof data.minimumHoldingMs === 'number' && typeof data.reentryCooldownMs === 'number'
+      && typeof data.openCount === 'number'
       && typeof data.scan24h?.observations === 'number' && Array.isArray(data.latestObservations)
       && Array.isArray(data.positions) && Array.isArray(data.rejectionReasons) && Array.isArray(data.variants)
       ? { success: true, data: data as FundingResearchSummary } : { success: false };
