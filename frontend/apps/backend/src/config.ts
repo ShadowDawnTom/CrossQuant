@@ -228,7 +228,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
   const fundingScanAssets = parseAssetList(environment.GCT_FUNDING_SCAN_ASSETS ?? executionMarketSymbols.join(','), 'GCT_FUNDING_SCAN_ASSETS');
   const fundingResearchAssets = parseAssetList(environment.GCT_FUNDING_RESEARCH_ASSETS ?? DEFAULT_RESEARCH_ASSETS, 'GCT_FUNDING_RESEARCH_ASSETS');
   const fundingResearchEnabled = environment.GCT_FUNDING_RESEARCH_ENABLED === '1';
-  const fundingResearchModelVersion = (environment.GCT_FUNDING_RESEARCH_MODEL_VERSION ?? 'rolling_v4').trim();
+  const fundingResearchModelVersion = (environment.GCT_FUNDING_RESEARCH_MODEL_VERSION ?? 'rolling_v5').trim();
   if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(fundingResearchModelVersion)) {
     throw new Error('GCT_FUNDING_RESEARCH_MODEL_VERSION must use lowercase letters, digits, underscores, or hyphens');
   }

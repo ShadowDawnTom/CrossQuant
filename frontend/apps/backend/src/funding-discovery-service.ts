@@ -149,7 +149,8 @@ export class FundingDiscoveryService {
       this.persist(this.latest, observedAt);
       this.lastPersistedAt = now;
     }
-    return this.hotAssets;
+    // 常驻种子币可以保留盘口用于观测，但只有通过全部轻量准入条件的热池成员才能交给模拟开仓器。
+    return this.latest.filter((item) => item.inHotPool && item.eligibleForHotPool).map((item) => item.asset);
   }
 
   private evaluateAsset(asset: string, rows: readonly GateFundingInfo[], ruleMap: ReadonlyMap<string, GateCrossExSymbol>,

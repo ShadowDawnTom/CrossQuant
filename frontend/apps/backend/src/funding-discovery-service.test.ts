@@ -26,7 +26,7 @@ describe('FundingDiscoveryService', () => {
     const service = new FundingDiscoveryService(database, {
       assets: ['SOL', 'DOGE'], initialHotAssets: ['SOL'], requiredAssets: ['SOL'], hotPoolSize: 2,
       minOpenInterestUsd: '1000000', promotionConfirmations: 1, snapshotIntervalMs: 1,
-      minEdgeDurationMs: 0, maxDirectionFlips24h: 3, minHotDwellMs: 0,
+      minEdgeDurationMs: 0, maxDirectionFlips24h: 3, minHotDwellMs: 1_000,
       onHotPoolChanged: changed, now: () => now,
     });
     const funding = ['SOL', 'DOGE'].flatMap((asset): GateFundingInfo[] => [
@@ -49,7 +49,7 @@ describe('FundingDiscoveryService', () => {
       ] })), venueStatus: [], fetchedAt: new Date(now).toISOString(), cacheStatus: 'fresh',
     } as FundingOverviewResponse;
 
-    expect(await service.observe(funding, rules, overview)).toEqual(['SOL', 'DOGE']);
+    expect(await service.observe(funding, rules, overview)).toEqual(['DOGE', 'SOL']);
     expect(changed).toHaveBeenCalledWith(['SOL', 'DOGE']);
     expect(service.summary()).toMatchObject({ universeSize: 2, hotPoolSize: 2, eligibleCount: 2,
       hotAssets: ['SOL', 'DOGE'] });
@@ -57,5 +57,13 @@ describe('FundingDiscoveryService', () => {
       eligibleForHotPool: true, primaryReason: 'discovery_hot_pool_eligible' });
     expect(database.prepare('SELECT COUNT(*) AS count FROM funding_discovery_snapshots').get())
       .toEqual({ count: 2 });
+
+    const missingOi = structuredClone(overview);
+    (missingOi.assets.find((item) => item.asset === 'DOGE')!.venues[1] as { openInterestValue: string | null })
+      .openInterestValue = null;
+    expect(await service.observe(funding, rules, missingOi)).toEqual(['SOL']);
+    expect(service.summary().assets.find((item) => item.asset === 'DOGE')).toMatchObject({
+      inHotPool: true, eligibleForHotPool: false, primaryReason: 'discovery_open_interest_missing',
+    });
   });
 });
