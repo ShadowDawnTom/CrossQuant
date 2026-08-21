@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError, type FundingResearchEvaluation, type FundingResearchSettlement,
-  type FundingResearchSummary } from './api.js';
+  type FundingDiscoverySummary, type FundingResearchSummary } from './api.js';
 
 function decimal(value: string | number | null | undefined, digits = 4): string {
   const parsed = Number(value);
@@ -44,6 +44,14 @@ const reasonLabel: Record<string, string> = {
   maker_fee_missing: 'Maker 费率缺失', spot_perp_not_supported_for_candidate: '该组合暂无同所现货对冲',
   spot_bbo_depth_insufficient: '现货最优档深度不足', spot_perp_fee_or_price_missing: '现货套利费率或价格缺失',
   spot_book_unavailable: '现货盘口暂不可用',
+  research_actual_notional_exceeded: '规则取整后实际金额超过模拟上限',
+  discovery_funding_edge_missing: '缺少正资金费差', discovery_ticker_missing: 'Ticker 缺失',
+  discovery_ticker_stale: 'Ticker 陈旧', discovery_open_interest_missing: '持仓量缺失',
+  discovery_open_interest_below_threshold: '持仓量低于热池门槛',
+  discovery_persistence_pending: '费率优势持续确认中', discovery_hot_pool_eligible: '符合热池资格',
+  discovery_edge_duration_insufficient: '费率优势持续时间不足',
+  discovery_direction_flips_exceeded: '24小时方向翻转过多',
+  instrument_not_live_or_delisting: '合约非 live 或存在下架风险',
 };
 
 function reason(value: string): string {
@@ -53,13 +61,19 @@ function reason(value: string): string {
 /** RESEARCH 面板只展示独立模拟账本与扫描漏斗，不提供任何交易操作入口。 */
 export function FundingResearchPanel() {
   const [summary, setSummary] = useState<FundingResearchSummary | null>(null);
+  const [discovery, setDiscovery] = useState<FundingDiscoverySummary | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [evaluations, setEvaluations] = useState<FundingResearchEvaluation[]>([]);
   const [settlements, setSettlements] = useState<FundingResearchSettlement[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    try { setSummary(await api.fundingResearchSummary()); setError(null); }
+    try {
+      const [research, discoveryResult] = await Promise.all([
+        api.fundingResearchSummary(), api.fundingDiscoverySummary(),
+      ]);
+      setSummary(research); setDiscovery(discoveryResult); setError(null);
+    }
     catch (cause) { setError(cause instanceof ApiError ? cause.code : 'funding_research_unavailable'); }
   }, []);
 
@@ -95,8 +109,35 @@ export function FundingResearchPanel() {
         <i />{summary?.enabled ? '独立模拟运行中' : '探索模拟未开启'}
       </span>
     </header>
-    <p className="funding-research-notice">每轮从同步盘口和流动性过滤后的市场选择最优组合，对比一次结算、滚动持仓、Maker/Taker 反事实和同所现货/永续四条影子口径；目标每腿 {summary?.targetNotionalUsd ?? '5'} U，但合约步长可能抬高实际金额。滚动组采用 {summary?.modelVersion ?? 'rolling_v3'}：第一次双腿结算前不累计普通退出计数，结算后普通价值转负连续确认 {summary?.holdExitConfirmations ?? 60} 次、方向翻转连续确认 {summary?.reversalExitConfirmations ?? 30} 次，平仓后至少冷却 {decimal((summary?.reentryCooldownMs ?? 43_200_000) / 3_600_000, 0)} 小时。毛快照 APR 只表示当前费率外推，所有研究都不会发送交易所订单。</p>
+    <p className="funding-research-notice">广域发现池只读取资金费、Ticker、交易规则和持仓量；排名靠前且持续确认的 {discovery?.hotPoolLimit ?? 10} 个币才接入完整订单簿。研究目标每腿 {summary?.targetNotionalUsd ?? '5'} U，规则取整后任一腿超过 {summary?.maxActualNotionalUsd ?? '10'} U 会直接拒绝。每个研究组最多同时持有 {summary?.maxOpenPositions ?? 3} 个不同组合。滚动组采用 {summary?.modelVersion ?? 'rolling_v4'}，所有研究都不会发送交易所订单。</p>
     {error && <p className="funding-paper-error" role="alert">研究数据读取失败：{error}</p>}
+
+    <div className="funding-research-opportunities">
+      <h3>广域发现池与动态盘口热池</h3>
+      <div className="funding-research-stats">
+        <span><small>发现币种</small><strong>{discovery?.universeSize ?? '—'}</strong></span>
+        <span><small>盘口热池</small><strong>{discovery ? `${discovery.hotPoolSize} / ${discovery.hotPoolLimit}` : '—'}</strong></span>
+        <span><small>当前符合热池资格</small><strong>{discovery?.eligibleCount ?? '—'}</strong></span>
+        <span><small>最后发现</small><strong>{time(discovery?.updatedAt)}</strong></span>
+      </div>
+      {!discovery || discovery.assets.length === 0 ? <p className="funding-paper-empty">等待第一轮广域发现。</p>
+        : <div className="research-observation-list">{discovery.assets.slice(0, 30).map((item) =>
+          <article key={item.asset} className={`research-observation ${item.inHotPool ? 'status-research_eligible' : 'status-rejected'}`}>
+            <div className="research-observation-title">
+              <span className="research-status">{item.inHotPool ? 'HOT BOOK' : item.eligibleForHotPool ? '候补' : '发现'}</span>
+              <strong>{item.asset}</strong><span>{item.bestLongVenue ?? '—'} 多 / {item.bestShortVenue ?? '—'} 空</span>
+              <em>{reason(item.primaryReason)}</em>
+            </div>
+            <div className="research-cost-grid">
+              <span><small>8h 等效毛费率差</small>{percent(item.spread8h, 4)}</span>
+              <span><small>双腿最小持仓量</small>{item.openInterestUsd ? `$${Number(item.openInterestUsd).toLocaleString()}` : '—'}</span>
+              <span><small>连续确认</small>{item.consecutiveConfirmations} 次</span>
+              <span><small>优势持续</small>{item.edgeDurationMinutes} 分钟</span>
+              <span><small>24h 方向翻转</small>{item.directionFlips24h} 次</span>
+              <span><small>Ticker</small>{decimal(item.lastPrice, 6)} · {percent(item.change24h)}</span>
+            </div>
+          </article>)}</div>}
+    </div>
 
     <div className="funding-research-stats">
       <span><small>24h 扫描组合</small><strong>{summary?.scan24h.observations.toLocaleString() ?? '—'}</strong></span>

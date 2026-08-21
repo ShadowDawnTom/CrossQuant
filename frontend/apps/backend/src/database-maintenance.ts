@@ -19,6 +19,7 @@ export interface DatabaseMaintenanceResult {
   fundingHoldingEvaluationsDeleted: number;
   fundingPaperEvaluationsDeleted: number;
   fundingScanObservationsDeleted: number;
+  fundingDiscoverySnapshotsDeleted: number;
   fundingResearchEvaluationsDeleted: number;
 }
 
@@ -89,6 +90,9 @@ export function runDatabaseMaintenance(
     const fundingScanObservationsDeleted = database.prepare(
       'DELETE FROM funding_scan_observations WHERE observed_at < ? AND id NOT IN (SELECT observation_id FROM funding_research_positions)',
     ).run(fundingScanCutoff).changes;
+    const fundingDiscoverySnapshotsDeleted = database.prepare(
+      'DELETE FROM funding_discovery_snapshots WHERE observed_at < ?',
+    ).run(fundingScanCutoff).changes;
     const fundingResearchEvaluationsDeleted = database.prepare(
       'DELETE FROM funding_research_evaluations WHERE observed_at < ?',
     ).run(executionCutoff).changes;
@@ -102,6 +106,7 @@ export function runDatabaseMaintenance(
       fundingHoldingEvaluationsDeleted,
       fundingPaperEvaluationsDeleted,
       fundingScanObservationsDeleted,
+      fundingDiscoverySnapshotsDeleted,
       fundingResearchEvaluationsDeleted,
     };
   })();

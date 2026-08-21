@@ -235,7 +235,8 @@ export interface FundingResearchVariant {
 }
 export interface FundingResearchSummary {
   enabled: boolean; modelVersion: string; holdExitConfirmations: number; reversalExitConfirmations: number;
-  reentryCooldownMs: number; targetNotionalUsd: string; maxOpenPositions: number; minimumSettledEvents: number;
+  reentryCooldownMs: number; targetNotionalUsd: string; maxActualNotionalUsd: string;
+  maxOpenPositions: number; minimumSettledEvents: number;
   lastScanAt: string | null; scan24h: { observations: number; liveEligible: number; researchEligible: number; rejected: number };
   rejectionReasons: Array<{ reason: string; count: number }>; latestObservations: FundingScanObservation[];
   openCount: number; closedCount: number; cumulativePnl: string; cumulativeFunding: string;
@@ -243,6 +244,18 @@ export interface FundingResearchSummary {
   cohorts: Array<{ cohort: 'ONE_SETTLEMENT' | 'ROLLING'; openCount: number; closedCount: number;
     cumulativePnl: string; cumulativeFunding: string; cumulativeFees: string }>;
   variants: FundingResearchVariant[];
+}
+export interface FundingDiscoveryAsset {
+  asset: string; observedAt: string; bestLongVenue: string | null; bestShortVenue: string | null;
+  bestLongRate: string | null; bestShortRate: string | null; spread8h: string | null;
+  openInterestUsd: string | null; lastPrice: string | null; change24h: string | null;
+  edgeDurationMinutes: number; directionFlips24h: number; consecutiveConfirmations: number;
+  eligibleForHotPool: boolean; inHotPool: boolean; primaryReason: string; score: number;
+  details: Record<string, unknown>;
+}
+export interface FundingDiscoverySummary {
+  updatedAt: string | null; universeSize: number; hotPoolSize: number; hotPoolLimit: number;
+  hotAssets: string[]; eligibleCount: number; assets: FundingDiscoveryAsset[];
 }
 
 interface RuntimeSchema<T> {
@@ -306,6 +319,14 @@ const FundingResearchSummarySchema: RuntimeSchema<FundingResearchSummary> = {
       && typeof data.scan24h?.observations === 'number' && Array.isArray(data.latestObservations)
       && Array.isArray(data.positions) && Array.isArray(data.rejectionReasons) && Array.isArray(data.variants)
       ? { success: true, data: data as FundingResearchSummary } : { success: false };
+  },
+};
+const FundingDiscoverySummarySchema: RuntimeSchema<FundingDiscoverySummary> = {
+  safeParse(value) {
+    const data = value as Partial<FundingDiscoverySummary> | null;
+    return data && typeof data.universeSize === 'number' && typeof data.hotPoolSize === 'number'
+      && Array.isArray(data.hotAssets) && Array.isArray(data.assets)
+      ? { success: true, data: data as FundingDiscoverySummary } : { success: false };
   },
 };
 const FundingResearchDetailsSchema: RuntimeSchema<{ position: FundingResearchPosition;
@@ -455,6 +476,7 @@ export const api = {
   fundingPaperDetails: (id: string) => request(FundingPaperDetailsSchema,
     `/api/funding-paper/${encodeURIComponent(id)}`),
   fundingResearchSummary: () => request(FundingResearchSummarySchema, '/api/funding-research'),
+  fundingDiscoverySummary: () => request(FundingDiscoverySummarySchema, '/api/funding-discovery'),
   fundingResearchDetails: (id: string) => request(FundingResearchDetailsSchema,
     `/api/funding-research/${encodeURIComponent(id)}`),
   startFundingArbitrage: (body: { idempotencyKey: string; candidateId: string; asset: string; longVenue: string;

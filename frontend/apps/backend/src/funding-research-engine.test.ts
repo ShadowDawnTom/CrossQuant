@@ -74,6 +74,37 @@ function observation(now: number): FundingScanObservation {
 }
 
 describe('FundingResearchEngine', () => {
+  it('每个实验组最多开三种不同组合，并在账本层再次拦截超额名义金额', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'funding-research-multi-'));
+    const database = openDatabase(join(directory, 'test.sqlite'), resolve(process.cwd(), '../../migrations'));
+    resources.push({ directory, database });
+    const currentTime = Date.parse('2026-08-15T00:00:00.000Z');
+    const assets = ['SOL', 'DOGE', 'ZEC'];
+    const observations = assets.map((asset, index) => ({
+      ...observation(currentTime), id: `${index + 1}aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`, asset,
+    }));
+    const fundingRows = assets.flatMap((asset) => funding(currentTime).map((row) => ({
+      ...row, symbol: row.symbol.replace('_SOL_', `_${asset}_`),
+    })));
+    const engine = new FundingResearchEngine(database, market(() => currentTime), {
+      enabled: true, modelVersion: 'rolling_v4', targetNotionalUsd: '5', maxActualNotionalUsd: '10',
+      maxOpenPositions: 3, minimumSettledEvents: 1,
+    }, () => currentTime);
+
+    expect(await engine.observe(observations, fundingRows, fees)).toBe(6);
+    expect(engine.list().filter((item) => item.state === 'OPEN' && item.cohort === 'ONE_SETTLEMENT')).toHaveLength(3);
+    expect(engine.list().filter((item) => item.state === 'OPEN' && item.cohort === 'ROLLING')).toHaveLength(3);
+
+    const oversized = { ...observation(currentTime), id: '9aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      asset: 'LINK', entryLongNotional: '11', entryShortNotional: '11' };
+    const isolated = new FundingResearchEngine(database, market(() => currentTime), {
+      enabled: true, modelVersion: 'cap_guard', targetNotionalUsd: '5', maxActualNotionalUsd: '10',
+      maxOpenPositions: 3, minimumSettledEvents: 1,
+    }, () => currentTime);
+    expect(await isolated.observe([oversized], fundingRows, fees)).toBe(0);
+    expect(isolated.list()).toEqual([]);
+  });
+
   it('允许负净收益研究仓位，但必须经历至少一次模拟结算后才平仓', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'funding-research-'));
     const database = openDatabase(join(directory, 'test.sqlite'), resolve(process.cwd(), '../../migrations'));

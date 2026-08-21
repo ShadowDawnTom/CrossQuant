@@ -87,6 +87,7 @@ export interface BackendConfig {
     modelVersion: string;
     assets: string[];
     targetNotionalUsd: string;
+    maxActualNotionalUsd: string;
     maxOpenPositions: number;
     maxSlippageBps: string;
     minimumSettledEvents: number;
@@ -103,6 +104,13 @@ export interface BackendConfig {
     holdAdverseExitBasisBps: string;
     makerFillProbability: string;
     makerLegRiskBps: string;
+    discoveryHotPoolSize: number;
+    discoveryMinOpenInterestUsd: string;
+    discoveryPromotionConfirmations: number;
+    discoveryMinEdgeDurationMs: number;
+    discoveryMaxDirectionFlips24h: number;
+    discoverySnapshotIntervalMs: number;
+    discoveryMinHotDwellMs: number;
   };
 }
 
@@ -157,6 +165,11 @@ const DEFAULT_RESEARCH_ASSETS = [
   'BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'ADA', 'SUI', 'AVAX', 'LINK', 'LTC',
   'BCH', 'DOT', 'UNI', 'AAVE', 'NEAR', 'APT', 'ARB', 'OP', 'INJ', 'ATOM',
   'FIL', 'ETC', 'XLM', 'HBAR', 'TRX', 'SEI', 'JUP', 'TAO', 'WIF', 'PEPE', 'ZEC',
+  'TON', 'SHIB', 'POL', 'BNB', 'EOS', 'GALA', 'SAND', 'MANA', 'CRV', 'LDO',
+  'RUNE', 'IMX', 'STX', 'TIA', 'PYTH', 'ENA', 'WLD', 'ORDI', 'NOT', 'FET',
+  'ICP', 'DYDX', 'GMX', 'KAS', 'ALGO', 'VET', 'FLOW', 'THETA', 'MKR', 'COMP',
+  'SNX', 'BONK', 'FLOKI', 'POPCAT', 'PENGU', 'TRUMP', 'KAITO', 'ONDO', 'PENDLE', 'JTO',
+  'STRK', 'AEVO', 'BLUR', 'MEME', 'NEO', 'IOTA', 'QTUM', 'CELO', 'JASMY',
 ].join(',');
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): BackendConfig {
@@ -215,18 +228,36 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
   const fundingScanAssets = parseAssetList(environment.GCT_FUNDING_SCAN_ASSETS ?? executionMarketSymbols.join(','), 'GCT_FUNDING_SCAN_ASSETS');
   const fundingResearchAssets = parseAssetList(environment.GCT_FUNDING_RESEARCH_ASSETS ?? DEFAULT_RESEARCH_ASSETS, 'GCT_FUNDING_RESEARCH_ASSETS');
   const fundingResearchEnabled = environment.GCT_FUNDING_RESEARCH_ENABLED === '1';
-  const fundingResearchModelVersion = (environment.GCT_FUNDING_RESEARCH_MODEL_VERSION ?? 'rolling_v3').trim();
+  const fundingResearchModelVersion = (environment.GCT_FUNDING_RESEARCH_MODEL_VERSION ?? 'rolling_v4').trim();
   if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(fundingResearchModelVersion)) {
     throw new Error('GCT_FUNDING_RESEARCH_MODEL_VERSION must use lowercase letters, digits, underscores, or hyphens');
   }
-  if (executionMarketSymbols.length > 50 || fundingResearchAssets.length > 50) {
-    throw new Error('execution and research asset lists must not exceed 50 assets');
+  if (executionMarketSymbols.length > 50 || fundingResearchAssets.length > 100) {
+    throw new Error('execution asset lists must not exceed 50 and research discovery must not exceed 100 assets');
   }
   const fundingResearchMaxOpenPositions = parsePositiveInteger(
-    environment.GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS ?? '1', 'GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS',
+    environment.GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS ?? '3', 'GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS',
   );
-  if (fundingResearchMaxOpenPositions !== 1) {
-    throw new Error('GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS must remain 1 per cohort');
+  if (fundingResearchMaxOpenPositions > 3) {
+    throw new Error('GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS must be between 1 and 3 per cohort');
+  }
+  const fundingResearchTargetNotionalUsd = parsePositiveDecimal(
+    environment.GCT_FUNDING_RESEARCH_TARGET_NOTIONAL_USD ?? '5', 'GCT_FUNDING_RESEARCH_TARGET_NOTIONAL_USD',
+  );
+  const fundingResearchMaxActualNotionalUsd = parsePositiveDecimal(
+    environment.GCT_FUNDING_RESEARCH_MAX_ACTUAL_NOTIONAL_USD ?? '10', 'GCT_FUNDING_RESEARCH_MAX_ACTUAL_NOTIONAL_USD',
+  );
+  if (Number(fundingResearchMaxActualNotionalUsd) < Number(fundingResearchTargetNotionalUsd)) {
+    throw new Error('GCT_FUNDING_RESEARCH_MAX_ACTUAL_NOTIONAL_USD must cover the research target');
+  }
+  const discoveryHotPoolSize = parsePositiveInteger(
+    environment.GCT_FUNDING_DISCOVERY_HOT_POOL_SIZE ?? '10', 'GCT_FUNDING_DISCOVERY_HOT_POOL_SIZE',
+  );
+  if (discoveryHotPoolSize < 8 || discoveryHotPoolSize > 12) {
+    throw new Error('GCT_FUNDING_DISCOVERY_HOT_POOL_SIZE must be between 8 and 12');
+  }
+  if (fundingScanAssets.length > discoveryHotPoolSize) {
+    throw new Error('GCT_FUNDING_SCAN_ASSETS must fit inside the dynamic hot pool');
   }
   const fundingResearchRollingSoftReviewMs = parsePositiveInteger(
     environment.GCT_FUNDING_RESEARCH_ROLLING_SOFT_REVIEW_MS ?? '259200000',
@@ -242,12 +273,6 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
   const missingStrictBooks = fundingScanAssets.filter((asset) => !executionMarketSymbols.includes(asset));
   if (missingStrictBooks.length > 0) {
     throw new Error(`GCT_FUNDING_SCAN_ASSETS require execution books for: ${missingStrictBooks.join(',')}`);
-  }
-  if (fundingResearchEnabled) {
-    const missingBooks = fundingResearchAssets.filter((asset) => !executionMarketSymbols.includes(asset));
-    if (missingBooks.length > 0) {
-      throw new Error(`GCT_FUNDING_RESEARCH_ASSETS require execution books for: ${missingBooks.join(',')}`);
-    }
   }
   // Browsers send the loopback host the user actually typed; localhost, 127.0.0.1, and [::1]
   // variants of the local UI and backend are all the same trust domain.
@@ -366,7 +391,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       enabled: fundingResearchEnabled,
       modelVersion: fundingResearchModelVersion,
       assets: fundingResearchAssets,
-      targetNotionalUsd: parsePositiveDecimal(environment.GCT_FUNDING_RESEARCH_TARGET_NOTIONAL_USD ?? '5', 'GCT_FUNDING_RESEARCH_TARGET_NOTIONAL_USD'),
+      targetNotionalUsd: fundingResearchTargetNotionalUsd,
+      maxActualNotionalUsd: fundingResearchMaxActualNotionalUsd,
       maxOpenPositions: fundingResearchMaxOpenPositions,
       maxSlippageBps: parseNonNegativeDecimal(environment.GCT_FUNDING_RESEARCH_MAX_SLIPPAGE_BPS ?? '10', 'GCT_FUNDING_RESEARCH_MAX_SLIPPAGE_BPS'),
       minimumSettledEvents: parsePositiveInteger(environment.GCT_FUNDING_RESEARCH_MIN_SETTLED_EVENTS ?? '1', 'GCT_FUNDING_RESEARCH_MIN_SETTLED_EVENTS'),
@@ -398,6 +424,31 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       ),
       makerFillProbability: parseUnitInterval(environment.GCT_FUNDING_RESEARCH_MAKER_FILL_PROBABILITY ?? '0.35', 'GCT_FUNDING_RESEARCH_MAKER_FILL_PROBABILITY'),
       makerLegRiskBps: parseNonNegativeDecimal(environment.GCT_FUNDING_RESEARCH_MAKER_LEG_RISK_BPS ?? '5', 'GCT_FUNDING_RESEARCH_MAKER_LEG_RISK_BPS'),
+      discoveryHotPoolSize,
+      discoveryMinOpenInterestUsd: parsePositiveDecimal(
+        environment.GCT_FUNDING_DISCOVERY_MIN_OPEN_INTEREST_USD ?? '1000000',
+        'GCT_FUNDING_DISCOVERY_MIN_OPEN_INTEREST_USD',
+      ),
+      discoveryPromotionConfirmations: parsePositiveInteger(
+        environment.GCT_FUNDING_DISCOVERY_PROMOTION_CONFIRMATIONS ?? '3',
+        'GCT_FUNDING_DISCOVERY_PROMOTION_CONFIRMATIONS',
+      ),
+      discoveryMinEdgeDurationMs: parsePositiveInteger(
+        environment.GCT_FUNDING_DISCOVERY_MIN_EDGE_DURATION_MS ?? '900000',
+        'GCT_FUNDING_DISCOVERY_MIN_EDGE_DURATION_MS',
+      ),
+      discoveryMaxDirectionFlips24h: parseNonNegativeInteger(
+        environment.GCT_FUNDING_DISCOVERY_MAX_DIRECTION_FLIPS_24H ?? '3',
+        'GCT_FUNDING_DISCOVERY_MAX_DIRECTION_FLIPS_24H',
+      ),
+      discoverySnapshotIntervalMs: parsePositiveInteger(
+        environment.GCT_FUNDING_DISCOVERY_SNAPSHOT_INTERVAL_MS ?? '300000',
+        'GCT_FUNDING_DISCOVERY_SNAPSHOT_INTERVAL_MS',
+      ),
+      discoveryMinHotDwellMs: parsePositiveInteger(
+        environment.GCT_FUNDING_DISCOVERY_MIN_HOT_DWELL_MS ?? '1800000',
+        'GCT_FUNDING_DISCOVERY_MIN_HOT_DWELL_MS',
+      ),
     },
   };
 }

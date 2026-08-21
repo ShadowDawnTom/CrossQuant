@@ -132,6 +132,28 @@ describe('venue payload parsing', () => {
 });
 
 describe('ExecutionMarketHub certification', () => {
+  it('动态替换研究热池时保留严格资产并初始化新增盘口', async () => {
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/futures/usdt/contracts')) return new Response(JSON.stringify([
+        { name: 'BTC_USDT', quanto_multiplier: '1' }, { name: 'DOGE_USDT', quanto_multiplier: '1' },
+      ]), { status: 200 });
+      return new Response(JSON.stringify({ data: [
+        { instId: 'BTC-USDT-SWAP', ctVal: '1' }, { instId: 'DOGE-USDT-SWAP', ctVal: '1' },
+      ] }), { status: 200 });
+    });
+    const hub = new ExecutionMarketHub(fetchImpl as typeof fetch, {
+      symbols: ['BTC'], requiredSymbols: ['BTC'], quoteFx: new StaticQuoteFxReader(),
+    });
+
+    await hub.replaceSymbols(['DOGE']);
+    expect(hub.health().symbols).toEqual(['BTC', 'DOGE']);
+    expect(hub.book('BINANCE', 'DOGE')).toMatchObject({ base: 'DOGE', synchronized: false });
+    await hub.replaceSymbols(['BTC']);
+    expect(hub.health().symbols).toEqual(['BTC']);
+    expect(() => hub.book('BINANCE', 'DOGE')).toThrow('execution_market_not_configured');
+  });
+
   it('waits for a websocket delta that bridges the REST snapshot', async () => {
     vi.useFakeTimers();
     const hub = new ExecutionMarketHub(fetch, { symbols: ['BTC'] });

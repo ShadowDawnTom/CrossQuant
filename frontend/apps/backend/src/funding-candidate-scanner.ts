@@ -26,7 +26,10 @@ export interface FundingCandidateScannerOptions {
   adverseExitBasisBps: string;
   minNetAnnualized?: string;
   researchAssets?: string[];
+  selectResearchAssets?: (funding: readonly GateFundingInfo[], rules: readonly GateCrossExSymbol[]) =>
+    readonly string[] | Promise<readonly string[]>;
   researchTargetNotionalUsd?: string;
+  researchMaxActualNotionalUsd?: string;
   researchMaxSlippageBps?: string;
   minLiquidityUsd?: string;
   liquidityDepthBps?: string;
@@ -205,7 +208,7 @@ export class FundingCandidateScanner {
     if (!credentials) return 0;
     const assets = [...new Set(this.options.assets.map((asset) => asset.toUpperCase()))];
     const strictAssets = new Set((this.options.strictAssets ?? assets).map((asset) => asset.toUpperCase()));
-    const researchAssets = new Set((this.options.researchAssets ?? []).map((asset) => asset.toUpperCase()));
+    const researchUniverse = new Set((this.options.researchAssets ?? []).map((asset) => asset.toUpperCase()));
     const minNetAnnualized = new Decimal(this.options.minNetAnnualized ?? '0');
     const researchMaxSlippageBps = new Decimal(this.options.researchMaxSlippageBps ?? '10');
     const minimumLiquidityUsd = new Decimal(this.options.minLiquidityUsd ?? '1000');
@@ -216,15 +219,24 @@ export class FundingCandidateScanner {
     const observedAt = new Date(this.now()).toISOString();
     const observations: FundingScanObservation[] = [];
     const requestedSymbols = assets.flatMap((asset) => EXECUTION_VENUES.map((venue) => crossExFutureSymbol(venue, asset)));
-    const [funding, reference] = await Promise.all([
-      this.gateway.queryFundingInfo!(credentials, requestedSymbols), this.referenceData(credentials),
-    ]);
+    const fundingRequests: GateFundingInfo[][] = [];
+    for (let offset = 0; offset < requestedSymbols.length; offset += 350) {
+      // CrossEx 单次最多接收 350 个 symbol；广域发现分批顺序请求，避免并发突发触发账户限频。
+      fundingRequests.push(await this.gateway.queryFundingInfo!(credentials, requestedSymbols.slice(offset, offset + 350)));
+    }
+    const funding = fundingRequests.flat();
+    const reference = await this.referenceData(credentials);
     const { rules, fees } = reference;
+    const researchAssets = new Set((this.options.selectResearchAssets
+      ? await this.options.selectResearchAssets(funding, rules)
+      : [...researchUniverse]).map((asset) => asset.toUpperCase()));
     const ruleMap = new Map(rules.map((rule) => [rule.symbol, rule]));
     const horizonMs = this.options.horizonHours * 60 * 60_000;
     let recorded = 0;
     for (const asset of assets) {
       const rows = funding.filter((item) => SYMBOL.exec(item.symbol)?.[2] === asset);
+      // 非热资产只参加轻量发现，不创建或读取任何完整订单簿。
+      if (!strictAssets.has(asset) && !researchAssets.has(asset)) continue;
       const combinations = rows.flatMap((first, left) => rows.slice(left + 1).map((second) => {
         const firstEvents = eventCount(first, this.now(), horizonMs);
         const secondEvents = eventCount(second, this.now(), horizonMs);
@@ -348,6 +360,9 @@ export class FundingCandidateScanner {
         );
         const capital = longEntry.notional.plus(shortEntry.notional).div(2);
         if (!capital.gt(0)) { reject('invalid_executable_notional', pair.quality); continue; }
+        const researchMaxActualNotional = new Decimal(this.options.researchMaxActualNotionalUsd ?? '10');
+        const researchActualNotionalExceeded = researchAssets.has(asset)
+          && (longEntry.notional.gt(researchMaxActualNotional) || shortEntry.notional.gt(researchMaxActualNotional));
         let longFee;
         let shortFee;
         try { longFee = feeFor(fees, longVenue, long.symbol); shortFee = feeFor(fees, shortVenue, short.symbol); }
@@ -388,6 +403,7 @@ export class FundingCandidateScanner {
           ? Decimal.max(0, friction).mul(this.options.horizonHours).div(conservativeFundingPnl)
           : null;
         const researchEligible = researchAssets.has(asset) && snapshotFundingPnl.gt(0)
+          && !researchActualNotionalExceeded
           && liquidityUsd.gte(minimumLiquidityUsd)
           && entrySlippageBps.lte(researchMaxSlippageBps) && exitSlippageBps.lte(researchMaxSlippageBps);
         let strictEligible = false;
@@ -407,6 +423,7 @@ export class FundingCandidateScanner {
         }
         const researchReason = !researchAssets.has(asset) ? 'research_asset_not_enabled'
           : !snapshotFundingPnl.gt(0) ? 'raw_funding_not_positive'
+            : researchActualNotionalExceeded ? 'research_actual_notional_exceeded'
             : liquidityUsd.lt(minimumLiquidityUsd) ? 'research_liquidity_below_threshold'
               : entrySlippageBps.gt(researchMaxSlippageBps) ? 'research_entry_slippage_exceeded'
               : exitSlippageBps.gt(researchMaxSlippageBps) ? 'research_exit_slippage_exceeded'

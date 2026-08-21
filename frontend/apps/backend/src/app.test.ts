@@ -498,7 +498,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 26, currentMigration: '0026_funding_scan_summaries.sql' },
+      database: { migrationCount: 27, currentMigration: '0027_funding_discovery_hot_pool.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',
@@ -555,10 +555,16 @@ describe('local backend', () => {
       headers: { host: '127.0.0.1:17840' } });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
-      enabled: false, targetNotionalUsd: '5', maxOpenPositions: 1, openCount: 0, closedCount: 0,
+      enabled: false, targetNotionalUsd: '5', maxActualNotionalUsd: '10', maxOpenPositions: 3,
+      openCount: 0, closedCount: 0,
       scan24h: { observations: 0, liveEligible: 0, researchEligible: 0, rejected: 0 },
       latestObservations: [], positions: [],
     });
+    const discovery = await app.inject({ method: 'GET', url: '/api/funding-discovery',
+      headers: { host: '127.0.0.1:17840' } });
+    expect(discovery.statusCode).toBe(200);
+    expect(discovery.json()).toMatchObject({ universeSize: 80, hotPoolSize: 2, hotPoolLimit: 10,
+      hotAssets: ['BTC', 'ETH'], eligibleCount: 0, assets: [] });
   });
 
   it('allows explicit reduce-only emergency orders while the global trading lock is active', async () => {

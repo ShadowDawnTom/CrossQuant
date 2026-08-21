@@ -20,6 +20,7 @@ export interface FundingResearchOptions {
   enabled: boolean;
   modelVersion?: string;
   targetNotionalUsd: string;
+  maxActualNotionalUsd?: string;
   maxOpenPositions: number;
   minimumSettledEvents: number;
   holdingEventsPerLeg?: number;
@@ -173,6 +174,7 @@ export interface FundingResearchSummary {
   reversalExitConfirmations: number;
   reentryCooldownMs: number;
   targetNotionalUsd: string;
+  maxActualNotionalUsd: string;
   maxOpenPositions: number;
   minimumSettledEvents: number;
   lastScanAt: string | null;
@@ -368,7 +370,7 @@ export class FundingResearchEngine {
   private active: Promise<number> | null = null;
 
   private get modelVersion(): string {
-    return this.options.modelVersion ?? 'rolling_v3';
+    return this.options.modelVersion ?? 'rolling_v4';
   }
 
   constructor(
@@ -478,6 +480,7 @@ export class FundingResearchEngine {
       reversalExitConfirmations: this.options.reversalExitConfirmationCount ?? 30,
       reentryCooldownMs: this.options.reentryCooldownMs ?? 12 * 60 * 60_000,
       targetNotionalUsd: this.options.targetNotionalUsd,
+      maxActualNotionalUsd: this.options.maxActualNotionalUsd ?? '10',
       maxOpenPositions: this.options.maxOpenPositions, minimumSettledEvents: this.options.minimumSettledEvents,
       lastScanAt: lastScan?.observed_at ?? null,
       scan24h,
@@ -590,28 +593,39 @@ export class FundingResearchEngine {
       changed += 1;
     }
     if (!this.options.enabled) return changed;
-    const best = [...observations].filter((item) => item.researchEligible && item.quantity !== null
+    const maxActualNotional = new Decimal(this.options.maxActualNotionalUsd ?? '10');
+    const candidates = [...observations].filter((item) => item.researchEligible && item.quantity !== null
       && item.entryLongPrice !== null && item.entryShortPrice !== null && item.entryLongNotional !== null
       && item.entryShortNotional !== null && item.entryFees !== null && item.rawAnnualized !== null
-      && item.netAnnualized !== null).sort((left, right) => new Decimal(right.netAnnualized!).cmp(left.netAnnualized!))[0];
-    if (!best) return changed;
-    await this.recordVariants(best, fees, observedAt);
+      && item.netAnnualized !== null
+      // 扫描器已检查一次，这里再做账本边界防御，配置错误也不能把 5U 目标放大成几十 U。
+      && new Decimal(item.entryLongNotional).lte(maxActualNotional)
+      && new Decimal(item.entryShortNotional).lte(maxActualNotional))
+      .sort((left, right) => new Decimal(right.netAnnualized!).cmp(left.netAnnualized!));
+    if (candidates.length === 0) return changed;
+    await this.recordVariants(candidates[0]!, fees, observedAt);
     for (const cohort of ['ONE_SETTLEMENT', 'ROLLING'] as const) {
-      const openCount = (this.database.prepare(`SELECT COUNT(*) AS count FROM funding_research_positions
+      let openCount = (this.database.prepare(`SELECT COUNT(*) AS count FROM funding_research_positions
         WHERE state = 'OPEN' AND cohort = ? AND research_model_version = ?`)
         .get(cohort, this.modelVersion) as { count: number }).count;
-      if (openCount >= this.options.maxOpenPositions) continue;
-      const latestClosed = this.database.prepare(`SELECT reopen_after FROM funding_research_positions
-        WHERE state = 'CLOSED' AND cohort = ? AND research_model_version = ? ORDER BY closed_at DESC LIMIT 1`)
-        .get(cohort, this.modelVersion) as { reopen_after: string | null } | undefined;
-      if (latestClosed?.reopen_after && latestClosed.reopen_after > observedAt) continue;
-      // observation_id 有历史唯一约束；第二组复制同一时点快照，保证两组入场基线完全一致。
-      const cohortObservation = cohort === 'ONE_SETTLEMENT' ? best : { ...best, id: randomUUID(), cohortClone: true };
-      if (cohort === 'ROLLING') this.persistObservations([cohortObservation]);
-      const openedId = this.open(cohortObservation, funding, observedAt, cohort);
-      if (!openedId) continue;
-      this.evaluate(openedId, funding, fees, observedAt);
-      changed += 1;
+      for (const candidate of candidates) {
+        if (openCount >= this.options.maxOpenPositions) break;
+        const latestClosed: { reopen_after: string | null } | undefined = this.database.prepare(`SELECT reopen_after FROM funding_research_positions
+          WHERE state = 'CLOSED' AND cohort = ? AND research_model_version = ? AND asset = ?
+            AND long_venue = ? AND short_venue = ? ORDER BY closed_at DESC LIMIT 1`)
+          .get(cohort, this.modelVersion, candidate.asset, candidate.longVenue, candidate.shortVenue) as
+          { reopen_after: string | null } | undefined;
+        if (latestClosed?.reopen_after && latestClosed.reopen_after > observedAt) continue;
+        // observation_id 有唯一约束；滚动组复制同一快照，但同组同方向组合由数据库索引继续防重。
+        const cohortObservation = cohort === 'ONE_SETTLEMENT'
+          ? candidate : { ...candidate, id: randomUUID(), cohortClone: true };
+        if (cohort === 'ROLLING') this.persistObservations([cohortObservation]);
+        const openedId = this.open(cohortObservation, funding, observedAt, cohort);
+        if (!openedId) continue;
+        this.evaluate(openedId, funding, fees, observedAt);
+        openCount += 1;
+        changed += 1;
+      }
     }
     return changed;
   }

@@ -1,6 +1,6 @@
 import { FUNDING_STAT_VENUES, PublicMarketDataError } from '@gate-crossex/public-data';
 import type { FundingStatVenue, PublicMarketDataGateway, VenueFundingStat } from '@gate-crossex/public-data';
-import type { FundingOverviewResponse, FundingOverviewVenueEntry, MarketCatalogVenue } from '@gate-crossex/shared-types';
+import type { FundingOverviewResponse, FundingOverviewVenueEntry } from '@gate-crossex/shared-types';
 
 interface VenueCacheEntry {
   rows: Map<string, VenueFundingStat>;
@@ -10,7 +10,7 @@ interface VenueCacheEntry {
 }
 
 export interface FundingOverviewCatalogView {
-  assets: ReadonlyMap<string, MarketCatalogVenue[]>;
+  assets: ReadonlyMap<string, Array<{ venue: string; symbol: string; quote: string }>>;
 }
 
 export interface FundingOverviewServiceOptions {

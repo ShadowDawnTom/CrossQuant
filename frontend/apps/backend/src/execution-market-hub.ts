@@ -87,6 +87,7 @@ export interface ExecutionMarketHealth {
 export interface ExecutionMarketReader {
   start(): void;
   stop(): void;
+  replaceSymbols?(symbols: readonly string[]): Promise<void>;
   health(now?: number): ExecutionMarketHealth;
   book(venue: ExecutionVenue, base: string, now?: number): ExecutionBookSnapshot;
   pair(base: string, longVenue: ExecutionVenue, shortVenue: ExecutionVenue, now?: number): ExecutionPairSnapshot;
@@ -447,6 +448,62 @@ export class ExecutionMarketHub {
     this.bootstrapTimers.clear();
   }
 
+  /**
+   * 运行中只替换研究盘口热池。严格实盘资产始终保留；增删主题不重连整所，避免动态筛选制造行情空窗。
+   */
+  async replaceSymbols(symbols: readonly string[]): Promise<void> {
+    const next = [...new Set(symbols.map((item) => item.trim().toUpperCase()).filter(Boolean))];
+    for (const asset of this.requiredSymbols) if (!next.includes(asset)) next.unshift(asset);
+    if (next.length === 0 || next.length > 50) throw new Error('execution market symbols must contain 1 to 50 assets');
+    const removed = this.symbols.filter((asset) => !next.includes(asset));
+    const added = next.filter((asset) => !this.symbols.includes(asset));
+    if (removed.length === 0 && added.length === 0) return;
+    this.symbols.splice(0, this.symbols.length, ...next);
+    for (const base of added) {
+      for (const venue of EXECUTION_VENUES) this.books.set(this.key(venue, base), new OrderBookReplica(venue, base));
+    }
+    for (const base of removed) {
+      for (const venue of EXECUTION_VENUES) {
+        const key = this.key(venue, base);
+        const timer = this.bootstrapTimers.get(key);
+        if (timer) clearTimeout(timer);
+        this.bootstrapTimers.delete(key);
+        this.bootstrapAttempts.delete(key);
+        this.metadataUnavailable.delete(key);
+      }
+    }
+    // Gate/OKX 合约乘数会影响基础币数量，新增币必须先刷新整所元数据再启动盘口。
+    this.metadataLoadedVenues.clear();
+    const metadataResults = await Promise.allSettled([this.loadVenueMultipliers('GATE'), this.loadVenueMultipliers('OKX')]);
+    (['GATE', 'OKX'] as const).forEach((venue, index) => {
+      const result = metadataResults[index];
+      if (result?.status !== 'rejected') return;
+      for (const base of added) {
+        const key = this.key(venue, base);
+        this.metadataUnavailable.add(key);
+        const state = this.books.get(key)!.state;
+        state.lastError = result.reason instanceof Error ? result.reason.message : 'contract_metadata_failed';
+      }
+    });
+    if (!this.stopped) {
+      for (const venue of EXECUTION_VENUES) {
+        const socket = this.connections.get(venue)?.socket;
+        if (!socket || socket.readyState !== WebSocket.OPEN) continue;
+        this.unsubscribeSymbols(venue, socket, removed);
+        const activeAdded = added.filter((base) => !this.metadataUnavailable.has(this.key(venue, base)));
+        this.subscribeSymbols(venue, socket, activeAdded);
+        for (const base of activeAdded) {
+          const book = this.books.get(this.key(venue, base))!;
+          const generation = book.beginRebuild('hot_pool_added');
+          if (venue !== 'BYBIT') this.requestBootstrap(venue, base, book, generation);
+        }
+      }
+    }
+    for (const base of removed) {
+      for (const venue of EXECUTION_VENUES) this.books.delete(this.key(venue, base));
+    }
+  }
+
   health(now = Date.now()): ExecutionMarketHealth {
     const venues = EXECUTION_VENUES.map((venue) => {
       const connection = this.connections.get(venue)!;
@@ -624,7 +681,11 @@ export class ExecutionMarketHub {
   }
 
   private subscribe(venue: ExecutionVenue, socket: WebSocket): void {
-    const symbols = this.venueSymbols(venue);
+    this.subscribeSymbols(venue, socket, this.venueSymbols(venue));
+  }
+
+  private subscribeSymbols(venue: ExecutionVenue, socket: WebSocket, symbols: readonly string[]): void {
+    if (symbols.length === 0) return;
     if (venue === 'GATE') {
       for (const base of symbols) socket.send(JSON.stringify({
         time: Math.floor(Date.now() / 1_000), channel: 'futures.order_book_update', event: 'subscribe',
@@ -649,6 +710,34 @@ export class ExecutionMarketHub {
     } else {
       for (const base of symbols) socket.send(JSON.stringify({ jsonrpc: '2.0', id: `${Date.now()}-${base}`,
         method: 'public/subscribe', params: { channels: [`book.${nativeSymbol(venue, base)}.100ms`] } }));
+    }
+  }
+
+  private unsubscribeSymbols(venue: ExecutionVenue, socket: WebSocket, symbols: readonly string[]): void {
+    if (symbols.length === 0) return;
+    if (venue === 'GATE') {
+      for (const base of symbols) socket.send(JSON.stringify({
+        time: Math.floor(Date.now() / 1_000), channel: 'futures.order_book_update', event: 'unsubscribe',
+        payload: [nativeSymbol(venue, base), '100ms', '100'],
+      }));
+    } else if (venue === 'BINANCE') {
+      socket.send(JSON.stringify({ method: 'UNSUBSCRIBE',
+        params: symbols.map((base) => `${nativeSymbol(venue, base).toLowerCase()}@depth@100ms`), id: Date.now() }));
+    } else if (venue === 'OKX') {
+      socket.send(JSON.stringify({ op: 'unsubscribe',
+        args: symbols.map((base) => ({ channel: 'books', instId: nativeSymbol(venue, base) })) }));
+    } else if (venue === 'BYBIT') {
+      for (const base of symbols) socket.send(JSON.stringify({ req_id: `unbook:${base}`, op: 'unsubscribe',
+        args: [`orderbook.200.${nativeSymbol(venue, base)}`] }));
+    } else if (venue === 'KRAKEN') {
+      for (const base of symbols) socket.send(JSON.stringify({ event: 'unsubscribe', feed: 'book',
+        product_ids: [nativeSymbol(venue, base)] }));
+    } else if (venue === 'HYPERLIQUID') {
+      for (const base of symbols) socket.send(JSON.stringify({ method: 'unsubscribe',
+        subscription: { type: 'l2Book', coin: nativeSymbol(venue, base) } }));
+    } else {
+      for (const base of symbols) socket.send(JSON.stringify({ jsonrpc: '2.0', id: `${Date.now()}-un-${base}`,
+        method: 'public/unsubscribe', params: { channels: [`book.${nativeSymbol(venue, base)}.100ms`] } }));
     }
   }
 
@@ -850,7 +939,7 @@ export class ExecutionMarketHub {
 
   private requestBootstrap(venue: ExecutionVenue, base: string, book: OrderBookReplica, generation: number): void {
     const key = this.key(venue, base);
-    if (this.stopped || this.bootstrapTasks.has(key) || this.bootstrapTimers.has(key)) return;
+    if (this.stopped || !this.symbols.includes(base) || this.bootstrapTasks.has(key) || this.bootstrapTimers.has(key)) return;
     const venueCooldown = this.venueCooldownUntil.get(venue) ?? 0;
     if (venueCooldown > Date.now()) {
       const timer = setTimeout(() => {
@@ -884,7 +973,7 @@ export class ExecutionMarketHub {
       })
       .finally(() => {
         this.bootstrapTasks.delete(key);
-        if (!this.stopped && !book.state.synchronized && !this.bootstrapTimers.has(key)) {
+        if (!this.stopped && this.symbols.includes(base) && !book.state.synchronized && !this.bootstrapTimers.has(key)) {
           this.requestBootstrap(venue, base, book, book.state.generation);
         }
       });
@@ -1030,7 +1119,7 @@ export class ExecutionMarketHub {
     }
   }
 
-  /** 一次拉取整所合约元数据，避免 20～50 币启动时逐币打爆公开 REST 限频。 */
+  /** 一次拉取整所合约元数据，避免动态热池逐币请求打爆公开 REST 限频。 */
   private async loadVenueMultipliers(venue: 'GATE' | 'OKX'): Promise<void> {
     if (this.metadataLoadedVenues.has(venue)) return;
     const rows: unknown[] = [];

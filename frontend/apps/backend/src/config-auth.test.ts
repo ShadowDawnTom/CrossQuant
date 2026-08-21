@@ -46,34 +46,38 @@ describe('browser authentication config', () => {
     expect(loadConfig({ GCT_FUNDING_RETENTION_FACTOR: '0.5' }).fundingArbitrage.fundingRetentionFactor).toBe('0.5');
   });
 
-  it('探索模拟不能越过已启用的行情资产范围', () => {
-    expect(() => loadConfig({
+  it('探索发现池可以大于完整盘口池', () => {
+    const config = loadConfig({
       GCT_EXECUTION_MARKET_SYMBOLS: 'BTC,ETH',
       GCT_FUNDING_RESEARCH_ENABLED: '1',
       GCT_FUNDING_RESEARCH_ASSETS: 'BTC,DOGE',
-    })).toThrow('require execution books for: DOGE');
+    });
+    expect(config.executionMarket.symbols).toEqual(['BTC', 'ETH']);
+    expect(config.fundingResearch.assets).toEqual(['BTC', 'DOGE']);
   });
 
-  it('探索模拟硬限制每个实验组同时只能有一组持仓', () => {
-    expect(() => loadConfig({ GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS: '2' }))
-      .toThrow('must remain 1');
+  it('探索模拟每个实验组最多同时三组持仓', () => {
+    expect(() => loadConfig({ GCT_FUNDING_RESEARCH_MAX_OPEN_POSITIONS: '4' }))
+      .toThrow('between 1 and 3');
     expect(loadConfig({
       GCT_EXECUTION_MARKET_SYMBOLS: 'BTC,ETH,SOL,DOGE,TRUMP',
       GCT_FUNDING_RESEARCH_ENABLED: '1',
       GCT_FUNDING_RESEARCH_ASSETS: 'BTC,ETH,SOL,DOGE,TRUMP',
     }).fundingResearch).toMatchObject({
       enabled: true,
-      modelVersion: 'rolling_v3',
+      modelVersion: 'rolling_v4',
       assets: ['BTC', 'ETH', 'SOL', 'DOGE', 'TRUMP'],
       targetNotionalUsd: '5',
-      maxOpenPositions: 1,
+      maxActualNotionalUsd: '10',
+      maxOpenPositions: 3,
+      discoveryHotPoolSize: 10,
       rollingHoldExitConfirmations: 60,
       rollingReversalExitConfirmations: 30,
       reentryCooldownMs: 43_200_000,
       holdStressSlippageBps: '2',
       holdAdverseExitBasisBps: '3',
     });
-    expect(() => loadConfig({ GCT_FUNDING_RESEARCH_MODEL_VERSION: 'Rolling V3' }))
+    expect(() => loadConfig({ GCT_FUNDING_RESEARCH_MODEL_VERSION: 'Rolling V4' }))
       .toThrow('must use lowercase letters');
   });
 });

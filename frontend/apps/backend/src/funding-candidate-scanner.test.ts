@@ -96,6 +96,29 @@ describe('FundingCandidateScanner', () => {
     expect(Number((observations[0] as { tradingFees: string }).tradingFees)).toBeGreaterThan(0);
   });
 
+  it('规则取整后任一腿超过模拟金额上限时保留拆解但拒绝开仓', async () => {
+    const observations: FundingScanObservation[] = [];
+    const testGateway = gateway();
+    const originalRules = testGateway.querySymbols.bind(testGateway);
+    testGateway.querySymbols = async () => (await originalRules()).map((rule) => ({
+      ...rule, min_size: '1', lot_size: '1', min_notional: '5',
+    }));
+    const scanner = new FundingCandidateScanner(testGateway,
+      async () => ({ apiKey: 'key', apiSecret: 'secret' }), market(),
+      { observeAuthoritativeCandidate: vi.fn() } as unknown as FundingArbitrageEngine,
+      { assets: ['SOL'], strictAssets: [], researchAssets: ['SOL'], targetNotionalUsd: '5',
+        researchTargetNotionalUsd: '5', researchMaxActualNotionalUsd: '10', horizonHours: 24,
+        fundingRetentionFactor: '0.5', stressSlippageBps: '5', adverseExitBasisBps: '10',
+        researchMaxSlippageBps: '10', minLiquidityUsd: '900',
+        onFundingData: async (_funding, _fees, rows) => { observations.push(...rows); }, now: () => NOW },
+    );
+
+    expect(await scanner.scan()).toBe(0);
+    expect(observations[0]).toMatchObject({ researchEligible: false,
+      primaryReason: 'research_actual_notional_exceeded', quantity: '1' });
+    expect(Number(observations[0]?.entryLongNotional)).toBeGreaterThan(10);
+  });
+
   it('毛费率最优组合不可用时继续评估已同步的执行器组合', async () => {
     const symbols = {
       BINANCE: 'BINANCE_FUTURE_SOL_USDT', OKX: 'OKX_FUTURE_SOL_USDT',

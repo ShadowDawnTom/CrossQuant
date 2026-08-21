@@ -80,6 +80,7 @@ import { FundingCandidateScanner, fundingRule } from './funding-candidate-scanne
 import { FundingHoldingMonitor } from './funding-holding-monitor.js';
 import { FundingPaperEngine } from './funding-paper-engine.js';
 import { FundingResearchEngine } from './funding-research-engine.js';
+import { FundingDiscoveryService } from './funding-discovery-service.js';
 import { readFundingPersistence } from './funding-persistence.js';
 import { SpotMarketReader } from './spot-market-reader.js';
 import { readDatabaseStatus } from './database.js';
@@ -590,6 +591,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     }
     return derivedCatalog;
   };
+  const fundingOverviewService = new FundingOverviewService(publicMarketGateway, {
+    warn: (venue, reason) => app.log.warn({ venue, reason }, 'funding overview venue fetch failed'),
+  });
+  const fundingHistoryService = new FundingHistoryService(database, publicMarketGateway, {
+    warn: (symbol, reason) => app.log.warn({ symbol, reason }, 'funding history fetch failed'),
+  });
 
   /**
    * All venue legs to stream for the asset of `symbol`, from the cached catalog only — this runs
@@ -710,6 +717,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     enabled: config.fundingResearch.enabled,
     modelVersion: config.fundingResearch.modelVersion,
     targetNotionalUsd: config.fundingResearch.targetNotionalUsd,
+    maxActualNotionalUsd: config.fundingResearch.maxActualNotionalUsd,
     maxOpenPositions: config.fundingResearch.maxOpenPositions,
     minimumSettledEvents: config.fundingResearch.minimumSettledEvents,
     holdingEventsPerLeg: config.fundingArbitrage.holdingEventsPerLeg,
@@ -733,6 +741,25 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     ...config.fundingArbitrage.scanAssets,
     ...(config.fundingResearch.enabled ? config.fundingResearch.assets : []),
   ])];
+  const fundingDiscoveryService = new FundingDiscoveryService(database, {
+    assets: config.fundingResearch.assets,
+    initialHotAssets: config.executionMarket.symbols,
+    requiredAssets: config.fundingArbitrage.scanAssets,
+    hotPoolSize: config.fundingResearch.discoveryHotPoolSize,
+    minOpenInterestUsd: config.fundingResearch.discoveryMinOpenInterestUsd,
+    promotionConfirmations: config.fundingResearch.discoveryPromotionConfirmations,
+    minEdgeDurationMs: config.fundingResearch.discoveryMinEdgeDurationMs,
+    maxDirectionFlips24h: config.fundingResearch.discoveryMaxDirectionFlips24h,
+    snapshotIntervalMs: config.fundingResearch.discoverySnapshotIntervalMs,
+    minHotDwellMs: config.fundingResearch.discoveryMinHotDwellMs,
+    protectedAssets: () => fundingResearchEngine.list(100)
+      .filter((position) => position.state === 'OPEN').map((position) => position.asset),
+    onHotPoolChanged: async (assets) => {
+      await executionMarketHub.replaceSymbols?.(assets);
+      fundingHistoryService.trackSymbols(assets.flatMap((asset) =>
+        EXECUTION_VENUES.map((venue) => crossExFutureSymbol(venue, asset))));
+    },
+  });
   const fundingCandidateScanner = tradingGateway.queryFundingInfo && tradingGateway.queryFeeRates
     ? new FundingCandidateScanner(tradingGateway as TradingCrossExGateway,
       () => credentialVault.get(DEFAULT_CREDENTIAL_PROFILE), executionMarketHub, fundingArbitrageEngine, {
@@ -745,7 +772,26 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         adverseExitBasisBps: config.fundingArbitrage.adverseExitBasisBps,
         minNetAnnualized: config.fundingArbitrage.minNetAnnualized,
         researchAssets: config.fundingResearch.enabled ? config.fundingResearch.assets : [],
+        selectResearchAssets: async (funding, rules) => {
+          if (!config.fundingResearch.enabled) return [];
+          await fundingOverviewService.ensureFresh();
+          const cachedCatalog = derivedMarketCatalog();
+          const discoveryAssets = cachedCatalog?.assets ?? (() => {
+            const assets = new Map<string, Array<{ venue: string; symbol: string; quote: string }>>();
+            for (const rule of rules) {
+              const match = /^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT)_FUTURE_([A-Z0-9]+)_(USD|USDC|USDT)$/.exec(rule.symbol);
+              if (!match?.[1] || !match[2] || !match[3]) continue;
+              const rows = assets.get(match[2]) ?? [];
+              rows.push({ venue: match[1], symbol: rule.symbol, quote: match[3] });
+              assets.set(match[2], rows);
+            }
+            return assets;
+          })();
+          return fundingDiscoveryService.observe(funding, rules,
+            fundingOverviewService.buildResponse({ assets: discoveryAssets }));
+        },
         researchTargetNotionalUsd: config.fundingResearch.targetNotionalUsd,
+        researchMaxActualNotionalUsd: config.fundingResearch.maxActualNotionalUsd,
         researchMaxSlippageBps: config.fundingResearch.maxSlippageBps,
         minLiquidityUsd: config.fundingResearch.minLiquidityUsd,
         liquidityDepthBps: config.fundingResearch.liquidityDepthBps,
@@ -897,13 +943,6 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   const candleStore = new CandleStore(database, marketHub, publicMarketGateway, {
     warn: (details, message) => app.log.warn(details, message),
-  });
-
-  const fundingOverviewService = new FundingOverviewService(publicMarketGateway, {
-    warn: (venue, reason) => app.log.warn({ venue, reason }, 'funding overview venue fetch failed'),
-  });
-  const fundingHistoryService = new FundingHistoryService(database, publicMarketGateway, {
-    warn: (symbol, reason) => app.log.warn({ symbol, reason }, 'funding history fetch failed'),
   });
 
   let portfolioRefreshInFlight: Promise<LivePortfolioSnapshot> | null = null;
@@ -1059,7 +1098,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     executionMarketSampleTimer = setInterval(() => {
       try {
         saveExecutionMarketSamples(database, sampleExecutionPairs(
-          executionMarketHub, config.executionMarket.symbols,
+          executionMarketHub, executionMarketHub.health().symbols,
         ));
       } catch (error) {
         app.log.warn({ err: error }, 'failed to persist execution market sample');
@@ -1138,7 +1177,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     }, 10_000);
     serviceLoadMonitorTimer.unref?.();
     fundingHistoryService.startBackground();
-    fundingHistoryService.trackSymbols(fundingScannerAssets.flatMap((asset) => (
+    fundingHistoryService.trackSymbols(fundingDiscoveryService.activeAssets().flatMap((asset) => (
       EXECUTION_VENUES.map((venue) => crossExFutureSymbol(venue, asset))
     )));
     databaseMaintenanceTimer = setInterval(() => {
@@ -1407,6 +1446,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   });
 
   app.get('/api/funding-research', async () => fundingResearchEngine.summary());
+
+  app.get('/api/funding-discovery', async () => fundingDiscoveryService.summary());
 
   app.get('/api/funding-research/:id', async (request, reply) => {
     const parsed = z.object({ id: z.string().uuid() }).safeParse(request.params);

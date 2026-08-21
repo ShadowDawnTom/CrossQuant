@@ -28,6 +28,7 @@ const CURRENT_SCHEMA_TABLES = [
   'funding_research_settlements',
   'funding_research_variants',
   'funding_rate_history',
+  'funding_discovery_snapshots',
   'funding_scan_observations',
   'funding_scan_summaries',
   'hyperliquid_perp_metadata',
@@ -75,10 +76,11 @@ export function assertDatabaseIntegrity(database: Database.Database): void {
   if (result !== 'ok') throw new Error(`SQLite integrity check failed: ${String(result)}`);
 }
 
-function assertCurrentSchema(database: Database.Database, includeScanSummaries: boolean): void {
-  const requiredTables = includeScanSummaries
-    ? CURRENT_SCHEMA_TABLES
-    : CURRENT_SCHEMA_TABLES.filter((table) => table !== 'funding_scan_summaries');
+function assertCurrentSchema(database: Database.Database, includeScanSummaries: boolean,
+  includeFundingDiscovery: boolean): void {
+  const requiredTables = CURRENT_SCHEMA_TABLES.filter((table) =>
+    (includeScanSummaries || table !== 'funding_scan_summaries')
+    && (includeFundingDiscovery || table !== 'funding_discovery_snapshots'));
   const rows = database.prepare(`
     SELECT name FROM sqlite_master
     WHERE type = 'table' AND name IN (${requiredTables.map(() => '?').join(', ')})
@@ -152,7 +154,8 @@ export function openDatabase(databasePath: string, migrationsDir: string,
     // 全库完整性检查改到停机维护窗口；小库、内存库和测试库继续在启动时检查。
     if (!onDisk || statSync(databasePath).size <= startupIntegrityMaxBytes) assertDatabaseIntegrity(database);
     if (migrationFiles.includes('0014_database_maintenance.sql')) {
-      assertCurrentSchema(database, migrationFiles.includes('0026_funding_scan_summaries.sql'));
+      assertCurrentSchema(database, migrationFiles.includes('0026_funding_scan_summaries.sql'),
+        migrationFiles.includes('0027_funding_discovery_hot_pool.sql'));
     }
     database.pragma('optimize');
     return database;
