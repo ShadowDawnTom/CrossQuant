@@ -12,6 +12,7 @@ const LIVE_ORDER_VENUES = new Set<string>(LIVE_EXECUTION_VENUES);
 
 export interface FundingDiscoveryAsset {
   asset: string;
+  pool: 'CORE' | 'SATELLITE';
   observedAt: string;
   bestLongVenue: ExecutionVenue | null;
   bestShortVenue: ExecutionVenue | null;
@@ -38,11 +39,14 @@ export interface FundingDiscoverySummary {
   hotPoolLimit: number;
   hotAssets: string[];
   eligibleCount: number;
+  coreCount: number;
+  satelliteCount: number;
   assets: FundingDiscoveryAsset[];
 }
 
 export interface FundingDiscoveryOptions {
   assets: string[];
+  coreAssets?: string[];
   initialHotAssets: string[];
   requiredAssets: string[];
   hotPoolSize: number;
@@ -98,6 +102,7 @@ export class FundingDiscoveryService {
   private readonly now: () => number;
   private readonly universe: string[];
   private readonly required: Set<string>;
+  private readonly core: Set<string>;
   private readonly initialHot: string[];
   private readonly states = new Map<string, AssetState>();
   private readonly hotSince = new Map<string, number>();
@@ -110,6 +115,7 @@ export class FundingDiscoveryService {
     this.now = options.now ?? Date.now;
     this.universe = [...new Set(options.assets.map((item) => item.toUpperCase()))];
     this.required = new Set(options.requiredAssets.map((item) => item.toUpperCase()));
+    this.core = new Set((options.coreAssets ?? []).map((item) => item.toUpperCase()).filter((item) => this.universe.includes(item)));
     this.initialHot = [...new Set([...this.required, ...options.initialHotAssets.map((item) => item.toUpperCase())])]
       .filter((item) => this.universe.includes(item)).slice(0, options.hotPoolSize);
     this.hotAssets = [...this.initialHot];
@@ -128,6 +134,8 @@ export class FundingDiscoveryService {
       hotPoolLimit: this.options.hotPoolSize,
       hotAssets: [...this.hotAssets],
       eligibleCount: this.latest.filter((item) => item.eligibleForHotPool).length,
+      coreCount: this.core.size,
+      satelliteCount: this.universe.length - this.core.size,
       assets: this.latest.slice(0, 100),
     };
   }
@@ -150,7 +158,7 @@ export class FundingDiscoveryService {
     }
     const next = this.universe.map((asset) => this.evaluateAsset(
       asset, rowsByAsset.get(asset) ?? [], ruleMap, overviewMap.get(asset) ?? null, now, observedAt,
-    )).sort((left, right) => right.score - left.score || left.asset.localeCompare(right.asset));
+    )).sort((left, right) => right.score - left.score);
     await this.updateHotPool(next, now);
     const hot = new Set(this.hotAssets);
     this.latest = next.map((item) => ({ ...item, inHotPool: hot.has(item.asset) }));
@@ -244,7 +252,8 @@ export class FundingDiscoveryService {
     const oiScore = openInterest?.gt(0) ? Math.min(20, Math.log10(openInterest.toNumber()) * 2) : 0;
     const score = best ? best.spread.mul(10_000).toNumber() + Math.min(20, state.confirmations) + oiScore : -1;
     return {
-      asset, observedAt, bestLongVenue: best?.longVenue ?? null, bestShortVenue: best?.shortVenue ?? null,
+      asset, pool: this.core.has(asset) ? 'CORE' : 'SATELLITE', observedAt,
+      bestLongVenue: best?.longVenue ?? null, bestShortVenue: best?.shortVenue ?? null,
       bestLongRate: best?.longRate.toString() ?? null, bestShortRate: best?.shortRate.toString() ?? null,
       spread8h: best?.spread.toString() ?? null, openInterestUsd: openInterest?.toString() ?? null,
       lastPrice: longTicker?.lastPrice ?? shortTicker?.lastPrice ?? null,
@@ -302,15 +311,15 @@ export class FundingDiscoveryService {
     const statement = this.database.prepare(`INSERT INTO funding_discovery_snapshots
       (id, sweep_id, observed_at, asset, best_long_venue, best_short_venue, best_long_rate, best_short_rate,
        spread_8h, open_interest_usd, last_price, change_24h, edge_started_at, direction_flips_24h,
-       consecutive_confirmations, eligible_for_hot_pool, in_hot_pool, primary_reason, details_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+       consecutive_confirmations, eligible_for_hot_pool, in_hot_pool, primary_reason, details_json, pool)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     this.database.transaction(() => {
       for (const row of rows) statement.run(randomUUID(), sweepId, observedAt, row.asset, row.bestLongVenue,
         row.bestShortVenue, row.bestLongRate, row.bestShortRate, row.spread8h, row.openInterestUsd,
         row.lastPrice, row.change24h,
         row.consecutiveConfirmations > 0 ? new Date(Date.parse(observedAt) - row.edgeDurationMinutes * 60_000).toISOString() : null,
         row.directionFlips24h, row.consecutiveConfirmations, row.eligibleForHotPool ? 1 : 0,
-        row.inHotPool ? 1 : 0, row.primaryReason, JSON.stringify(row.details));
+        row.inHotPool ? 1 : 0, row.primaryReason, JSON.stringify(row.details), row.pool);
     })();
   }
 

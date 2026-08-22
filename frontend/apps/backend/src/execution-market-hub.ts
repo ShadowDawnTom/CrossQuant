@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 import { Decimal } from 'decimal.js';
-import { nativeMarketAsset } from './market-asset-aliases.js';
+import { canonicalMarketAsset, nativeMarketAsset } from './market-asset-aliases.js';
 import { StablecoinFxOracle, type ExecutionQuote, type QuoteFxReader } from './quote-fx-oracle.js';
 
 export const EXECUTION_VENUES = [
@@ -119,6 +119,9 @@ export interface ExecutionMarketHubOptions {
   reconnectBaseMs?: number;
   bootstrapBaseMs?: number;
   rateLimitCooldownMs?: number;
+  /** 新热池至少达到逐币多所实时盘口后才替换旧池，避免切换本身制造全局行情空窗。 */
+  symbolStageTimeoutMs?: number;
+  symbolStageMinimumLiveVenues?: number;
   endpoints?: Partial<Record<ExecutionVenue, { rest: string; websocket: string }>>;
   quoteFx?: QuoteFxReader;
 }
@@ -379,6 +382,7 @@ export class OrderBookReplica {
  */
 export class ExecutionMarketHub {
   private readonly symbols: string[];
+  private activeSymbols: string[];
   private readonly requiredSymbols: Set<string>;
   private readonly books = new Map<string, OrderBookReplica>();
   private readonly connections = new Map<ExecutionVenue, VenueConnection>();
@@ -386,6 +390,7 @@ export class ExecutionMarketHub {
   private readonly metadataUnavailable = new Set<string>();
   private venueAvailability: Map<ExecutionVenue, Set<string>> | null = null;
   private readonly metadataLoadedVenues = new Set<'GATE' | 'OKX'>();
+  private readonly hyperliquidSymbols = new Map<string, string>();
   private readonly bootstrapTasks = new Map<string, Promise<void>>();
   private readonly bootstrapAttempts = new Map<string, number>();
   private readonly bootstrapTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -397,7 +402,10 @@ export class ExecutionMarketHub {
   private readonly reconnectBaseMs: number;
   private readonly bootstrapBaseMs: number;
   private readonly rateLimitCooldownMs: number;
+  private readonly symbolStageTimeoutMs: number;
+  private readonly symbolStageMinimumLiveVenues: number;
   private readonly quoteFx: QuoteFxReader;
+  private replacementTask: Promise<void> = Promise.resolve();
   private stopped = true;
 
   constructor(
@@ -409,12 +417,15 @@ export class ExecutionMarketHub {
     this.requiredSymbols = new Set((options.requiredSymbols ?? this.symbols)
       .map((item) => item.trim().toUpperCase()).filter((item) => this.symbols.includes(item)));
     if (this.requiredSymbols.size === 0) throw new Error('execution market required symbols must be configured');
+    this.activeSymbols = [...this.symbols];
     this.maxBookAgeMs = options.maxBookAgeMs ?? 1_500;
     this.maxExchangeSkewMs = options.maxExchangeSkewMs ?? 750;
     this.maxReceiveSkewMs = options.maxReceiveSkewMs ?? 750;
     this.reconnectBaseMs = options.reconnectBaseMs ?? 500;
     this.bootstrapBaseMs = options.bootstrapBaseMs ?? 1_000;
     this.rateLimitCooldownMs = options.rateLimitCooldownMs ?? 15 * 60_000;
+    this.symbolStageTimeoutMs = options.symbolStageTimeoutMs ?? 10_000;
+    this.symbolStageMinimumLiveVenues = options.symbolStageMinimumLiveVenues ?? 2;
     this.quoteFx = options.quoteFx ?? new StablecoinFxOracle(fetchImpl);
     this.endpoints = { ...DEFAULT_ENDPOINTS };
     for (const venue of EXECUTION_VENUES) {
@@ -459,31 +470,35 @@ export class ExecutionMarketHub {
    * 运行中只替换研究盘口热池。严格实盘资产始终保留；增删主题不重连整所，避免动态筛选制造行情空窗。
    */
   async replaceSymbols(symbols: readonly string[], availability?: ExecutionVenueAvailability): Promise<void> {
+    const task = this.replacementTask.then(() => this.performSymbolReplacement(symbols, availability));
+    // 动态发现可能在上一轮切换尚未完成时再次触发；串行化后不会让两轮订阅互相覆盖。
+    this.replacementTask = task.catch(() => undefined);
+    return task;
+  }
+
+  private async performSymbolReplacement(symbols: readonly string[], availability?: ExecutionVenueAvailability): Promise<void> {
     const next = [...new Set(symbols.map((item) => item.trim().toUpperCase()).filter(Boolean))];
     for (const asset of this.requiredSymbols) if (!next.includes(asset)) next.unshift(asset);
     if (next.length === 0 || next.length > 50) throw new Error('execution market symbols must contain 1 to 50 assets');
-    const previousVenueSymbols = new Map(EXECUTION_VENUES.map((venue) => [venue, this.venueSymbols(venue)]));
+    const previousSymbols = [...this.activeSymbols];
+    const previousAvailability = this.venueAvailability === null ? null
+      : new Map([...this.venueAvailability].map(([venue, assets]) => [venue, new Set(assets)]));
+    const previousVenueSymbols = new Map(EXECUTION_VENUES.map((venue) => [venue, this.activeVenueSymbols(venue)]));
     const availabilityChanged = this.replaceAvailability(availability);
-    const removed = this.symbols.filter((asset) => !next.includes(asset));
-    const added = next.filter((asset) => !this.symbols.includes(asset));
+    const removed = previousSymbols.filter((asset) => !next.includes(asset));
+    const added = next.filter((asset) => !previousSymbols.includes(asset));
     if (removed.length === 0 && added.length === 0 && !availabilityChanged) return;
-    this.symbols.splice(0, this.symbols.length, ...next);
+    // 先保留旧池并加入新币；只有新币通过实时认证后才撤掉旧订阅。
+    const staged = [...new Set([...previousSymbols, ...next])];
+    this.symbols.splice(0, this.symbols.length, ...staged);
     for (const base of added) {
       for (const venue of EXECUTION_VENUES) this.books.set(this.key(venue, base), new OrderBookReplica(venue, base));
     }
-    for (const base of removed) {
-      for (const venue of EXECUTION_VENUES) {
-        const key = this.key(venue, base);
-        const timer = this.bootstrapTimers.get(key);
-        if (timer) clearTimeout(timer);
-        this.bootstrapTimers.delete(key);
-        this.bootstrapAttempts.delete(key);
-        this.metadataUnavailable.delete(key);
-      }
-    }
     // Gate/OKX 合约乘数会影响基础币数量，新增币必须先刷新整所元数据再启动盘口。
     this.metadataLoadedVenues.clear();
-    const metadataResults = await Promise.allSettled([this.loadVenueMultipliers('GATE'), this.loadVenueMultipliers('OKX')]);
+    const metadataResults = await Promise.allSettled([
+      this.loadVenueMultipliers('GATE'), this.loadVenueMultipliers('OKX'), this.loadHyperliquidSymbols(),
+    ]);
     (['GATE', 'OKX'] as const).forEach((venue, index) => {
       const result = metadataResults[index];
       if (result?.status !== 'rejected') return;
@@ -507,19 +522,59 @@ export class ExecutionMarketHub {
         for (const base of activeAdded) {
           const book = this.books.get(this.key(venue, base))!;
           const generation = book.beginRebuild('hot_pool_added');
-          if (venue !== 'BYBIT') this.requestBootstrap(venue, base, book, generation);
+          if (venue !== 'BYBIT' && venue !== 'HYPERLIQUID') this.requestBootstrap(venue, base, book, generation);
         }
       }
     }
+    const stagedReady = this.stopped || this.symbolStageTimeoutMs <= 0 || this.symbolStageMinimumLiveVenues <= 0
+      || await this.waitForStagedSymbols(added);
+    if (!stagedReady) {
+      // 新池认证失败时恢复旧池和旧白名单，不能把正常运行的盘口一起清空。
+      for (const venue of EXECUTION_VENUES) {
+        const socket = this.connections.get(venue)?.socket;
+        if (socket?.readyState === WebSocket.OPEN) {
+          const stagedAdded = this.venueSymbols(venue).filter((base) => !previousVenueSymbols.get(venue)?.includes(base));
+          this.unsubscribeSymbols(venue, socket, stagedAdded);
+        }
+      }
+      this.venueAvailability = previousAvailability;
+      this.symbols.splice(0, this.symbols.length, ...previousSymbols);
+      for (const base of added) for (const venue of EXECUTION_VENUES) {
+        const key = this.key(venue, base);
+        const timer = this.bootstrapTimers.get(key);
+        if (timer) clearTimeout(timer);
+        this.bootstrapTimers.delete(key);
+        this.bootstrapAttempts.delete(key);
+        this.metadataUnavailable.delete(key);
+        this.books.delete(key);
+      }
+      return;
+    }
+    this.activeSymbols = [...next];
+    for (const venue of EXECUTION_VENUES) {
+      const socket = this.connections.get(venue)?.socket;
+      if (!socket || socket.readyState !== WebSocket.OPEN) continue;
+      const activeRemoved = previousVenueSymbols.get(venue)?.filter((base) => !this.activeVenueSymbols(venue).includes(base)) ?? [];
+      this.unsubscribeSymbols(venue, socket, activeRemoved);
+    }
+    this.symbols.splice(0, this.symbols.length, ...next);
     for (const base of removed) {
-      for (const venue of EXECUTION_VENUES) this.books.delete(this.key(venue, base));
+      for (const venue of EXECUTION_VENUES) {
+        const key = this.key(venue, base);
+        const timer = this.bootstrapTimers.get(key);
+        if (timer) clearTimeout(timer);
+        this.bootstrapTimers.delete(key);
+        this.bootstrapAttempts.delete(key);
+        this.metadataUnavailable.delete(key);
+        this.books.delete(key);
+      }
     }
   }
 
   health(now = Date.now()): ExecutionMarketHealth {
     const venues = EXECUTION_VENUES.map((venue) => {
       const connection = this.connections.get(venue)!;
-      const replicas = this.venueSymbols(venue).map((base) => this.books.get(this.key(venue, base))!);
+      const replicas = this.activeVenueSymbols(venue).map((base) => this.books.get(this.key(venue, base))!);
       return {
         venue, connectionState: connection.state,
         readyBooks: replicas.filter((book) => this.isLive(book, connection, now)).length,
@@ -533,7 +588,7 @@ export class ExecutionMarketHub {
     const total = requiredBooks.length;
     return {
       state: this.stopped ? 'stopped' : ready === total ? 'healthy' : ready === 0 ? 'starting' : 'degraded',
-      updatedAt: new Date(now).toISOString(), symbols: [...this.symbols], venues,
+      updatedAt: new Date(now).toISOString(), symbols: [...this.activeSymbols], venues,
     };
   }
 
@@ -546,7 +601,7 @@ export class ExecutionMarketHub {
     const quote = executionQuote(venue);
     const quoteRate = this.quoteFx.rate(quote, now);
     return {
-      venue, symbol: nativeSymbol(venue, normalized), base: normalized, quote,
+      venue, symbol: this.marketSymbol(venue, normalized), base: normalized, quote,
       quoteToUsd: quoteRate.usdRate, quoteRateAgeMs: quoteRate.ageMs, quoteRateState: quoteRate.state,
       bids: sortedLevels(state.bids, true), asks: sortedLevels(state.asks, false), sequence: state.sequence,
       exchangeTimestamp: iso(state.exchangeTimestamp), receivedAt: iso(state.receivedAt),
@@ -597,6 +652,7 @@ export class ExecutionMarketHub {
       if (venue === 'GATE' || venue === 'OKX') {
         await this.loadVenueMultipliers(venue);
       }
+      if (venue === 'HYPERLIQUID') await this.loadHyperliquidSymbols();
       this.connect(venue);
     } catch (error) {
       for (const base of this.venueSymbols(venue)) {
@@ -635,7 +691,7 @@ export class ExecutionMarketHub {
         const book = this.books.get(this.key(venue, base))!;
         const generation = book.beginRebuild('connection_opened');
         // Bybit 的 orderbook 主题首包本身就是完整快照。避免 30 个 REST 初始化请求触发 IP 级封禁。
-        if (venue !== 'BYBIT') this.requestBootstrap(venue, base, book, generation);
+        if (venue !== 'BYBIT' && venue !== 'HYPERLIQUID') this.requestBootstrap(venue, base, book, generation);
       }
       connection.heartbeatTimer = setInterval(() => {
         if (socket.readyState !== WebSocket.OPEN) return;
@@ -702,26 +758,26 @@ export class ExecutionMarketHub {
       for (const base of symbols) socket.send(JSON.stringify({
         time: Math.floor(Date.now() / 1_000), channel: 'futures.order_book_update', event: 'subscribe',
         // REST 初始化固定取 100 档，因此 WS 也必须订阅 100 档，否则本地深度会逐步错位。
-        payload: [nativeSymbol(venue, base), '100ms', '100'],
+        payload: [this.marketSymbol(venue, base), '100ms', '100'],
       }));
     } else if (venue === 'BINANCE') {
-      socket.send(JSON.stringify({ method: 'SUBSCRIBE', params: symbols.map((base) => `${nativeSymbol(venue, base).toLowerCase()}@depth@100ms`), id: Date.now() }));
+      socket.send(JSON.stringify({ method: 'SUBSCRIBE', params: symbols.map((base) => `${this.marketSymbol(venue, base).toLowerCase()}@depth@100ms`), id: Date.now() }));
     } else if (venue === 'OKX') {
-      socket.send(JSON.stringify({ op: 'subscribe', args: symbols.map((base) => ({ channel: 'books', instId: nativeSymbol(venue, base) })) }));
+      socket.send(JSON.stringify({ op: 'subscribe', args: symbols.map((base) => ({ channel: 'books', instId: this.marketSymbol(venue, base) })) }));
     } else if (venue === 'BYBIT') {
       // 单个无效合约不能污染整所订阅；req_id 也让失败 ACK 能准确落到对应盘口。
       for (const base of symbols) socket.send(JSON.stringify({ req_id: `book:${base}`, op: 'subscribe',
-        args: [`orderbook.200.${nativeSymbol(venue, base)}`] }));
+        args: [`orderbook.200.${this.marketSymbol(venue, base)}`] }));
     } else if (venue === 'KRAKEN') {
       for (const base of symbols) socket.send(JSON.stringify({ event: 'subscribe', feed: 'book',
-        product_ids: [nativeSymbol(venue, base)] }));
+        product_ids: [this.marketSymbol(venue, base)] }));
     } else if (venue === 'HYPERLIQUID') {
       for (const base of symbols) socket.send(JSON.stringify({
-        method: 'subscribe', subscription: { type: 'l2Book', coin: nativeSymbol(venue, base) },
+        method: 'subscribe', subscription: { type: 'l2Book', coin: this.marketSymbol(venue, base) },
       }));
     } else {
       for (const base of symbols) socket.send(JSON.stringify({ jsonrpc: '2.0', id: `${Date.now()}-${base}`,
-        method: 'public/subscribe', params: { channels: [`book.${nativeSymbol(venue, base)}.100ms`] } }));
+        method: 'public/subscribe', params: { channels: [`book.${this.marketSymbol(venue, base)}.100ms`] } }));
     }
   }
 
@@ -730,26 +786,26 @@ export class ExecutionMarketHub {
     if (venue === 'GATE') {
       for (const base of symbols) socket.send(JSON.stringify({
         time: Math.floor(Date.now() / 1_000), channel: 'futures.order_book_update', event: 'unsubscribe',
-        payload: [nativeSymbol(venue, base), '100ms', '100'],
+        payload: [this.marketSymbol(venue, base), '100ms', '100'],
       }));
     } else if (venue === 'BINANCE') {
       socket.send(JSON.stringify({ method: 'UNSUBSCRIBE',
-        params: symbols.map((base) => `${nativeSymbol(venue, base).toLowerCase()}@depth@100ms`), id: Date.now() }));
+        params: symbols.map((base) => `${this.marketSymbol(venue, base).toLowerCase()}@depth@100ms`), id: Date.now() }));
     } else if (venue === 'OKX') {
       socket.send(JSON.stringify({ op: 'unsubscribe',
-        args: symbols.map((base) => ({ channel: 'books', instId: nativeSymbol(venue, base) })) }));
+        args: symbols.map((base) => ({ channel: 'books', instId: this.marketSymbol(venue, base) })) }));
     } else if (venue === 'BYBIT') {
       for (const base of symbols) socket.send(JSON.stringify({ req_id: `unbook:${base}`, op: 'unsubscribe',
-        args: [`orderbook.200.${nativeSymbol(venue, base)}`] }));
+        args: [`orderbook.200.${this.marketSymbol(venue, base)}`] }));
     } else if (venue === 'KRAKEN') {
       for (const base of symbols) socket.send(JSON.stringify({ event: 'unsubscribe', feed: 'book',
-        product_ids: [nativeSymbol(venue, base)] }));
+        product_ids: [this.marketSymbol(venue, base)] }));
     } else if (venue === 'HYPERLIQUID') {
       for (const base of symbols) socket.send(JSON.stringify({ method: 'unsubscribe',
-        subscription: { type: 'l2Book', coin: nativeSymbol(venue, base) } }));
+        subscription: { type: 'l2Book', coin: this.marketSymbol(venue, base) } }));
     } else {
       for (const base of symbols) socket.send(JSON.stringify({ jsonrpc: '2.0', id: `${Date.now()}-un-${base}`,
-        method: 'public/unsubscribe', params: { channels: [`book.${nativeSymbol(venue, base)}.100ms`] } }));
+        method: 'public/unsubscribe', params: { channels: [`book.${this.marketSymbol(venue, base)}.100ms`] } }));
     }
   }
 
@@ -884,7 +940,7 @@ export class ExecutionMarketHub {
     if (message.channel !== 'l2Book') return;
     const data = object(message.data);
     if (!data || typeof data.coin !== 'string' || !Array.isArray(data.levels)) return;
-    const base = this.symbols.find((item) => nativeSymbol('HYPERLIQUID', item) === data.coin);
+    const base = this.symbols.find((item) => this.marketSymbol('HYPERLIQUID', item) === data.coin);
     const bids = keyedLevels(data.levels[0], 'px', 'sz');
     const asks = keyedLevels(data.levels[1], 'px', 'sz');
     const timestamp = finiteInteger(data.time);
@@ -950,6 +1006,33 @@ export class ExecutionMarketHub {
       && !this.metadataUnavailable.has(this.key(venue, base)));
   }
 
+  private activeVenueSymbols(venue: ExecutionVenue): string[] {
+    return this.activeSymbols.filter((base) => this.venueSupports(venue, base)
+      && !this.metadataUnavailable.has(this.key(venue, base)));
+  }
+
+  private marketSymbol(venue: ExecutionVenue, base: string): string {
+    if (venue === 'HYPERLIQUID') return this.hyperliquidSymbols.get(base.toUpperCase()) ?? nativeSymbol(venue, base);
+    return nativeSymbol(venue, base);
+  }
+
+  /** 新币至少在两所拿到新鲜双边盘口后才发布；超时由调用方保留旧热池。 */
+  private async waitForStagedSymbols(assets: readonly string[]): Promise<boolean> {
+    if (assets.length === 0) return true;
+    const deadline = Date.now() + this.symbolStageTimeoutMs;
+    while (!this.stopped && Date.now() < deadline) {
+      const now = Date.now();
+      const ready = assets.every((asset) => EXECUTION_VENUES.filter((venue) => this.venueSupports(venue, asset))
+        .filter((venue) => {
+          const book = this.books.get(this.key(venue, asset));
+          return Boolean(book && this.isLive(book, this.connections.get(venue)!, now));
+        }).length >= this.symbolStageMinimumLiveVenues);
+      if (ready) return true;
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+    return false;
+  }
+
   /**
    * 用交易规则刷新逐所可订阅标的。
    * 只要调用方提供了某个交易所，该交易所未列出的币就必须 fail-closed，避免无效主题拖垮整条连接。
@@ -974,7 +1057,9 @@ export class ExecutionMarketHub {
 
   private venueSupports(venue: ExecutionVenue, base: string): boolean {
     const available = this.venueAvailability?.get(venue);
-    return !available || available.has(base.toUpperCase());
+    const normalized = base.toUpperCase();
+    if (venue === 'HYPERLIQUID' && this.hyperliquidSymbols.size > 0 && !this.hyperliquidSymbols.has(normalized)) return false;
+    return !available || available.has(normalized);
   }
 
   private requestBootstrap(venue: ExecutionVenue, base: string, book: OrderBookReplica, generation: number): void {
@@ -1083,7 +1168,7 @@ export class ExecutionMarketHub {
   }
 
   private async fetchSnapshot(venue: ExecutionVenue, base: string): Promise<{ bids: Level[]; asks: Level[]; sequence: number; exchangeTimestamp: number }> {
-    const symbol = nativeSymbol(venue, base);
+    const symbol = this.marketSymbol(venue, base);
     let url: string;
     let init: RequestInit = { signal: AbortSignal.timeout(8_000) };
     if (venue === 'GATE') url = `${this.endpoints.GATE.rest}/futures/usdt/order_book?contract=${symbol}&limit=100&with_id=true`;
@@ -1205,6 +1290,52 @@ export class ExecutionMarketHub {
       }
     }
     this.metadataLoadedVenues.add(venue);
+  }
+
+  /**
+   * 从 Hyperliquid 元数据构建原生路由。HIP-3 合约必须带 DEX 前缀；默认市场名称优先，
+   * 同一资产存在多个部署者时优先使用已验证的 xyz 市场，避免裸名称令整条 WS 连接被关闭。
+   */
+  private async loadHyperliquidSymbols(): Promise<void> {
+    const endpoint = `${this.endpoints.HYPERLIQUID.rest}/info`;
+    const post = async (body: Record<string, unknown>): Promise<unknown> => {
+      const response = await this.fetchImpl(endpoint, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(8_000) });
+      if (!response.ok) throw new Error(`hyperliquid_metadata_http_${response.status}`);
+      return response.json();
+    };
+    const dexPayload = await post({ type: 'perpDexs' });
+    const dexNames = Array.isArray(dexPayload) ? dexPayload.flatMap((value) => {
+      const row = object(value);
+      return typeof row?.name === 'string' && row.name ? [row.name] : [];
+    }) : [];
+    const markets: Array<{ dex: string | null; payload: unknown }> = [
+      { dex: null, payload: await post({ type: 'meta' }) },
+    ];
+    const dexMetadata = await Promise.allSettled([...new Set(dexNames)]
+      .map(async (dex) => ({ dex, payload: await post({ type: 'meta', dex }) })));
+    for (const result of dexMetadata) {
+      // 单个 HIP-3 DEX 故障不能拖垮主市场，其他部署者仍可继续提供可用路由。
+      if (result.status === 'fulfilled') markets.push(result.value);
+    }
+    const routes = new Map<string, { symbol: string; priority: number }>();
+    for (const market of markets) {
+      const metadata = object(market.payload);
+      if (!Array.isArray(metadata?.universe)) continue;
+      for (const value of metadata.universe) {
+        const row = object(value);
+        if (typeof row?.name !== 'string' || !row.name) continue;
+        const symbol = market.dex && !row.name.includes(':') ? `${market.dex}:${row.name}` : row.name;
+        const nativeBase = symbol.includes(':') ? symbol.slice(symbol.indexOf(':') + 1) : symbol;
+        const canonical = canonicalMarketAsset('HYPERLIQUID', 'FUTURE', nativeBase).toUpperCase();
+        const priority = market.dex === null ? 0 : market.dex === 'xyz' ? 1 : 2;
+        const previous = routes.get(canonical);
+        if (!previous || priority < previous.priority) routes.set(canonical, { symbol, priority });
+      }
+    }
+    if (routes.size === 0) throw new Error('hyperliquid_metadata_schema_invalid');
+    this.hyperliquidSymbols.clear();
+    for (const [asset, route] of routes) this.hyperliquidSymbols.set(asset, route.symbol);
   }
 }
 

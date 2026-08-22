@@ -53,7 +53,8 @@ describe('FundingCandidateScanner', () => {
     expect(onFundingData).toHaveBeenCalledOnce();
     expect(candidates[0]).toMatchObject({ quantity: '0.05' });
     // 当前盘口立即往返亏 0.1 USDT；资金费只保留 50%，再扣 15bp 压力缓冲和四笔手续费。
-    expect(Number(candidates[0]?.netAnnualized)).toBeCloseTo(45.7512, 3);
+    // 严格入口改用 24h/72h/7d 中生存概率加权后净值最高的周期，本例选择 7 天。
+    expect(Number(candidates[0]?.netAnnualized)).toBeCloseTo(53.6979, 3);
   });
 
   it('目标数量的任一进出场盘口深度不足时不生成候选', async () => {

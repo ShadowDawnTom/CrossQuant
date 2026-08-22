@@ -86,6 +86,8 @@ export interface BackendConfig {
     enabled: boolean;
     modelVersion: string;
     assets: string[];
+    coreAssets: string[];
+    satelliteAssets: string[];
     targetNotionalUsd: string;
     maxActualNotionalUsd: string;
     maxOpenPositions: number;
@@ -162,11 +164,20 @@ function parseAssetList(value: string, name: string): string[] {
   return assets;
 }
 
-const DEFAULT_RESEARCH_ASSETS = [
+const DEFAULT_RESEARCH_CORE_ASSETS = [
   'BTC', 'ETH', 'SOL', 'XRP', 'ZEC', 'BNB', 'SNDK', 'UNITREE', 'PUMP', 'SUI',
   'ONDO', 'MSTRX', 'APT', 'TAO', 'LIT', 'LINK', 'AAVE', 'LDO', 'PYTH', 'HYPE',
   'ARB', 'COINX', 'CRV', 'NVDAX', 'GOOGLX', 'MSFT', 'WLFI', 'IO', 'AI', 'AERO',
   'ASTER', 'UNI', 'AKT', 'SKY', 'ZK', 'MORPHO', 'BREV', 'SKHYNIX',
+].join(',');
+
+const DEFAULT_RESEARCH_SATELLITE_ASSETS = [
+  'DOGE', 'ADA', 'AVAX', 'LTC', 'BCH', 'DOT', 'NEAR', 'OP', 'INJ', 'ATOM',
+  'FIL', 'ETC', 'XLM', 'HBAR', 'TRX', 'SEI', 'JUP', 'WIF', 'PEPE', 'TON',
+  'SHIB', 'POL', 'EOS', 'GALA', 'SAND', 'MANA', 'RUNE', 'IMX', 'STX', 'TIA',
+  'ENA', 'WLD', 'ORDI', 'NOT', 'FET', 'ICP', 'DYDX', 'GMX', 'KAS', 'ALGO',
+  'VET', 'FLOW', 'THETA', 'MKR', 'COMP', 'SNX', 'BONK', 'FLOKI', 'POPCAT', 'PENGU',
+  'TRUMP', 'KAITO', 'PENDLE', 'JTO', 'STRK',
 ].join(',');
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): BackendConfig {
@@ -223,9 +234,20 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
   }
   const executionMarketSymbols = parseAssetList(environment.GCT_EXECUTION_MARKET_SYMBOLS ?? 'BTC,ETH', 'GCT_EXECUTION_MARKET_SYMBOLS');
   const fundingScanAssets = parseAssetList(environment.GCT_FUNDING_SCAN_ASSETS ?? executionMarketSymbols.join(','), 'GCT_FUNDING_SCAN_ASSETS');
-  const fundingResearchAssets = parseAssetList(environment.GCT_FUNDING_RESEARCH_ASSETS ?? DEFAULT_RESEARCH_ASSETS, 'GCT_FUNDING_RESEARCH_ASSETS');
+  const fundingResearchCoreAssets = parseAssetList(
+    environment.GCT_FUNDING_RESEARCH_CORE_ASSETS ?? DEFAULT_RESEARCH_CORE_ASSETS,
+    'GCT_FUNDING_RESEARCH_CORE_ASSETS',
+  );
+  const fundingResearchSatelliteAssets = parseAssetList(
+    environment.GCT_FUNDING_RESEARCH_SATELLITE_ASSETS ?? DEFAULT_RESEARCH_SATELLITE_ASSETS,
+    'GCT_FUNDING_RESEARCH_SATELLITE_ASSETS',
+  );
+  // 旧部署显式设置总池时继续兼容；新部署使用“38 龙头 + 40~60 卫星”的可解释分池。
+  const fundingResearchAssets = environment.GCT_FUNDING_RESEARCH_ASSETS
+    ? parseAssetList(environment.GCT_FUNDING_RESEARCH_ASSETS, 'GCT_FUNDING_RESEARCH_ASSETS')
+    : [...new Set([...fundingResearchCoreAssets, ...fundingResearchSatelliteAssets])];
   const fundingResearchEnabled = environment.GCT_FUNDING_RESEARCH_ENABLED === '1';
-  const fundingResearchModelVersion = (environment.GCT_FUNDING_RESEARCH_MODEL_VERSION ?? 'rolling_v7').trim();
+  const fundingResearchModelVersion = (environment.GCT_FUNDING_RESEARCH_MODEL_VERSION ?? 'rolling_v8').trim();
   if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(fundingResearchModelVersion)) {
     throw new Error('GCT_FUNDING_RESEARCH_MODEL_VERSION must use lowercase letters, digits, underscores, or hyphens');
   }
@@ -395,6 +417,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
       enabled: fundingResearchEnabled,
       modelVersion: fundingResearchModelVersion,
       assets: fundingResearchAssets,
+      coreAssets: fundingResearchCoreAssets.filter((asset) => fundingResearchAssets.includes(asset)),
+      satelliteAssets: fundingResearchSatelliteAssets.filter((asset) => fundingResearchAssets.includes(asset)),
       targetNotionalUsd: fundingResearchTargetNotionalUsd,
       maxActualNotionalUsd: fundingResearchMaxActualNotionalUsd,
       maxOpenPositions: fundingResearchMaxOpenPositions,

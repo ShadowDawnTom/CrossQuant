@@ -46,8 +46,8 @@ describe('database migrations', () => {
 
     expect(readDatabaseStatus(first)).toEqual({
       state: 'ok',
-      migrationCount: 27,
-      currentMigration: '0027_funding_discovery_hot_pool.sql',
+      migrationCount: 28,
+      currentMigration: '0028_survival_research_and_account_fees.sql',
     });
     const orderColumns = first.prepare('PRAGMA table_info(execution_orders)').all() as Array<{ name: string }>;
     expect(orderColumns.map((column) => column.name)).toContain('failure_reason');
@@ -60,7 +60,7 @@ describe('database migrations', () => {
     first.close();
 
     const reopened = openDatabase(location.path, migrationsDir);
-    expect(readDatabaseStatus(reopened).migrationCount).toBe(27);
+    expect(readDatabaseStatus(reopened).migrationCount).toBe(28);
     reopened.close();
   });
 
@@ -70,7 +70,7 @@ describe('database migrations', () => {
     openDatabase(location.path, migrationsDir).close();
 
     const reopened = openDatabase(location.path, migrationsDir, { startupIntegrityMaxBytes: 0 });
-    expect(readDatabaseStatus(reopened)).toMatchObject({ state: 'ok', currentMigration: '0027_funding_discovery_hot_pool.sql' });
+    expect(readDatabaseStatus(reopened)).toMatchObject({ state: 'ok', currentMigration: '0028_survival_research_and_account_fees.sql' });
     reopened.close();
   });
 
@@ -155,7 +155,7 @@ describe('database migrations', () => {
     const database = openDatabase(location.path, resolve(process.cwd(), '../../migrations'));
     const columns = database.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain('correlation_id');
-    expect(readDatabaseStatus(database).currentMigration).toBe('0027_funding_discovery_hot_pool.sql');
+    expect(readDatabaseStatus(database).currentMigration).toBe('0028_survival_research_and_account_fees.sql');
     database.close();
   });
 

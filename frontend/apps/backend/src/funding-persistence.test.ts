@@ -29,6 +29,11 @@ describe('funding persistence', () => {
     }
     const stats = readFundingPersistence(database, 'GATE_FUTURE_SOL_USDT', 'BINANCE_FUTURE_SOL_USDT', now);
     expect(stats).toMatchObject({ samples: 10, positiveWindows: 8, probability: '0.8', directionFlips: 1 });
+    expect(stats.horizons).toEqual(expect.arrayContaining([
+      expect.objectContaining({ hours: 24, samples: 10, survivalProbability: '0.8' }),
+      expect.objectContaining({ hours: 72, samples: 8, survivalProbability: '0.75' }),
+      expect.objectContaining({ hours: 168, samples: 4, survivalProbability: '0.5' }),
+    ]));
     expect(persistenceAdjustedRetention('0.9', stats)).toBe('0.8');
     expect(persistenceAdjustedRetention('0.5', stats)).toBe('0.5');
   });

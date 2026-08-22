@@ -50,6 +50,18 @@ export interface FundingCandidateScannerOptions {
 
 export type FundingScanStatus = 'LIVE_ELIGIBLE' | 'RESEARCH_ELIGIBLE' | 'REJECTED';
 
+export interface FundingHorizonScenario {
+  hours: 24 | 72 | 168;
+  longEvents: number;
+  shortEvents: number;
+  rawFundingPnl: string;
+  survivalProbability: string;
+  historicalSamples: number;
+  conservativeFundingPnl: string;
+  netPnl: string;
+  netAnnualized: string;
+}
+
 export interface FundingScanObservation {
   id: string;
   scanId: string;
@@ -108,6 +120,10 @@ export interface FundingScanObservation {
   historicalEdgeP10?: string | null;
   historicalEdgeMedian?: string | null;
   requestedNotionalUsd?: string;
+  horizonScenarios?: FundingHorizonScenario[];
+  selectedHorizonHours?: number | null;
+  survivalWeightedNetPnl?: string | null;
+  survivalWeightedAnnualized?: string | null;
 }
 
 function eventCount(item: GateFundingInfo, now: number, horizonMs: number): number {
@@ -403,6 +419,7 @@ export class FundingCandidateScanner {
         const tradingFees = entryFees.plus(exitFees);
         const persistence = this.options.persistenceStats?.(long.symbol, short.symbol, this.now()) ?? {
           probability: null, samples: 0, positiveWindows: 0, directionFlips: 0, medianEdge: null, p10Edge: null,
+          horizons: [],
         };
         const retention = new Decimal(persistenceAdjustedRetention(this.options.fundingRetentionFactor, persistence));
         const conservativeFundingPnl = snapshotFundingPnl.gt(0) ? snapshotFundingPnl.mul(retention) : snapshotFundingPnl;
@@ -411,10 +428,38 @@ export class FundingCandidateScanner {
         // 跨报价币组合额外预留稳定币波动缓冲；当前汇率用于换算，未来脱锚风险不能被当作零。
         const stablecoinRiskBuffer = baseObservation.longQuote === baseObservation.shortQuote ? new Decimal(0)
           : capital.mul(stablecoinRiskBps).div(10_000);
-        const netPnl = conservativeFundingPnl.plus(immediateRoundTripPnl).minus(tradingFees)
-          .minus(stressBuffer).minus(stablecoinRiskBuffer);
-        const rawAnnualized = snapshotFundingPnl.div(capital).mul(8760).div(this.options.horizonHours);
-        const netAnnualized = netPnl.div(capital).mul(8760).div(this.options.horizonHours);
+        const configuredRetention = new Decimal(this.options.fundingRetentionFactor);
+        const horizonScenarios = ([24, 72, 168] as const).map((hours) => {
+          const horizon = hours * 60 * 60_000;
+          const scenarioLongEvents = eventCount(long, this.now(), horizon);
+          const scenarioShortEvents = eventCount(short, this.now(), horizon);
+          const raw = shortEntry.notional.mul(short.funding_rate).mul(scenarioShortEvents)
+            .minus(longEntry.notional.mul(long.funding_rate).mul(scenarioLongEvents));
+          const history = persistence.horizons?.find((item) => item.hours === hours);
+          // 样本不足时沿用人工先验；样本足够后只允许真实生存率把收益预期调低。
+          const survival = history && history.samples >= 7 && history.survivalProbability !== null
+            ? Decimal.min(configuredRetention, Decimal.max(0, history.survivalProbability)) : configuredRetention;
+          const conservative = raw.gt(0) ? raw.mul(survival) : raw;
+          const scenarioNet = conservative.plus(immediateRoundTripPnl).minus(tradingFees)
+            .minus(stressBuffer).minus(stablecoinRiskBuffer);
+          return {
+            hours,
+            longEvents: scenarioLongEvents,
+            shortEvents: scenarioShortEvents,
+            rawFundingPnl: raw.toString(),
+            survivalProbability: survival.toString(),
+            historicalSamples: history?.samples ?? 0,
+            conservativeFundingPnl: conservative.toString(),
+            netPnl: scenarioNet.toString(),
+            netAnnualized: scenarioNet.div(capital).mul(8760).div(hours).toString(),
+          } satisfies FundingHorizonScenario;
+        });
+        const selectedScenario = [...horizonScenarios].sort((left, right) =>
+          new Decimal(right.netPnl).cmp(left.netPnl))[0]!;
+        const dayScenario = horizonScenarios[0]!;
+        const netPnl = new Decimal(dayScenario.netPnl);
+        const rawAnnualized = new Decimal(dayScenario.rawFundingPnl).div(capital).mul(8760).div(24);
+        const netAnnualized = new Decimal(dayScenario.netAnnualized);
         const entrySlippageBps = longEntry.slippageBps.plus(shortEntry.slippageBps);
         const exitSlippageBps = longExit.slippageBps.plus(shortExit.slippageBps);
         const basisBps = longEntry.average.minus(shortEntry.average).abs()
@@ -431,10 +476,13 @@ export class FundingCandidateScanner {
         const executorSupported = LIVE_VENUES.has(longVenue) && LIVE_VENUES.has(shortVenue);
         let strictReason = !strictAssets.has(asset) ? 'strict_asset_not_enabled'
           : !executorSupported ? 'executor_venue_not_supported' : 'funding_net_return_below_threshold';
-        if (strictAssets.has(asset) && executorSupported && netAnnualized.gte(minNetAnnualized)) {
+        if (strictAssets.has(asset) && executorSupported
+          && new Decimal(selectedScenario.netPnl).gt(0)
+          && new Decimal(selectedScenario.netAnnualized).gte(minNetAnnualized)) {
           try {
             await this.engine.observeAuthoritativeCandidate({ asset, longVenue, shortVenue, quantity: quantity.toString(),
-              longRate: long.funding_rate, shortRate: short.funding_rate, netAnnualized: netAnnualized.toString() });
+              longRate: long.funding_rate, shortRate: short.funding_rate,
+              netAnnualized: selectedScenario.netAnnualized });
             strictEligible = true;
             strictReason = 'live_threshold_passed';
             recorded += 1;
@@ -469,6 +517,13 @@ export class FundingCandidateScanner {
           persistenceProbability: persistence.probability, persistenceSamples: persistence.samples,
           retentionFactorUsed: retention.toString(), historicalEdgeP10: persistence.p10Edge,
           historicalEdgeMedian: persistence.medianEdge });
+        const last = observations[observations.length - 1];
+        if (last?.id === baseObservation.id) {
+          last.horizonScenarios = horizonScenarios;
+          last.selectedHorizonHours = selectedScenario.hours;
+          last.survivalWeightedNetPnl = selectedScenario.netPnl;
+          last.survivalWeightedAnnualized = selectedScenario.netAnnualized;
+        }
       }
     }
     // 持仓监控复用本轮认证数据，避免再打一遍 funding_info 和 fee 接口触发限频。

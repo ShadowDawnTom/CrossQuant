@@ -498,7 +498,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 27, currentMigration: '0027_funding_discovery_hot_pool.sql' },
+      database: { migrationCount: 28, currentMigration: '0028_survival_research_and_account_fees.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',
@@ -563,7 +563,8 @@ describe('local backend', () => {
     const discovery = await app.inject({ method: 'GET', url: '/api/funding-discovery',
       headers: { host: '127.0.0.1:17840' } });
     expect(discovery.statusCode).toBe(200);
-    expect(discovery.json()).toMatchObject({ universeSize: 38, hotPoolSize: 2, hotPoolLimit: 10,
+    expect(discovery.json()).toMatchObject({ universeSize: 93, coreCount: 38, satelliteCount: 55,
+      hotPoolSize: 2, hotPoolLimit: 10,
       hotAssets: ['BTC', 'ETH'], eligibleCount: 0, assets: [] });
   });
 

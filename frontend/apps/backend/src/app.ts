@@ -762,6 +762,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     ? deriveExecutionAvailability(cachedRules) : undefined;
   const fundingDiscoveryService = new FundingDiscoveryService(database, {
     assets: config.fundingResearch.assets,
+    coreAssets: config.fundingResearch.coreAssets,
     initialHotAssets: config.executionMarket.symbols,
     requiredAssets: config.fundingArbitrage.scanAssets,
     hotPoolSize: config.fundingResearch.discoveryHotPoolSize,

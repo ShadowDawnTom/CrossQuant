@@ -201,9 +201,15 @@ export interface FundingScanObservation {
   dataValid?: boolean; invalidReason?: string | null; persistenceProbability?: string | null;
   persistenceSamples?: number; retentionFactorUsed?: string; historicalEdgeP10?: string | null;
   historicalEdgeMedian?: string | null; requestedNotionalUsd?: string;
+  horizonScenarios?: Array<{ hours: 24 | 72 | 168; longEvents: number; shortEvents: number;
+    rawFundingPnl: string; survivalProbability: string; historicalSamples: number;
+    conservativeFundingPnl: string; netPnl: string; netAnnualized: string }>;
+  selectedHorizonHours?: number | null; survivalWeightedNetPnl?: string | null;
+  survivalWeightedAnnualized?: string | null;
 }
+export type FundingResearchCohort = 'ONE_SETTLEMENT' | 'ROLLING' | 'STATIC_72H' | 'STATIC_7D';
 export interface FundingResearchPosition {
-  id: string; observationId: string; mode: 'RESEARCH'; cohort: 'ONE_SETTLEMENT' | 'ROLLING'; asset: string; longVenue: string; shortVenue: string;
+  id: string; observationId: string; mode: 'RESEARCH'; cohort: FundingResearchCohort; asset: string; longVenue: string; shortVenue: string;
   quantity: string; targetNotionalUsd: string; state: string; monitorState: string;
   entryRawAnnualized: string; entryNetAnnualized: string; entryLongPrice: string; entryShortPrice: string;
   entryLongNotional: string; entryShortNotional: string; exitLongPrice: string | null; exitShortPrice: string | null;
@@ -224,7 +230,13 @@ export interface FundingResearchEvaluation {
 export interface FundingResearchSettlement {
   id: string; positionId: string; symbol: string; venue: string; side: string; fundingTime: string;
   fundingRate: string; notionalUsd: string; expectedAmount: string; amount: string | null;
-  state: string; amountSource: string; settledAt: string | null;
+  actualFundingRate: string | null; state: string; amountSource: string; settledAt: string | null;
+}
+export interface FundingFeeDiagnostic {
+  venue: string; spotMakerFee: string; spotTakerFee: string; spotRpiMakerFee: string | null;
+  futureMakerFee: string; futureTakerFee: string; futureRpiMakerFee: string | null;
+  rpiAvailable: boolean; specialFeeCount: number; specialRpiCount: number;
+  accountEffective: true; observedAt: string;
 }
 export interface FundingResearchVariant {
   id: string; observationId: string; evaluatedAt: string; asset: string; longVenue: string; shortVenue: string;
@@ -241,12 +253,13 @@ export interface FundingResearchSummary {
   rejectionReasons: Array<{ reason: string; count: number }>; latestObservations: FundingScanObservation[];
   openCount: number; closedCount: number; cumulativePnl: string; cumulativeFunding: string;
   cumulativeFees: string; positions: FundingResearchPosition[];
-  cohorts: Array<{ cohort: 'ONE_SETTLEMENT' | 'ROLLING'; openCount: number; closedCount: number;
+  cohorts: Array<{ cohort: FundingResearchCohort; openCount: number; closedCount: number;
     cumulativePnl: string; cumulativeFunding: string; cumulativeFees: string }>;
   variants: FundingResearchVariant[];
+  feeDiagnostics: FundingFeeDiagnostic[];
 }
 export interface FundingDiscoveryAsset {
-  asset: string; observedAt: string; bestLongVenue: string | null; bestShortVenue: string | null;
+  asset: string; pool: 'CORE' | 'SATELLITE'; observedAt: string; bestLongVenue: string | null; bestShortVenue: string | null;
   bestLongRate: string | null; bestShortRate: string | null; spread8h: string | null;
   openInterestUsd: string | null; lastPrice: string | null; change24h: string | null;
   edgeDurationMinutes: number; directionFlips24h: number; consecutiveConfirmations: number;
@@ -255,7 +268,8 @@ export interface FundingDiscoveryAsset {
 }
 export interface FundingDiscoverySummary {
   updatedAt: string | null; universeSize: number; hotPoolSize: number; hotPoolLimit: number;
-  hotAssets: string[]; eligibleCount: number; assets: FundingDiscoveryAsset[];
+  hotAssets: string[]; eligibleCount: number; coreCount: number; satelliteCount: number;
+  assets: FundingDiscoveryAsset[];
 }
 
 interface RuntimeSchema<T> {

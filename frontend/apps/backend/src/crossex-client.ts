@@ -87,6 +87,7 @@ const GateSymbolSchema = z.object({
   liquidation_fee: z.string().nullable(),
   default_leverage: z.string().nullable().optional(),
   delist_time: z.string(),
+  support_rpi: z.string().optional(),
 });
 export type GateCrossExSymbol = z.infer<typeof GateSymbolSchema>;
 
@@ -167,7 +168,7 @@ export const CrossExOrderRequestSchema = z.object({
   symbol: z.string().regex(/^[A-Z0-9_]{3,120}$/),
   side: z.enum(['BUY', 'SELL']),
   type: z.enum(['LIMIT', 'MARKET']).default('LIMIT'),
-  time_in_force: z.enum(['GTC', 'IOC', 'FOK', 'POC']).default('GTC'),
+  time_in_force: z.enum(['GTC', 'IOC', 'FOK', 'POC', 'RPI']).default('GTC'),
   qty: z.string().regex(/^\d+(?:\.\d+)?$/).optional(),
   price: z.string().regex(/^\d+(?:\.\d+)?$/).optional(),
   quote_qty: z.string().regex(/^\d+(?:\.\d+)?$/).optional(),
@@ -190,12 +191,15 @@ const GateFeeRateSchema = z.object({
   exchange_type: z.string(),
   spot_maker_fee: z.string(),
   spot_taker_fee: z.string(),
+  spot_rpi_maker_fee: z.string().nullable().optional(),
   future_maker_fee: z.string(),
   future_taker_fee: z.string(),
+  future_rpi_maker_fee: z.string().nullable().optional(),
   special_fee_list: z.array(z.object({
     symbol: z.string(),
     taker_fee_rate: z.string(),
     maker_fee_rate: z.string(),
+    rpi_fee_rate: z.string().nullable().optional(),
   })).optional(),
 });
 export type GateFeeRate = z.infer<typeof GateFeeRateSchema>;

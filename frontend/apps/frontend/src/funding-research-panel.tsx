@@ -49,6 +49,8 @@ const reasonLabel: Record<string, string> = {
   funding_reversal_confirmation_pending: '资金费翻转等待连续确认',
   research_minimum_holding_active: '24小时长持观察期内，仅记录普通价值转负',
   research_model_restarted: '旧模型归档，重新起跑',
+  research_static_72h_holding: '固定72小时实验持有中', research_static_72h_completed: '固定72小时实验完成',
+  research_static_7d_holding: '固定7天实验持有中', research_static_7d_completed: '固定7天实验完成',
   soft_review_due: '滚动组达到72小时重点观察', hard_holding_limit: '滚动组达到7天硬上限',
   settlement_guard_active: '处于结算保护窗口', funding_schedule_unavailable: '结算计划不可用',
   crossed_order_book: '本地盘口交叉，已隔离并重建', executable_taker_baseline: '四笔 Taker 基准',
@@ -68,6 +70,13 @@ const reasonLabel: Record<string, string> = {
 
 function reason(value: string): string {
   return reasonLabel[value] ?? value;
+}
+
+function cohortLabel(value: FundingResearchPosition['cohort']): string {
+  if (value === 'ONE_SETTLEMENT') return '一次结算组';
+  if (value === 'ROLLING') return '滚动持仓组';
+  if (value === 'STATIC_72H') return '固定72小时组';
+  return '固定7天组';
 }
 
 /** RESEARCH 面板只展示独立模拟账本与扫描漏斗，不提供任何交易操作入口。 */
@@ -121,13 +130,14 @@ export function FundingResearchPanel() {
         <i />{summary?.enabled ? '独立模拟运行中' : '探索模拟未开启'}
       </span>
     </header>
-    <p className="funding-research-notice">广域发现池使用主流币、行业龙头和 RWA 龙头白名单，只读取资金费、Ticker、交易规则和持仓量；排名靠前且持续确认的 {discovery?.hotPoolLimit ?? 10} 个标的才接入完整订单簿。研究目标每腿 {summary?.targetNotionalUsd ?? '5'} U，规则取整后任一腿超过 {summary?.maxActualNotionalUsd ?? '10'} U 会直接拒绝。每个研究组最多同时持有 {summary?.maxOpenPositions ?? 3} 个不同组合。滚动组采用 {summary?.modelVersion ?? 'rolling_v7'}，普通价值转负在最初 {summary ? Math.round(summary.minimumHoldingMs / 3_600_000) : 24} 小时只记录不退出；资金费持续反转和硬风控仍可提前结束。所有研究都不会发送交易所订单。</p>
+    <p className="funding-research-notice">发现池由 38 个龙头常驻池和 40–60 个高费率卫星池组成，只读取资金费、Ticker、交易规则和持仓量；按费率差、持续性和持仓量评分，前 {discovery?.hotPoolLimit ?? 10} 个才无损切换到完整订单簿。研究目标每腿 {summary?.targetNotionalUsd ?? '5'} U，规则取整后任一腿超过 {summary?.maxActualNotionalUsd ?? '10'} U 会直接拒绝。四个研究组分别验证一次结算、滚动、固定72小时和固定7天，所有研究都不会发送交易所订单。</p>
     {error && <p className="funding-paper-error" role="alert">研究数据读取失败：{error}</p>}
 
     <div className="funding-research-opportunities">
       <h3>广域发现池与动态盘口热池</h3>
       <div className="funding-research-stats">
         <span><small>发现币种</small><strong>{discovery?.universeSize ?? '—'}</strong></span>
+        <span><small>龙头 / 卫星</small><strong>{discovery ? `${discovery.coreCount} / ${discovery.satelliteCount}` : '—'}</strong></span>
         <span><small>盘口热池</small><strong>{discovery ? `${discovery.hotPoolSize} / ${discovery.hotPoolLimit}` : '—'}</strong></span>
         <span><small>当前符合热池资格</small><strong>{discovery?.eligibleCount ?? '—'}</strong></span>
         <span><small>最后发现</small><strong>{time(discovery?.updatedAt)}</strong></span>
@@ -136,7 +146,7 @@ export function FundingResearchPanel() {
         : <div className="research-observation-list">{discovery.assets.slice(0, 30).map((item) =>
           <article key={item.asset} className={`research-observation ${item.inHotPool ? 'status-research_eligible' : 'status-rejected'}`}>
             <div className="research-observation-title">
-              <span className="research-status">{item.inHotPool ? 'HOT BOOK' : item.eligibleForHotPool ? '候补' : '发现'}</span>
+              <span className="research-status">{item.inHotPool ? 'HOT BOOK' : item.eligibleForHotPool ? '候补' : item.pool}</span>
               <strong>{item.asset}</strong><span>{item.bestLongVenue ?? '—'} 多 / {item.bestShortVenue ?? '—'} 空</span>
               <em>{reason(item.primaryReason)}</em>
             </div>
@@ -160,7 +170,7 @@ export function FundingResearchPanel() {
       <span><small>研究累计 PnL</small><strong>{decimal(summary?.cumulativePnl)} U</strong></span>
     </div>
     {summary && <div className="funding-research-stats">
-      {summary.cohorts.map((item) => <span key={item.cohort}><small>{item.cohort === 'ONE_SETTLEMENT' ? '一次结算组' : '滚动持仓组'} 持仓/已平</small><strong>{item.openCount} / {item.closedCount}</strong><em>{decimal(item.cumulativePnl)} U</em></span>)}
+      {summary.cohorts.map((item) => <span key={item.cohort}><small>{cohortLabel(item.cohort)} 持仓/已平</small><strong>{item.openCount} / {item.closedCount}</strong><em>{decimal(item.cumulativePnl)} U</em></span>)}
     </div>}
     {summary && <div className="funding-research-opportunities">
       <h3>P2 影子策略对比</h3>
@@ -205,6 +215,8 @@ export function FundingResearchPanel() {
                 <span><small>目标 / 实际每腿</small>{decimal(item.requestedNotionalUsd, 2)} → {decimal(item.entryLongNotional, 2)} / {decimal(item.entryShortNotional, 2)} U</span>
                 <span><small>毛快照 APR</small>{percent(item.rawAnnualized)}</span>
                 <span><small>可执行保守净收益年化</small>{percent(item.netAnnualized)}</span>
+                <span><small>多周期最优保守净收益</small>{item.selectedHorizonHours ? `${item.selectedHorizonHours}h · ${decimal(item.survivalWeightedNetPnl, 6)} U` : '—'}</span>
+                <span><small>生存加权净年化</small>{percent(item.survivalWeightedAnnualized)}</span>
                 <span><small>24h 原始资金费</small>{decimal(item.rawFundingPnl, 6)} U</span>
                 <span><small>保守资金费</small>{decimal(item.conservativeFundingPnl, 6)} U</span>
                 <span><small>立即往返损益</small>{decimal(item.immediateRoundTripPnl, 6)} U</span>
@@ -231,9 +243,9 @@ export function FundingResearchPanel() {
         : summary.positions.length === 0 ? <p className="funding-paper-empty">等待第一组通过同步、深度、数量和滑点检查的研究机会。</p>
           : summary.positions.map((position) => <article key={position.id} className={`research-position state-${position.state.toLowerCase()}`}>
             <div className="paper-position-head">
-              <div><span className="research-status">{position.cohort === 'ONE_SETTLEMENT' ? '一次结算组' : '滚动持仓组'}</span><strong>{position.asset}</strong><span>{position.longVenue} 多 / {position.shortVenue} 空</span></div>
+              <div><span className="research-status">{cohortLabel(position.cohort)}</span><strong>{position.asset}</strong><span>{position.longVenue} 多 / {position.shortVenue} 空</span></div>
               <span className="paper-position-state">{position.state === 'OPEN'
-                ? position.cohort === 'ROLLING' ? '滚动持仓监控中' : '等待真实结算时点'
+                ? position.cohort === 'ROLLING' ? '滚动持仓监控中' : position.cohort === 'ONE_SETTLEMENT' ? '等待真实结算时点' : '静态持仓实验中'
                 : '研究已平仓'}</span>
             </div>
             <div className="paper-position-metrics">
@@ -260,12 +272,26 @@ export function FundingResearchPanel() {
             {selectedId === position.id && <div className="paper-position-details">
               <div><h4>模拟资金费结算</h4>{settlements.length === 0 ? <p>等待生成结算事件。</p> : settlements.slice(0, 12).map((item) =>
                 <p key={item.id}><span>{item.venue} {item.side} · {time(item.fundingTime)}</span>
-                  <span>{decimal(item.expectedAmount, 6)} → {decimal(item.amount, 6)} U</span><strong>{item.state} · {item.amountSource === 'PREDICTED_SNAPSHOT' ? '预测模拟' : item.amountSource}</strong></p>)}</div>
+                  <span>预测 {percent(item.fundingRate, 4)} / 最终 {percent(item.actualFundingRate, 4)} · {decimal(item.expectedAmount, 6)} → {decimal(item.amount, 6)} U</span><strong>{item.state} · {item.amountSource === 'REALIZED_HISTORY' ? '真实最终费率' : '等待最终费率'}</strong></p>)}</div>
               <div><h4>研究评估时间线</h4>{evaluations.length === 0 ? <p>等待首轮评估。</p> : evaluations.slice(0, 12).map((item) =>
                 <p key={item.id}><span>{time(item.observedAt)}</span><span>{item.decision} · {reason(item.reason)}</span>
                   <strong>{decimal(item.currentExitPnl)} U</strong></p>)}</div>
             </div>}
           </article>)}
     </div>
+    {summary && <div className="funding-research-opportunities">
+      <h3>CrossEx 账户实际手续费</h3>
+      <p className="funding-research-notice">这里直接展示 `/crossex/fee` 返回值，已反映当前账户 VIP、Maker/Taker 和 RPI 白名单结果；接口不返回 VIP 等级名称，因此只核实实际费率。</p>
+      <div className="research-observation-list">{summary.feeDiagnostics.map((item) => <article key={item.venue} className="research-observation">
+        <div className="research-observation-title"><strong>{item.venue}</strong><em>{item.rpiAvailable ? 'RPI 已返回费率' : 'RPI 未开通或该所不支持'}</em></div>
+        <div className="research-cost-grid">
+          <span><small>合约 Maker / Taker</small>{percent(item.futureMakerFee, 4)} / {percent(item.futureTakerFee, 4)}</span>
+          <span><small>合约 RPI Maker</small>{percent(item.futureRpiMakerFee, 4)}</span>
+          <span><small>现货 Maker / Taker</small>{percent(item.spotMakerFee, 4)} / {percent(item.spotTakerFee, 4)}</span>
+          <span><small>特殊合约 / 含 RPI</small>{item.specialFeeCount} / {item.specialRpiCount}</span>
+          <span><small>最后核实</small>{time(item.observedAt)}</span>
+        </div>
+      </article>)}</div>
+    </div>}
   </section>;
 }

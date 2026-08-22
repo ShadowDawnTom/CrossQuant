@@ -8,6 +8,16 @@ export interface FundingPersistenceStats {
   directionFlips: number;
   medianEdge: string | null;
   p10Edge: string | null;
+  horizons?: FundingPersistenceHorizon[];
+}
+
+export interface FundingPersistenceHorizon {
+  hours: 24 | 72 | 168;
+  samples: number;
+  survivalProbability: string | null;
+  positiveCumulativeProbability: string | null;
+  meanEdge: string | null;
+  p10Edge: string | null;
 }
 
 interface FundingHistoryRow {
@@ -25,6 +35,37 @@ function percentile(values: readonly Decimal[], probability: number): Decimal | 
   const sorted = [...values].sort((left, right) => left.cmp(right));
   const index = Math.max(0, Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * probability)));
   return sorted[index] ?? null;
+}
+
+function consecutive(left: string, right: string): boolean {
+  return Date.parse(`${right}T00:00:00.000Z`) - Date.parse(`${left}T00:00:00.000Z`) === 24 * 60 * 60_000;
+}
+
+/** 多日窗口同时统计累计为正和每天方向都不翻转；后者才是可用于续持的生存概率。 */
+function horizonStats(days: readonly string[], edges: readonly Decimal[], hours: 24 | 72 | 168): FundingPersistenceHorizon {
+  const width = hours / 24;
+  const windows: Array<{ total: Decimal; survived: boolean }> = [];
+  for (let index = 0; index + width <= edges.length; index += 1) {
+    const windowDays = days.slice(index, index + width);
+    if (windowDays.slice(1).some((day, offset) => !consecutive(windowDays[offset]!, day))) continue;
+    const windowEdges = edges.slice(index, index + width);
+    windows.push({
+      total: windowEdges.reduce((total, edge) => total.plus(edge), new Decimal(0)),
+      survived: windowEdges.every((edge) => edge.gt(0)),
+    });
+  }
+  const positive = windows.filter((window) => window.total.gt(0)).length;
+  const survived = windows.filter((window) => window.survived).length;
+  const totals = windows.map((window) => window.total);
+  return {
+    hours,
+    samples: windows.length,
+    survivalProbability: windows.length === 0 ? null : new Decimal(survived).div(windows.length).toString(),
+    positiveCumulativeProbability: windows.length === 0 ? null : new Decimal(positive).div(windows.length).toString(),
+    meanEdge: windows.length === 0 ? null
+      : totals.reduce((total, edge) => total.plus(edge), new Decimal(0)).div(windows.length).toString(),
+    p10Edge: percentile(totals, 0.1)?.toString() ?? null,
+  };
 }
 
 /**
@@ -71,6 +112,7 @@ export function readFundingPersistence(
     directionFlips,
     medianEdge: median?.toString() ?? null,
     p10Edge: p10?.toString() ?? null,
+    horizons: ([24, 72, 168] as const).map((hours) => horizonStats(days, edges, hours)),
   };
 }
 

@@ -42,7 +42,10 @@ export interface FundingResearchOptions {
   spotMarket?: SpotMarketReader;
 }
 
-export type FundingResearchCohort = 'ONE_SETTLEMENT' | 'ROLLING';
+export const FUNDING_RESEARCH_COHORTS = [
+  'ONE_SETTLEMENT', 'ROLLING', 'STATIC_72H', 'STATIC_7D',
+] as const;
+export type FundingResearchCohort = typeof FUNDING_RESEARCH_COHORTS[number];
 
 interface ResearchPositionRow {
   id: string;
@@ -160,12 +163,28 @@ export interface FundingResearchSettlement {
   side: string;
   fundingTime: string;
   fundingRate: string;
+  actualFundingRate: string | null;
   notionalUsd: string;
   expectedAmount: string;
   amount: string | null;
   state: string;
   amountSource: string;
   settledAt: string | null;
+}
+
+export interface FundingFeeDiagnostic {
+  venue: string;
+  spotMakerFee: string;
+  spotTakerFee: string;
+  spotRpiMakerFee: string | null;
+  futureMakerFee: string;
+  futureTakerFee: string;
+  futureRpiMakerFee: string | null;
+  rpiAvailable: boolean;
+  specialFeeCount: number;
+  specialRpiCount: number;
+  accountEffective: true;
+  observedAt: string;
 }
 
 export interface FundingResearchSummary {
@@ -192,6 +211,7 @@ export interface FundingResearchSummary {
   cohorts: Array<{ cohort: FundingResearchCohort; openCount: number; closedCount: number;
     cumulativePnl: string; cumulativeFunding: string; cumulativeFees: string }>;
   variants: FundingResearchVariant[];
+  feeDiagnostics: FundingFeeDiagnostic[];
 }
 
 export interface FundingResearchVariant {
@@ -324,6 +344,13 @@ function observationFromRow(row: Record<string, unknown>): FundingScanObservatio
     historicalEdgeP10: row.historical_edge_p10 === null ? null : String(row.historical_edge_p10),
     historicalEdgeMedian: row.historical_edge_median === null ? null : String(row.historical_edge_median),
     requestedNotionalUsd: row.requested_notional_usd === null ? undefined : String(row.requested_notional_usd),
+    horizonScenarios: (() => {
+      try { const value = JSON.parse(String(row.horizon_scenarios_json ?? '[]')) as unknown; return Array.isArray(value) ? value : []; }
+      catch { return []; }
+    })() as FundingScanObservation['horizonScenarios'],
+    selectedHorizonHours: row.selected_horizon_hours === null ? null : Number(row.selected_horizon_hours),
+    survivalWeightedNetPnl: row.survival_weighted_net_pnl === null ? null : String(row.survival_weighted_net_pnl),
+    survivalWeightedAnnualized: row.survival_weighted_annualized === null ? null : String(row.survival_weighted_annualized),
   };
 }
 
@@ -342,9 +369,11 @@ function rankedObservations(observations: readonly FundingScanObservation[]): Fu
   return [...observations].sort((left, right) => {
     if (left.researchEligible !== right.researchEligible) return right.researchEligible ? 1 : -1;
     if (left.strictEligible !== right.strictEligible) return right.strictEligible ? 1 : -1;
-    if (left.netAnnualized === null) return right.netAnnualized === null ? 0 : 1;
-    if (right.netAnnualized === null) return -1;
-    return new Decimal(right.netAnnualized).cmp(left.netAnnualized);
+    const leftScore = left.survivalWeightedAnnualized ?? left.netAnnualized;
+    const rightScore = right.survivalWeightedAnnualized ?? right.netAnnualized;
+    if (leftScore === null) return rightScore === null ? 0 : 1;
+    if (rightScore === null) return -1;
+    return new Decimal(rightScore).cmp(leftScore);
   });
 }
 
@@ -372,7 +401,7 @@ export class FundingResearchEngine {
   private active: Promise<number> | null = null;
 
   private get modelVersion(): string {
-    return this.options.modelVersion ?? 'rolling_v7';
+    return this.options.modelVersion ?? 'rolling_v8';
   }
 
   constructor(
@@ -467,7 +496,7 @@ export class FundingResearchEngine {
         entry_fees: string; exit_fees: string; total_pnl: string }>;
     const closed = ledger.filter((position) => position.state === 'CLOSED');
     const fees = ledger.reduce((total, position) => total.plus(position.entry_fees).plus(position.exit_fees), new Decimal(0));
-    const cohorts = (['ONE_SETTLEMENT', 'ROLLING'] as const).map((cohort) => {
+    const cohorts = FUNDING_RESEARCH_COHORTS.map((cohort) => {
       const rows = ledger.filter((item) => item.cohort === cohort);
       const cohortClosed = rows.filter((item) => item.state === 'CLOSED');
       return { cohort, openCount: rows.filter((item) => item.state === 'OPEN').length,
@@ -493,7 +522,24 @@ export class FundingResearchEngine {
       cumulativePnl: closed.reduce((total, position) => total.plus(position.total_pnl), new Decimal(0)).toString(),
       cumulativeFunding: ledger.reduce((total, position) => total.plus(position.funding_pnl), new Decimal(0)).toString(),
       cumulativeFees: fees.toString(), positions, cohorts, variants: this.latestVariants(),
+      feeDiagnostics: this.feeDiagnostics(),
     };
+  }
+
+  private feeDiagnostics(): FundingFeeDiagnostic[] {
+    const rows = this.database.prepare('SELECT * FROM funding_fee_diagnostics ORDER BY venue').all() as Array<Record<string, unknown>>;
+    return rows.map((row) => {
+      const spotRpi = row.spot_rpi_maker_fee === null ? null : String(row.spot_rpi_maker_fee);
+      const futureRpi = row.future_rpi_maker_fee === null ? null : String(row.future_rpi_maker_fee);
+      return {
+        venue: String(row.venue), spotMakerFee: String(row.spot_maker_fee), spotTakerFee: String(row.spot_taker_fee),
+        spotRpiMakerFee: spotRpi, futureMakerFee: String(row.future_maker_fee),
+        futureTakerFee: String(row.future_taker_fee), futureRpiMakerFee: futureRpi,
+        rpiAvailable: Boolean(spotRpi || futureRpi || Number(row.special_rpi_count) > 0),
+        specialFeeCount: Number(row.special_fee_count), specialRpiCount: Number(row.special_rpi_count),
+        accountEffective: true, observedAt: String(row.observed_at),
+      };
+    });
   }
 
   private latestVariants(): FundingResearchVariant[] {
@@ -577,6 +623,7 @@ export class FundingResearchEngine {
       WHERE position_id = ? ORDER BY funding_time DESC`).all(id) as Array<Record<string, unknown>>).map((item) => ({
         id: String(item.id), positionId: String(item.position_id), symbol: String(item.symbol), venue: String(item.venue),
         side: String(item.side), fundingTime: String(item.funding_time), fundingRate: String(item.funding_rate),
+        actualFundingRate: item.actual_rate === null ? null : String(item.actual_rate),
         notionalUsd: String(item.notional_usd), expectedAmount: String(item.expected_amount),
         amount: item.amount === null ? null : String(item.amount), state: String(item.state),
         amountSource: String(item.amount_source ?? 'PREDICTED_SNAPSHOT'),
@@ -589,6 +636,7 @@ export class FundingResearchEngine {
     fees: readonly GateFeeRate[]): Promise<number> {
     const observedAt = new Date(this.now()).toISOString();
     this.persistObservations(observations);
+    this.persistFees(fees, observedAt);
     this.settleDue(observedAt);
     let changed = 0;
     // 不能先截取最近历史再过滤 OPEN；历史平仓增多后，老滚动仓会被挤出监控范围。
@@ -608,10 +656,11 @@ export class FundingResearchEngine {
       // 扫描器已检查一次，这里再做账本边界防御，配置错误也不能把 5U 目标放大成几十 U。
       && new Decimal(item.entryLongNotional).lte(maxActualNotional)
       && new Decimal(item.entryShortNotional).lte(maxActualNotional))
-      .sort((left, right) => new Decimal(right.netAnnualized!).cmp(left.netAnnualized!));
+      .sort((left, right) => new Decimal(right.survivalWeightedAnnualized ?? right.netAnnualized!)
+        .cmp(left.survivalWeightedAnnualized ?? left.netAnnualized!));
     if (candidates.length === 0) return changed;
     await this.recordVariants(candidates[0]!, fees, observedAt);
-    for (const cohort of ['ONE_SETTLEMENT', 'ROLLING'] as const) {
+    for (const cohort of FUNDING_RESEARCH_COHORTS) {
       let openCount = (this.database.prepare(`SELECT COUNT(*) AS count FROM funding_research_positions
         WHERE state = 'OPEN' AND cohort = ? AND research_model_version = ?`)
         .get(cohort, this.modelVersion) as { count: number }).count;
@@ -626,7 +675,7 @@ export class FundingResearchEngine {
         // observation_id 有唯一约束；滚动组复制同一快照，但同组同方向组合由数据库索引继续防重。
         const cohortObservation = cohort === 'ONE_SETTLEMENT'
           ? candidate : { ...candidate, id: randomUUID(), cohortClone: true };
-        if (cohort === 'ROLLING') this.persistObservations([cohortObservation]);
+        if (cohort !== 'ONE_SETTLEMENT') this.persistObservations([cohortObservation]);
         const openedId = this.open(cohortObservation, funding, observedAt, cohort);
         if (!openedId) continue;
         this.evaluate(openedId, funding, fees, observedAt);
@@ -680,10 +729,13 @@ export class FundingResearchEngine {
         this.database.prepare(`UPDATE funding_scan_observations SET data_valid = ?, invalid_reason = ?,
           persistence_probability = ?, persistence_samples = ?, retention_factor_used = ?,
           historical_edge_p10 = ?, historical_edge_median = ?, requested_notional_usd = ?,
-          research_model_version = ? WHERE id = ?`)
+          research_model_version = ?, horizon_scenarios_json = ?, selected_horizon_hours = ?,
+          survival_weighted_net_pnl = ?, survival_weighted_annualized = ? WHERE id = ?`)
           .run(item.dataValid === false ? 0 : 1, item.invalidReason ?? null, item.persistenceProbability ?? null,
             item.persistenceSamples ?? 0, item.retentionFactorUsed ?? null, item.historicalEdgeP10 ?? null,
-            item.historicalEdgeMedian ?? null, item.requestedNotionalUsd ?? null, this.modelVersion, item.id);
+            item.historicalEdgeMedian ?? null, item.requestedNotionalUsd ?? null, this.modelVersion,
+            JSON.stringify(item.horizonScenarios ?? []), item.selectedHorizonHours ?? null,
+            item.survivalWeightedNetPnl ?? null, item.survivalWeightedAnnualized ?? null, item.id);
       }
       for (const [scanId, items] of summaryGroups) {
         const rejectionReasons: Record<string, number> = {};
@@ -696,6 +748,29 @@ export class FundingResearchEngine {
           items.filter((item) => item.researchEligible).length,
           items.filter((item) => item.status === 'REJECTED').length,
           JSON.stringify(rejectionReasons), JSON.stringify(rankedIds));
+      }
+    })();
+  }
+
+  /** 保存 `/crossex/fee` 返回的账户实际费率；它已经包含当前 VIP/白名单结果，但不能反推出 VIP 等级。 */
+  private persistFees(fees: readonly GateFeeRate[], observedAt: string): void {
+    const statement = this.database.prepare(`INSERT INTO funding_fee_diagnostics
+      (venue, spot_maker_fee, spot_taker_fee, spot_rpi_maker_fee, future_maker_fee, future_taker_fee,
+       future_rpi_maker_fee, special_fee_count, special_rpi_count, special_fees_json, observed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(venue) DO UPDATE SET spot_maker_fee = excluded.spot_maker_fee,
+        spot_taker_fee = excluded.spot_taker_fee, spot_rpi_maker_fee = excluded.spot_rpi_maker_fee,
+        future_maker_fee = excluded.future_maker_fee, future_taker_fee = excluded.future_taker_fee,
+        future_rpi_maker_fee = excluded.future_rpi_maker_fee, special_fee_count = excluded.special_fee_count,
+        special_rpi_count = excluded.special_rpi_count, special_fees_json = excluded.special_fees_json,
+        observed_at = excluded.observed_at`);
+    this.database.transaction(() => {
+      for (const fee of fees) {
+        const special = fee.special_fee_list ?? [];
+        statement.run(fee.exchange_type, fee.spot_maker_fee, fee.spot_taker_fee,
+          fee.spot_rpi_maker_fee || null, fee.future_maker_fee, fee.future_taker_fee,
+          fee.future_rpi_maker_fee || null, special.length,
+          special.filter((item) => Boolean(item.rpi_fee_rate)).length, JSON.stringify(special), observedAt);
       }
     })();
   }
@@ -730,9 +805,11 @@ export class FundingResearchEngine {
     const annualized = (pnl: Decimal, basis: Decimal = capital) => pnl.div(basis).mul(8760).div(horizonHours);
     this.persistVariant(observation, observedAt, {
       variant: 'TAKER_TAKER', hedgeModel: 'PERP_PERP', state: 'PRICED',
-      expectedNetPnl: observation.netPnl, expectedNetAnnualized: observation.netAnnualized,
+      expectedNetPnl: observation.survivalWeightedNetPnl ?? observation.netPnl,
+      expectedNetAnnualized: observation.survivalWeightedAnnualized ?? observation.netAnnualized,
       tradingFees: observation.tradingFees, fillProbability: '1', breakEvenHours: observation.breakEvenHours,
-      reason: 'executable_taker_baseline', details: { cohortModels: ['ONE_SETTLEMENT', 'ROLLING'] },
+      reason: 'executable_taker_baseline', details: { cohortModels: FUNDING_RESEARCH_COHORTS,
+        selectedHorizonHours: observation.selectedHorizonHours, horizonScenarios: observation.horizonScenarios },
     });
 
     const longSymbol = crossExFutureSymbol(observation.longVenue, observation.asset);
@@ -839,7 +916,8 @@ export class FundingResearchEngine {
         VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(id, observation.id, observation.asset, observation.longVenue, observation.shortVenue,
           observation.quantity, this.options.targetNotionalUsd, observation.rawAnnualized,
-          observation.netAnnualized, observation.entryLongPrice, observation.entryShortPrice,
+          observation.survivalWeightedAnnualized ?? observation.netAnnualized,
+          observation.entryLongPrice, observation.entryShortPrice,
           observation.entryLongNotional, observation.entryShortNotional, observation.entryFees,
           observation.entrySlippageBps, observedAt, observedAt, observedAt, cohort,
           observation.longQuote, observation.shortQuote, this.modelVersion);
@@ -914,6 +992,16 @@ export class FundingResearchEngine {
       const shouldExit = settledLegs === 2 && settledEvents >= this.options.minimumSettledEvents * 2;
       decision = shouldExit ? 'EXIT' : 'HOLD';
       reason = shouldExit ? 'research_minimum_settlement_completed' : 'research_waiting_first_settlement';
+    } else if (position.cohort === 'STATIC_72H' || position.cohort === 'STATIC_7D') {
+      const durationMs = position.cohort === 'STATIC_72H' ? 72 * 60 * 60_000 : 7 * 24 * 60 * 60_000;
+      const deadline = Date.parse(position.opened_at) + durationMs;
+      decision = Date.parse(observedAt) >= deadline ? 'EXIT' : 'HOLD';
+      reason = decision === 'EXIT'
+        ? position.cohort === 'STATIC_72H' ? 'research_static_72h_completed' : 'research_static_7d_completed'
+        : position.cohort === 'STATIC_72H' ? 'research_static_72h_holding' : 'research_static_7d_holding';
+      // 静态组不因费率翻转或短期价值转负退出，用来隔离“持有时长”对手续费回收的影响。
+      holdingDetails = { staticDeadline: new Date(deadline).toISOString(),
+        fundingReversalObserved: new Decimal(shortFunding.funding_rate).lte(longFunding.funding_rate) };
     } else {
       try {
         const holding = evaluateFundingHolding({
@@ -1032,7 +1120,10 @@ export class FundingResearchEngine {
     })();
   }
 
-  /** 研究账本使用结算前最后一条预测费率模拟到账，不把它标成交易所真实资金流水。 */
+  /**
+   * 研究账本只在历史接口落库真实最终费率后结算。历史数据延迟时保持 PENDING，
+   * 不能再拿结算前预测值冒充已经到账的资金费。
+   */
   private settleDue(observedAt: string): void {
     const due = this.database.prepare(`SELECT settlements.*, positions.opened_at
       FROM funding_research_settlements settlements
@@ -1048,8 +1139,18 @@ export class FundingResearchEngine {
             settled_at = NULL, updated_at = ? WHERE id = ? AND state = 'PENDING'`).run(observedAt, row.id);
           continue;
         }
-        this.database.prepare(`UPDATE funding_research_settlements SET state = 'SETTLED', amount = expected_amount,
-          settled_at = ?, updated_at = ? WHERE id = ? AND state = 'PENDING'`).run(observedAt, observedAt, row.id);
+        const fundingTimeMs = Date.parse(String(row.funding_time));
+        const realized = this.database.prepare(`SELECT rate, funding_time FROM funding_rate_history
+          WHERE symbol = ? AND funding_time BETWEEN ? AND ? AND fetched_at <= ?
+          ORDER BY ABS(funding_time - ?) LIMIT 1`).get(row.symbol, fundingTimeMs - 300_000,
+          fundingTimeMs + 300_000, observedAt, fundingTimeMs) as { rate: string; funding_time: number } | undefined;
+        if (!realized) continue;
+        const signedAmount = new Decimal(String(row.notional_usd)).mul(realized.rate)
+          .mul(String(row.side) === 'LONG' ? -1 : 1);
+        this.database.prepare(`UPDATE funding_research_settlements SET state = 'SETTLED', amount = ?,
+          actual_rate = ?, amount_source = 'REALIZED_HISTORY', settled_at = ?, updated_at = ?
+          WHERE id = ? AND state = 'PENDING'`)
+          .run(signedAmount.toString(), realized.rate, observedAt, observedAt, row.id);
         affected.add(String(row.position_id));
       }
       for (const positionId of affected) {

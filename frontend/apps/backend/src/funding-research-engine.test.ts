@@ -50,6 +50,14 @@ function reversedFunding(now: number): GateFundingInfo[] {
   ];
 }
 
+function saveRealizedFunding(database: { prepare(sql: string): { run(...values: unknown[]): unknown } },
+  fundingTime: number, fetchedAt: number): void {
+  const statement = database.prepare(`INSERT OR REPLACE INTO funding_rate_history
+    (symbol, funding_time, rate, fetched_at) VALUES (?, ?, ?, ?)`);
+  statement.run('BINANCE_FUTURE_SOL_USDT', fundingTime, '-0.00004', new Date(fetchedAt).toISOString());
+  statement.run('GATE_FUTURE_SOL_USDT', fundingTime, '0.00002', new Date(fetchedAt).toISOString());
+}
+
 const fees: GateFeeRate[] = ['BINANCE', 'GATE'].map((venue) => ({ exchange_type: venue,
   spot_maker_fee: '0', spot_taker_fee: '0', future_maker_fee: '0.0002', future_taker_fee: '0.0005' }));
 
@@ -91,9 +99,11 @@ describe('FundingResearchEngine', () => {
       maxOpenPositions: 3, minimumSettledEvents: 1,
     }, () => currentTime);
 
-    expect(await engine.observe(observations, fundingRows, fees)).toBe(6);
+    expect(await engine.observe(observations, fundingRows, fees)).toBe(12);
     expect(engine.list().filter((item) => item.state === 'OPEN' && item.cohort === 'ONE_SETTLEMENT')).toHaveLength(3);
     expect(engine.list().filter((item) => item.state === 'OPEN' && item.cohort === 'ROLLING')).toHaveLength(3);
+    expect(engine.list().filter((item) => item.state === 'OPEN' && item.cohort === 'STATIC_72H')).toHaveLength(3);
+    expect(engine.list().filter((item) => item.state === 'OPEN' && item.cohort === 'STATIC_7D')).toHaveLength(3);
 
     const oversized = { ...observation(currentTime), id: '9aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
       asset: 'LINK', entryLongNotional: '11', entryShortNotional: '11' };
@@ -115,13 +125,15 @@ describe('FundingResearchEngine', () => {
       stressSlippageBps: '0', adverseExitBasisBps: '0', fundingRetentionFactor: '0.5',
     }, () => currentTime);
 
-    expect(await engine.observe([observation(currentTime)], funding(currentTime), fees)).toBe(2);
-    expect(engine.list()).toHaveLength(2);
+    expect(await engine.observe([observation(currentTime)], funding(currentTime), fees)).toBe(4);
+    expect(engine.list()).toHaveLength(4);
     expect(engine.list()).toEqual(expect.arrayContaining([
       expect.objectContaining({ cohort: 'ONE_SETTLEMENT', state: 'OPEN', monitorState: 'HOLD', settledEvents: 0 }),
       expect.objectContaining({ cohort: 'ROLLING', state: 'OPEN', monitorState: 'HOLD', settledEvents: 0 }),
+      expect.objectContaining({ cohort: 'STATIC_72H', state: 'OPEN', monitorState: 'HOLD', settledEvents: 0 }),
+      expect.objectContaining({ cohort: 'STATIC_7D', state: 'OPEN', monitorState: 'HOLD', settledEvents: 0 }),
     ]));
-    expect(engine.summary()).toMatchObject({ enabled: true, openCount: 2, scan24h: {
+    expect(engine.summary()).toMatchObject({ enabled: true, openCount: 4, scan24h: {
       observations: 1, liveEligible: 0, researchEligible: 1, rejected: 0,
     }, variants: expect.arrayContaining([
       expect.objectContaining({ variant: 'TAKER_TAKER', state: 'PRICED' }),
@@ -130,6 +142,7 @@ describe('FundingResearchEngine', () => {
     ]) });
 
     currentTime += 61_000;
+    saveRealizedFunding(database, currentTime - 1_000, currentTime);
     await engine.observe([observation(currentTime)], funding(currentTime), fees);
     const oneSettlement = engine.list().find((item) => item.cohort === 'ONE_SETTLEMENT')!;
     const rolling = engine.list().find((item) => item.cohort === 'ROLLING')!;
@@ -138,7 +151,7 @@ describe('FundingResearchEngine', () => {
     expect(rolling).toMatchObject({ state: 'OPEN', monitorState: 'HOLD', settledEvents: 2 });
     expect(Number(oneSettlement.fundingPnl)).toBeGreaterThan(0);
     expect(engine.details(oneSettlement.id)?.settlements.filter((item) => item.state === 'SETTLED'))
-      .toEqual(expect.arrayContaining([expect.objectContaining({ amountSource: 'PREDICTED_SNAPSHOT' })]));
+      .toEqual(expect.arrayContaining([expect.objectContaining({ amountSource: 'REALIZED_HISTORY', actualFundingRate: expect.any(String) })]));
     expect(engine.details(oneSettlement.id)?.evaluations.some((item) => item.decision === 'EXIT')).toBe(true);
     await engine.observe([observation(currentTime)], funding(currentTime), fees);
     expect(engine.list().filter((item) => item.cohort === 'ONE_SETTLEMENT')).toHaveLength(1);
@@ -167,6 +180,7 @@ describe('FundingResearchEngine', () => {
     });
 
     currentTime += 60_000;
+    saveRealizedFunding(database, firstFundingSnapshotAt + 60_000, currentTime);
     await engine.observe([observation(currentTime)], funding(currentTime), fees);
     expect(engine.list().find((item) => item.cohort === 'ROLLING')).toMatchObject({
       state: 'OPEN', lastReason: 'research_minimum_holding_active', unprofitableCount: 0, settledEvents: 2,
@@ -182,6 +196,33 @@ describe('FundingResearchEngine', () => {
     await engine.observe([observation(currentTime)], funding(currentTime), fees);
     expect(engine.list().find((item) => item.cohort === 'ROLLING')).toMatchObject({
       state: 'CLOSED', lastReason: 'hold_value_not_positive', unprofitableCount: 2,
+    });
+  });
+
+  it('固定72小时和7天实验组只在各自截止时间退出', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'funding-research-static-'));
+    const database = openDatabase(join(directory, 'test.sqlite'), resolve(process.cwd(), '../../migrations'));
+    resources.push({ directory, database });
+    let currentTime = Date.parse('2026-08-15T00:00:00.000Z');
+    const engine = new FundingResearchEngine(database, market(() => currentTime), {
+      enabled: true, modelVersion: 'static_cohorts', targetNotionalUsd: '5', maxOpenPositions: 1,
+      minimumSettledEvents: 1,
+    }, () => currentTime);
+    await engine.observe([observation(currentTime)], funding(currentTime), fees);
+
+    currentTime += 72 * 60 * 60_000;
+    await engine.observe([], funding(currentTime), fees);
+    expect(engine.list().find((item) => item.cohort === 'STATIC_72H')).toMatchObject({
+      state: 'CLOSED', lastReason: 'research_static_72h_completed',
+    });
+    expect(engine.list().find((item) => item.cohort === 'STATIC_7D')).toMatchObject({
+      state: 'OPEN', lastReason: 'research_static_7d_holding',
+    });
+
+    currentTime += 4 * 24 * 60 * 60_000;
+    await engine.observe([], funding(currentTime), fees);
+    expect(engine.list().find((item) => item.cohort === 'STATIC_7D')).toMatchObject({
+      state: 'CLOSED', lastReason: 'research_static_7d_completed',
     });
   });
 
@@ -243,7 +284,7 @@ describe('FundingResearchEngine', () => {
     await engine.observe([], funding(currentTime), fees);
     const open = database.prepare(`SELECT last_evaluated_at FROM funding_research_positions
       WHERE research_model_version = ? AND state = 'OPEN'`).all('monitor_guard') as Array<{ last_evaluated_at: string }>;
-    expect(open).toHaveLength(2);
+    expect(open).toHaveLength(4);
     expect(open.every((item) => item.last_evaluated_at === new Date(currentTime).toISOString())).toBe(true);
   });
 

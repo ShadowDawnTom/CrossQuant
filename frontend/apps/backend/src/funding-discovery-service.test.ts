@@ -24,7 +24,7 @@ describe('FundingDiscoveryService', () => {
     const now = Date.parse('2026-08-21T00:00:00.000Z');
     const changed = vi.fn(async () => undefined);
     const service = new FundingDiscoveryService(database, {
-      assets: ['SOL', 'DOGE'], initialHotAssets: ['SOL'], requiredAssets: ['SOL'], hotPoolSize: 2,
+      assets: ['SOL', 'DOGE'], coreAssets: ['SOL'], initialHotAssets: ['SOL'], requiredAssets: ['SOL'], hotPoolSize: 2,
       minOpenInterestUsd: '1000000', promotionConfirmations: 1, snapshotIntervalMs: 1,
       minEdgeDurationMs: 0, maxDirectionFlips24h: 3, minHotDwellMs: 1_000,
       onHotPoolChanged: changed, now: () => now,
@@ -51,9 +51,10 @@ describe('FundingDiscoveryService', () => {
 
     expect(await service.observe(funding, rules, overview)).toEqual(['DOGE', 'SOL']);
     expect(changed).toHaveBeenCalledWith(['SOL', 'DOGE']);
-    expect(service.summary()).toMatchObject({ universeSize: 2, hotPoolSize: 2, eligibleCount: 2,
+    expect(service.summary()).toMatchObject({ universeSize: 2, coreCount: 1, satelliteCount: 1,
+      hotPoolSize: 2, eligibleCount: 2,
       hotAssets: ['SOL', 'DOGE'] });
-    expect(service.summary().assets[0]).toMatchObject({ asset: 'DOGE', inHotPool: true,
+    expect(service.summary().assets[0]).toMatchObject({ asset: 'DOGE', pool: 'SATELLITE', inHotPool: true,
       eligibleForHotPool: true, primaryReason: 'discovery_hot_pool_eligible' });
     expect(database.prepare('SELECT COUNT(*) AS count FROM funding_discovery_snapshots').get())
       .toEqual({ count: 2 });

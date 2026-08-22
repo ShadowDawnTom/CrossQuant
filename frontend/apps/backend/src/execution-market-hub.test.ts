@@ -63,6 +63,32 @@ describe('OrderBookReplica', () => {
 });
 
 describe('venue payload parsing', () => {
+  it('通过 Hyperliquid 元数据为 HIP-3 合约添加 DEX 前缀', async () => {
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { type?: string; dex?: string };
+      if (body.type === 'perpDexs') return new Response(JSON.stringify([null, { name: 'xyz' }]), { status: 200 });
+      if (body.type === 'meta' && body.dex === 'xyz') {
+        return new Response(JSON.stringify({ universe: [{ name: 'xyz:UNITREE' }, { name: 'xyz:SKHX' }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ universe: [{ name: 'BTC' }] }), { status: 200 });
+    });
+    const hub = new ExecutionMarketHub(fetchImpl as typeof fetch, { symbols: ['UNITREE'] });
+    const sent: string[] = [];
+    const internal = hub as unknown as {
+      loadHyperliquidSymbols: () => Promise<void>;
+      subscribeSymbols: (venue: 'HYPERLIQUID', socket: { send(value: string): void }, symbols: string[]) => void;
+      onHyperliquid: (message: Record<string, unknown>) => void;
+      books: Map<string, OrderBookReplica>;
+    };
+    await internal.loadHyperliquidSymbols();
+    internal.subscribeSymbols('HYPERLIQUID', { send: (value) => sent.push(value) }, ['UNITREE']);
+    expect(sent[0]).toContain('xyz:UNITREE');
+    internal.onHyperliquid({ channel: 'l2Book', data: { coin: 'xyz:UNITREE', time: 1_800_000_000_010,
+      levels: [[{ px: '10', sz: '4' }], [{ px: '11', sz: '5' }]] } });
+    expect(internal.books.get('HYPERLIQUID:UNITREE')!.state.asks.get('11')).toBe('5');
+    expect(crossExFutureSymbol('HYPERLIQUID', 'UNITREE')).toBe('HYPERLIQUID_FUTURE_UNITREE_USDC');
+  });
+
   it('accepts Gate object levels without dropping sequence updates', () => {
     const hub = new ExecutionMarketHub(fetch, { symbols: ['BTC'] });
     const internal = hub as unknown as {
@@ -134,6 +160,32 @@ describe('venue payload parsing', () => {
 });
 
 describe('ExecutionMarketHub certification', () => {
+  it('新热池未达到多所实时认证时保留旧池', async () => {
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/info')) {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { type?: string };
+        return new Response(JSON.stringify(body.type === 'perpDexs' ? [] : { universe: [{ name: 'BTC' }, { name: 'DOGE' }] }), { status: 200 });
+      }
+      if (url.includes('/futures/usdt/contracts')) return new Response(JSON.stringify([
+        { name: 'BTC_USDT', quanto_multiplier: '1' }, { name: 'DOGE_USDT', quanto_multiplier: '1' },
+      ]), { status: 200 });
+      return new Response(JSON.stringify({ data: [
+        { instId: 'BTC-USDT-SWAP', ctVal: '1' }, { instId: 'DOGE-USDT-SWAP', ctVal: '1' },
+      ] }), { status: 200 });
+    });
+    const hub = new ExecutionMarketHub(fetchImpl as typeof fetch, {
+      symbols: ['BTC'], requiredSymbols: ['BTC'], symbolStageTimeoutMs: 10,
+      quoteFx: new StaticQuoteFxReader(),
+    });
+    const internal = hub as unknown as { stopped: boolean };
+    internal.stopped = false;
+    await hub.replaceSymbols(['DOGE']);
+    expect(hub.health().symbols).toEqual(['BTC']);
+    expect(() => hub.book('BINANCE', 'DOGE')).toThrow('execution_market_not_configured');
+    hub.stop();
+  });
+
   it('动态替换研究热池时保留严格资产并初始化新增盘口', async () => {
     const fetchImpl = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
