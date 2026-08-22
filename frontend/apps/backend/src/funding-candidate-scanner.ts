@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Decimal } from 'decimal.js';
 import type { GateCredentials } from './credential-vault.js';
 import type { GateCrossExSymbol, GateFeeRate, GateFundingInfo, TradingCrossExGateway } from './crossex-client.js';
+import { canonicalMarketAsset } from './market-asset-aliases.js';
 import {
   crossExFutureSymbol,
   EXECUTION_VENUES,
@@ -14,7 +15,13 @@ import { FundingArbitrageError, type FundingArbitrageEngine } from './funding-ar
 import { persistenceAdjustedRetention, type FundingPersistenceStats } from './funding-persistence.js';
 
 const LIVE_VENUES = new Set<ExecutionVenue>(LIVE_EXECUTION_VENUES);
+const RESEARCH_VENUES = new Set<ExecutionVenue>(EXECUTION_VENUES);
 const SYMBOL = /^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT)_FUTURE_([A-Z0-9]+)_(USD|USDC|USDT)$/;
+
+function canonicalFundingAsset(symbol: string): string | null {
+  const match = SYMBOL.exec(symbol);
+  return match?.[1] && match[2] ? canonicalMarketAsset(match[1], 'FUTURE', match[2]) : null;
+}
 
 export interface FundingCandidateScannerOptions {
   assets: string[];
@@ -234,7 +241,7 @@ export class FundingCandidateScanner {
     const horizonMs = this.options.horizonHours * 60 * 60_000;
     let recorded = 0;
     for (const asset of assets) {
-      const rows = funding.filter((item) => SYMBOL.exec(item.symbol)?.[2] === asset);
+      const rows = funding.filter((item) => canonicalFundingAsset(item.symbol) === asset);
       // 非热资产只参加轻量发现，不创建或读取任何完整订单簿。
       if (!strictAssets.has(asset) && !researchAssets.has(asset)) continue;
       const combinations = rows.flatMap((first, left) => rows.slice(left + 1).map((second) => {
@@ -246,7 +253,7 @@ export class FundingCandidateScanner {
       })).filter((item) => item.firstEvents > 0 || item.secondEvents > 0)
         .sort((left, right) => right.rawEdge.cmp(left.rawEdge));
       // 毛费率第一名可能来自尚未接入执行器或盘口未同步的交易所，不能让它占掉整个研究名额。
-      // 研究池额外保留可执行且已同步的最优组合；严格池仍检查四家执行器支持交易所的全部组合。
+      // 研究池允许七家行情接入交易所；严格实盘池仍只检查四家已完成真实下单演练的交易所。
       const selected: typeof combinations = [];
       const addSelected = (item: (typeof combinations)[number]): void => {
         if (!selected.includes(item)) selected.push(item);
@@ -263,7 +270,7 @@ export class FundingCandidateScanner {
         for (const item of combinations) {
           const firstVenue = SYMBOL.exec(item.first.symbol)?.[1] as ExecutionVenue | undefined;
           const secondVenue = SYMBOL.exec(item.second.symbol)?.[1] as ExecutionVenue | undefined;
-          if (!firstVenue || !secondVenue || !LIVE_VENUES.has(firstVenue) || !LIVE_VENUES.has(secondVenue)) continue;
+          if (!firstVenue || !secondVenue || !RESEARCH_VENUES.has(firstVenue) || !RESEARCH_VENUES.has(secondVenue)) continue;
           const firstRule = ruleMap.get(item.first.symbol);
           const secondRule = ruleMap.get(item.second.symbol);
           if (!firstRule || !secondRule || firstRule.state !== 'live' || secondRule.state !== 'live') continue;

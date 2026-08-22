@@ -121,7 +121,7 @@ export function FundingResearchPanel() {
         <i />{summary?.enabled ? '独立模拟运行中' : '探索模拟未开启'}
       </span>
     </header>
-    <p className="funding-research-notice">广域发现池只读取资金费、Ticker、交易规则和持仓量；排名靠前且持续确认的 {discovery?.hotPoolLimit ?? 10} 个币才接入完整订单簿。研究目标每腿 {summary?.targetNotionalUsd ?? '5'} U，规则取整后任一腿超过 {summary?.maxActualNotionalUsd ?? '10'} U 会直接拒绝。每个研究组最多同时持有 {summary?.maxOpenPositions ?? 3} 个不同组合。滚动组采用 {summary?.modelVersion ?? 'rolling_v6'}，普通价值转负在最初 {summary ? Math.round(summary.minimumHoldingMs / 3_600_000) : 24} 小时只记录不退出；资金费持续反转和硬风控仍可提前结束。所有研究都不会发送交易所订单。</p>
+    <p className="funding-research-notice">广域发现池使用主流币、行业龙头和 RWA 龙头白名单，只读取资金费、Ticker、交易规则和持仓量；排名靠前且持续确认的 {discovery?.hotPoolLimit ?? 10} 个标的才接入完整订单簿。研究目标每腿 {summary?.targetNotionalUsd ?? '5'} U，规则取整后任一腿超过 {summary?.maxActualNotionalUsd ?? '10'} U 会直接拒绝。每个研究组最多同时持有 {summary?.maxOpenPositions ?? 3} 个不同组合。滚动组采用 {summary?.modelVersion ?? 'rolling_v7'}，普通价值转负在最初 {summary ? Math.round(summary.minimumHoldingMs / 3_600_000) : 24} 小时只记录不退出；资金费持续反转和硬风控仍可提前结束。所有研究都不会发送交易所订单。</p>
     {error && <p className="funding-paper-error" role="alert">研究数据读取失败：{error}</p>}
 
     <div className="funding-research-opportunities">

@@ -73,4 +73,41 @@ describe('FundingDiscoveryService', () => {
       eligibleForHotPool: false, primaryReason: 'instrument_not_live_or_delisting',
     });
   });
+
+  it('将交易所别名归一到同一资产，并允许研究专用交易所进入模拟热池', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'funding-discovery-alias-'));
+    const database = openDatabase(join(directory, 'test.sqlite'), resolve(process.cwd(), '../../migrations'));
+    resources.push({ directory, database });
+    const now = Date.parse('2026-08-22T00:00:00.000Z');
+    const service = new FundingDiscoveryService(database, {
+      assets: ['SKHYNIX'], initialHotAssets: [], requiredAssets: [], hotPoolSize: 1,
+      minOpenInterestUsd: '1000000', promotionConfirmations: 1, snapshotIntervalMs: 1,
+      minEdgeDurationMs: 0, maxDirectionFlips24h: 3, minHotDwellMs: 1_000, now: () => now,
+    });
+    const funding: GateFundingInfo[] = [
+      { symbol: 'GATE_FUTURE_SKHYNIX_USDT', funding_rate: '-0.0001',
+        funding_time: String(now + 3_600_000), funding_interval: '28800' },
+      { symbol: 'HYPERLIQUID_FUTURE_SKHX_USDC', funding_rate: '0.0003',
+        funding_time: String(now + 3_600_000), funding_interval: '28800' },
+    ];
+    const rules = funding.map((item) => ({ symbol: item.symbol, state: 'live', lot_size: '0.01',
+      min_size: '0.01', min_notional: '5', max_market_size: '100000' })) as GateCrossExSymbol[];
+    const overview = {
+      assets: [{ asset: 'SKHYNIX', bestExecution: null, venues: [
+        { venue: 'GATE', symbol: funding[0]!.symbol, quote: 'USDT', fundingRate: '-0.0001',
+          nextFundingAt: new Date(now + 3_600_000).toISOString(), openInterestValue: '5000000',
+          lastPrice: '180', change24h: '0.01', fetchedAt: new Date(now).toISOString(), executionSupport: 'live_ready' },
+        { venue: 'HYPERLIQUID', symbol: funding[1]!.symbol, quote: 'USDC', fundingRate: '0.0003',
+          nextFundingAt: new Date(now + 3_600_000).toISOString(), openInterestValue: '4000000',
+          lastPrice: '180', change24h: '0.01', fetchedAt: new Date(now).toISOString(), executionSupport: 'research_only' },
+      ] }], venueStatus: [], fetchedAt: new Date(now).toISOString(), cacheStatus: 'fresh',
+    } as FundingOverviewResponse;
+
+    expect(await service.observe(funding, rules, overview)).toEqual(['SKHYNIX']);
+    expect(service.summary().assets[0]).toMatchObject({
+      asset: 'SKHYNIX', bestLongVenue: 'GATE', bestShortVenue: 'HYPERLIQUID',
+      eligibleForHotPool: true, primaryReason: 'discovery_hot_pool_eligible',
+      details: { researchMarketSupported: true, executionSupported: false },
+    });
+  });
 });

@@ -563,7 +563,7 @@ describe('local backend', () => {
     const discovery = await app.inject({ method: 'GET', url: '/api/funding-discovery',
       headers: { host: '127.0.0.1:17840' } });
     expect(discovery.statusCode).toBe(200);
-    expect(discovery.json()).toMatchObject({ universeSize: 80, hotPoolSize: 2, hotPoolLimit: 10,
+    expect(discovery.json()).toMatchObject({ universeSize: 38, hotPoolSize: 2, hotPoolLimit: 10,
       hotAssets: ['BTC', 'ETH'], eligibleCount: 0, assets: [] });
   });
 

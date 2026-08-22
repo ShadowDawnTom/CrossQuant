@@ -372,7 +372,7 @@ export class FundingResearchEngine {
   private active: Promise<number> | null = null;
 
   private get modelVersion(): string {
-    return this.options.modelVersion ?? 'rolling_v6';
+    return this.options.modelVersion ?? 'rolling_v7';
   }
 
   constructor(

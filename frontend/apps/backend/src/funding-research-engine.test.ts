@@ -194,7 +194,7 @@ describe('FundingResearchEngine', () => {
       ...row, funding_time: String(Date.parse('2026-08-15T08:00:00.000Z')), funding_interval: '60',
     }));
     const engine = new FundingResearchEngine(database, market(() => currentTime), {
-      enabled: true, modelVersion: 'rolling_v6', targetNotionalUsd: '5', maxOpenPositions: 1,
+      enabled: true, modelVersion: 'rolling_v7', targetNotionalUsd: '5', maxOpenPositions: 1,
       minimumSettledEvents: 1, stressSlippageBps: '0', adverseExitBasisBps: '0',
     }, () => currentTime);
 

@@ -65,7 +65,7 @@ describe('browser authentication config', () => {
       GCT_FUNDING_RESEARCH_ASSETS: 'BTC,ETH,SOL,DOGE,TRUMP',
     }).fundingResearch).toMatchObject({
       enabled: true,
-      modelVersion: 'rolling_v6',
+      modelVersion: 'rolling_v7',
       assets: ['BTC', 'ETH', 'SOL', 'DOGE', 'TRUMP'],
       targetNotionalUsd: '5',
       maxActualNotionalUsd: '10',

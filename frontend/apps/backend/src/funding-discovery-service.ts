@@ -3,10 +3,12 @@ import type Database from 'better-sqlite3';
 import { Decimal } from 'decimal.js';
 import type { FundingOverviewResponse } from '@gate-crossex/shared-types';
 import type { GateCrossExSymbol, GateFundingInfo } from './crossex-client.js';
-import { LIVE_EXECUTION_VENUES, type ExecutionVenue } from './execution-market-hub.js';
+import { EXECUTION_VENUES, LIVE_EXECUTION_VENUES, type ExecutionVenue } from './execution-market-hub.js';
+import { canonicalMarketAsset } from './market-asset-aliases.js';
 
 const FUNDING_SYMBOL = /^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT)_FUTURE_([A-Z0-9]+)_(USD|USDC|USDT)$/;
-const EXECUTABLE_VENUES = new Set<string>(LIVE_EXECUTION_VENUES);
+const RESEARCH_MARKET_VENUES = new Set<string>(EXECUTION_VENUES);
+const LIVE_ORDER_VENUES = new Set<string>(LIVE_EXECUTION_VENUES);
 
 export interface FundingDiscoveryAsset {
   asset: string;
@@ -139,10 +141,12 @@ export class FundingDiscoveryService {
     const rowsByAsset = new Map<string, GateFundingInfo[]>();
     for (const row of funding) {
       const match = FUNDING_SYMBOL.exec(row.symbol);
-      if (!match?.[2] || !this.universe.includes(match[2])) continue;
-      const rows = rowsByAsset.get(match[2]) ?? [];
+      if (!match?.[1] || !match[2]) continue;
+      const asset = canonicalMarketAsset(match[1], 'FUTURE', match[2]);
+      if (!this.universe.includes(asset)) continue;
+      const rows = rowsByAsset.get(asset) ?? [];
       rows.push(row);
-      rowsByAsset.set(match[2], rows);
+      rowsByAsset.set(asset, rows);
     }
     const next = this.universe.map((asset) => this.evaluateAsset(
       asset, rowsByAsset.get(asset) ?? [], ruleMap, overviewMap.get(asset) ?? null, now, observedAt,
@@ -173,9 +177,10 @@ export class FundingDiscoveryService {
       return [{ long, short, longVenue, shortVenue, longRate, shortRate, spread: shortRate.minus(longRate) }];
     })).sort((left, right) => right.spread.cmp(left.spread));
     const grossBest = candidates[0] ?? null;
-    // 毛差第一名可能来自研究专用交易所或已停止交易的合约；热池必须继续寻找可由真实执行器支持的组合。
-    const best = candidates.find((item) => EXECUTABLE_VENUES.has(item.longVenue)
-      && EXECUTABLE_VENUES.has(item.shortVenue)
+    // 毛差第一名可能来自未接行情或已停止交易的合约；模拟热池可以使用七家已接入订单簿的交易所。
+    // 真实下单是否支持由候选扫描器单独标记，不能把研究覆盖面误当成实盘执行能力。
+    const best = candidates.find((item) => RESEARCH_MARKET_VENUES.has(item.longVenue)
+      && RESEARCH_MARKET_VENUES.has(item.shortVenue)
       && ruleMap.get(item.long.symbol)?.state === 'live' && ruleMap.get(item.short.symbol)?.state === 'live')
       ?? grossBest;
     const direction = best ? `${best.longVenue}:${best.shortVenue}` : null;
@@ -216,13 +221,16 @@ export class FundingDiscoveryService {
     const shortDelistAt = delistTimeMs(shortRule);
     const delistingSoon = [longDelistAt, shortDelistAt].some((timestamp) =>
       timestamp !== null && timestamp <= now + 7 * 24 * 60 * 60_000);
-    const executionSupported = Boolean(best && EXECUTABLE_VENUES.has(best.longVenue) && EXECUTABLE_VENUES.has(best.shortVenue));
+    const researchMarketSupported = Boolean(best && RESEARCH_MARKET_VENUES.has(best.longVenue)
+      && RESEARCH_MARKET_VENUES.has(best.shortVenue));
+    const executionSupported = Boolean(best && LIVE_ORDER_VENUES.has(best.longVenue)
+      && LIVE_ORDER_VENUES.has(best.shortVenue));
     const tickerValid = Boolean(longTicker?.lastPrice && shortTicker?.lastPrice && Number.isFinite(tickerAge) && tickerAge <= 10 * 60_000);
     const oiValid = Boolean(openInterest && openInterest.gte(this.options.minOpenInterestUsd));
     const reason = !best || !best.spread.gt(0) ? 'discovery_funding_edge_missing'
       : !longRule || !shortRule ? 'instrument_rule_missing'
         : !rulesLive || delistingSoon ? 'instrument_not_live_or_delisting'
-          : !executionSupported ? 'executor_venue_not_supported'
+          : !researchMarketSupported ? 'research_market_venue_not_supported'
             : !scheduleValid ? 'funding_schedule_unavailable'
               : !longTicker || !shortTicker ? 'discovery_ticker_missing'
                 : !tickerValid ? 'discovery_ticker_stale'
@@ -259,7 +267,8 @@ export class FundingDiscoveryService {
         shortRule: shortRule ? { state: shortRule.state, lotSize: shortRule.lot_size, minSize: shortRule.min_size,
           minNotional: shortRule.min_notional, maxMarketSize: shortRule.max_market_size,
           delistAt: shortDelistAt === null ? null : new Date(shortDelistAt).toISOString() } : null,
-        tickerAgeMs: Number.isFinite(tickerAge) ? tickerAge : null, scheduleValid, executionSupported, delistingSoon,
+        tickerAgeMs: Number.isFinite(tickerAge) ? tickerAge : null, scheduleValid,
+        researchMarketSupported, executionSupported, delistingSoon,
       },
     };
   }

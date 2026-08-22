@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
 import { Decimal } from 'decimal.js';
+import { nativeMarketAsset } from './market-asset-aliases.js';
 import { StablecoinFxOracle, type ExecutionQuote, type QuoteFxReader } from './quote-fx-oracle.js';
 
 export const EXECUTION_VENUES = [
@@ -87,11 +88,14 @@ export interface ExecutionMarketHealth {
 export interface ExecutionMarketReader {
   start(): void;
   stop(): void;
-  replaceSymbols?(symbols: readonly string[]): Promise<void>;
+  replaceSymbols?(symbols: readonly string[], availability?: ExecutionVenueAvailability): Promise<void>;
   health(now?: number): ExecutionMarketHealth;
   book(venue: ExecutionVenue, base: string, now?: number): ExecutionBookSnapshot;
   pair(base: string, longVenue: ExecutionVenue, shortVenue: ExecutionVenue, now?: number): ExecutionPairSnapshot;
 }
+
+/** 每个交易所真实存在的统一标的；缺失合约不能发送订阅或 REST 初始化请求。 */
+export type ExecutionVenueAvailability = Partial<Record<ExecutionVenue, readonly string[]>>;
 
 interface VenueConnection {
   socket: WebSocket | null;
@@ -213,21 +217,23 @@ export function executionQuote(venue: ExecutionVenue): ExecutionQuote {
 }
 
 export function crossExFutureSymbol(venue: ExecutionVenue, base: string): string {
-  return `${venue}_FUTURE_${base.toUpperCase()}_${executionQuote(venue)}`;
+  const nativeBase = nativeMarketAsset(venue, 'FUTURE', base.toUpperCase());
+  return `${venue}_FUTURE_${nativeBase}_${executionQuote(venue)}`;
 }
 
 export function nativeSymbol(venue: ExecutionVenue, base: string): string {
-  if (venue === 'GATE') return `${base}_USDT`;
-  if (venue === 'OKX') return `${base}-USDT-SWAP`;
+  const routedBase = nativeMarketAsset(venue, 'FUTURE', base.toUpperCase());
+  if (venue === 'GATE') return `${routedBase}_USDT`;
+  if (venue === 'OKX') return `${routedBase}-USDT-SWAP`;
   if (venue === 'KRAKEN') {
-    const nativeBase = base === 'BTC' ? 'XBT' : base;
+    const nativeBase = routedBase === 'BTC' ? 'XBT' : routedBase;
     return `PF_${nativeBase}USD`;
   }
-  if (venue === 'HYPERLIQUID') return base;
-  if (venue === 'DERIBIT') return `${base}_USDC-PERPETUAL`;
+  if (venue === 'HYPERLIQUID') return routedBase;
+  if (venue === 'DERIBIT') return `${routedBase}_USDC-PERPETUAL`;
   // 各所对千倍面值合约的命名不统一，必须在原生行情层做映射，不能让一个错误主题拖垮整批订阅。
-  if (venue === 'BYBIT' && base === 'PEPE') return '1000PEPEUSDT';
-  return `${base}USDT`;
+  if (venue === 'BYBIT' && routedBase === 'PEPE') return '1000PEPEUSDT';
+  return `${routedBase}USDT`;
 }
 
 /** 将原生报价币价格折算成 USD；汇率不可用时必须由上层拒绝候选。 */
@@ -378,6 +384,7 @@ export class ExecutionMarketHub {
   private readonly connections = new Map<ExecutionVenue, VenueConnection>();
   private readonly multipliers = new Map<string, string>();
   private readonly metadataUnavailable = new Set<string>();
+  private venueAvailability: Map<ExecutionVenue, Set<string>> | null = null;
   private readonly metadataLoadedVenues = new Set<'GATE' | 'OKX'>();
   private readonly bootstrapTasks = new Map<string, Promise<void>>();
   private readonly bootstrapAttempts = new Map<string, number>();
@@ -451,13 +458,15 @@ export class ExecutionMarketHub {
   /**
    * 运行中只替换研究盘口热池。严格实盘资产始终保留；增删主题不重连整所，避免动态筛选制造行情空窗。
    */
-  async replaceSymbols(symbols: readonly string[]): Promise<void> {
+  async replaceSymbols(symbols: readonly string[], availability?: ExecutionVenueAvailability): Promise<void> {
     const next = [...new Set(symbols.map((item) => item.trim().toUpperCase()).filter(Boolean))];
     for (const asset of this.requiredSymbols) if (!next.includes(asset)) next.unshift(asset);
     if (next.length === 0 || next.length > 50) throw new Error('execution market symbols must contain 1 to 50 assets');
+    const previousVenueSymbols = new Map(EXECUTION_VENUES.map((venue) => [venue, this.venueSymbols(venue)]));
+    const availabilityChanged = this.replaceAvailability(availability);
     const removed = this.symbols.filter((asset) => !next.includes(asset));
     const added = next.filter((asset) => !this.symbols.includes(asset));
-    if (removed.length === 0 && added.length === 0) return;
+    if (removed.length === 0 && added.length === 0 && !availabilityChanged) return;
     this.symbols.splice(0, this.symbols.length, ...next);
     for (const base of added) {
       for (const venue of EXECUTION_VENUES) this.books.set(this.key(venue, base), new OrderBookReplica(venue, base));
@@ -489,8 +498,11 @@ export class ExecutionMarketHub {
       for (const venue of EXECUTION_VENUES) {
         const socket = this.connections.get(venue)?.socket;
         if (!socket || socket.readyState !== WebSocket.OPEN) continue;
-        this.unsubscribeSymbols(venue, socket, removed);
-        const activeAdded = added.filter((base) => !this.metadataUnavailable.has(this.key(venue, base)));
+        const previousActive = previousVenueSymbols.get(venue) ?? [];
+        const nextActive = this.venueSymbols(venue);
+        const activeRemoved = previousActive.filter((base) => !nextActive.includes(base));
+        const activeAdded = nextActive.filter((base) => !previousActive.includes(base));
+        this.unsubscribeSymbols(venue, socket, activeRemoved);
         this.subscribeSymbols(venue, socket, activeAdded);
         for (const base of activeAdded) {
           const book = this.books.get(this.key(venue, base))!;
@@ -507,7 +519,7 @@ export class ExecutionMarketHub {
   health(now = Date.now()): ExecutionMarketHealth {
     const venues = EXECUTION_VENUES.map((venue) => {
       const connection = this.connections.get(venue)!;
-      const replicas = this.symbols.map((base) => this.books.get(this.key(venue, base))!);
+      const replicas = this.venueSymbols(venue).map((base) => this.books.get(this.key(venue, base))!);
       return {
         venue, connectionState: connection.state,
         readyBooks: replicas.filter((book) => this.isLive(book, connection, now)).length,
@@ -934,7 +946,35 @@ export class ExecutionMarketHub {
   }
 
   private venueSymbols(venue: ExecutionVenue): string[] {
-    return this.symbols.filter((base) => !this.metadataUnavailable.has(this.key(venue, base)));
+    return this.symbols.filter((base) => this.venueSupports(venue, base)
+      && !this.metadataUnavailable.has(this.key(venue, base)));
+  }
+
+  /**
+   * 用交易规则刷新逐所可订阅标的。
+   * 只要调用方提供了某个交易所，该交易所未列出的币就必须 fail-closed，避免无效主题拖垮整条连接。
+   */
+  private replaceAvailability(availability?: ExecutionVenueAvailability): boolean {
+    if (!availability) return false;
+    const next = new Map<ExecutionVenue, Set<string>>();
+    for (const venue of EXECUTION_VENUES) {
+      const assets = availability[venue];
+      if (assets) next.set(venue, new Set(assets.map((asset) => asset.trim().toUpperCase()).filter(Boolean)));
+    }
+    const previous = this.venueAvailability;
+    const changed = !previous || EXECUTION_VENUES.some((venue) => {
+      const left = previous.get(venue); const right = next.get(venue);
+      if (!left && !right) return false;
+      if (!left || !right || left.size !== right.size) return true;
+      return [...left].some((asset) => !right.has(asset));
+    });
+    this.venueAvailability = next;
+    return changed;
+  }
+
+  private venueSupports(venue: ExecutionVenue, base: string): boolean {
+    const available = this.venueAvailability?.get(venue);
+    return !available || available.has(base.toUpperCase());
   }
 
   private requestBootstrap(venue: ExecutionVenue, base: string, book: OrderBookReplica, generation: number): void {

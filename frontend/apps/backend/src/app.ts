@@ -67,7 +67,7 @@ import { FundingHistoryService } from './funding-history.js';
 import { FundingOverviewService } from './funding-overview.js';
 import { canonicalMarketAsset } from './market-asset-aliases.js';
 import { CrossExMarketHub, CANDLE_INTERVALS, type MarketDefinition, type MarketHubMessage } from './market-hub.js';
-import { crossExFutureSymbol, ExecutionMarketHub, EXECUTION_VENUES, sampleExecutionPairs, type ExecutionMarketReader, type ExecutionVenue } from './execution-market-hub.js';
+import { crossExFutureSymbol, ExecutionMarketHub, EXECUTION_VENUES, sampleExecutionPairs, type ExecutionMarketReader, type ExecutionVenue, type ExecutionVenueAvailability } from './execution-market-hub.js';
 import { StrategyEngine, StrategyEngineError } from './strategy-engine.js';
 import { TradingSession } from './trading-session.js';
 import { TradingRuntime, TradingRuntimeError } from './trading-runtime.js';
@@ -171,6 +171,21 @@ function deriveMarketCatalog(items: CrossExInstrument[], fetchedAt: string): Der
     ordered.set(asset, [...venues.values()].sort((left, right) => (CATALOG_VENUES as readonly string[]).indexOf(left.venue) - (CATALOG_VENUES as readonly string[]).indexOf(right.venue)));
   }
   return { fetchedAt, assets: ordered, liveSymbols };
+}
+
+/** 从 Gate 交易规则生成逐所白名单，防止研究热池向不存在的合约发送订阅。 */
+function deriveExecutionAvailability(items: ReadonlyArray<{ symbol: string; state: string }>): ExecutionVenueAvailability {
+  const available = new Map<ExecutionVenue, Set<string>>(
+    EXECUTION_VENUES.map((venue) => [venue, new Set<string>()]),
+  );
+  for (const item of items) {
+    if (item.state !== 'live') continue;
+    const match = CROSSEX_FUTURE_SYMBOL.exec(item.symbol);
+    if (!match?.[1] || !match[2] || !(EXECUTION_VENUES as readonly string[]).includes(match[1])) continue;
+    const venue = match[1] as ExecutionVenue;
+    available.get(venue)!.add(canonicalMarketAsset(venue, 'FUTURE', match[2]));
+  }
+  return Object.fromEntries([...available].map(([venue, assets]) => [venue, [...assets]])) as ExecutionVenueAvailability;
 }
 
 const CredentialContextSchema = z.object({
@@ -742,6 +757,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     ...config.fundingArbitrage.scanAssets,
     ...(config.fundingResearch.enabled ? config.fundingResearch.assets : []),
   ])];
+  const cachedRules = readInstrumentCatalog(database)?.items ?? [];
+  let executionVenueAvailability: ExecutionVenueAvailability | undefined = cachedRules.length > 0
+    ? deriveExecutionAvailability(cachedRules) : undefined;
   const fundingDiscoveryService = new FundingDiscoveryService(database, {
     assets: config.fundingResearch.assets,
     initialHotAssets: config.executionMarket.symbols,
@@ -756,7 +774,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     protectedAssets: () => fundingResearchEngine.list(100)
       .filter((position) => position.state === 'OPEN').map((position) => position.asset),
     onHotPoolChanged: async (assets) => {
-      await executionMarketHub.replaceSymbols?.(assets);
+      await executionMarketHub.replaceSymbols?.(assets, executionVenueAvailability);
       fundingHistoryService.trackSymbols(assets.flatMap((asset) =>
         EXECUTION_VENUES.map((venue) => crossExFutureSymbol(venue, asset))));
     },
@@ -775,6 +793,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         researchAssets: config.fundingResearch.enabled ? config.fundingResearch.assets : [],
         selectResearchAssets: async (funding, rules) => {
           if (!config.fundingResearch.enabled) return [];
+          executionVenueAvailability = deriveExecutionAvailability(rules);
           await fundingOverviewService.ensureFresh();
           const cachedCatalog = derivedMarketCatalog();
           const discoveryAssets = cachedCatalog?.assets ?? (() => {
@@ -782,14 +801,18 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
             for (const rule of rules) {
               const match = /^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT)_FUTURE_([A-Z0-9]+)_(USD|USDC|USDT)$/.exec(rule.symbol);
               if (!match?.[1] || !match[2] || !match[3]) continue;
-              const rows = assets.get(match[2]) ?? [];
+              const asset = canonicalMarketAsset(match[1], 'FUTURE', match[2]);
+              const rows = assets.get(asset) ?? [];
               rows.push({ venue: match[1], symbol: rule.symbol, quote: match[3] });
-              assets.set(match[2], rows);
+              assets.set(asset, rows);
             }
             return assets;
           })();
-          return fundingDiscoveryService.observe(funding, rules,
+          const selected = await fundingDiscoveryService.observe(funding, rules,
             fundingOverviewService.buildResponse({ assets: discoveryAssets }));
+          // 即使热池资产未变化，交易所新上架/下架也必须刷新逐所订阅白名单。
+          await executionMarketHub.replaceSymbols?.(fundingDiscoveryService.activeAssets(), executionVenueAvailability);
+          return selected;
         },
         researchTargetNotionalUsd: config.fundingResearch.targetNotionalUsd,
         researchMaxActualNotionalUsd: config.fundingResearch.maxActualNotionalUsd,
@@ -1095,6 +1118,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   if (options.startMarketStream) {
     marketHub.start();
+    await executionMarketHub.replaceSymbols?.(fundingDiscoveryService.activeAssets(), executionVenueAvailability);
     executionMarketHub.start();
     executionMarketSampleTimer = setInterval(() => {
       try {

@@ -163,14 +163,10 @@ function parseAssetList(value: string, name: string): string[] {
 }
 
 const DEFAULT_RESEARCH_ASSETS = [
-  'BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'ADA', 'SUI', 'AVAX', 'LINK', 'LTC',
-  'BCH', 'DOT', 'UNI', 'AAVE', 'NEAR', 'APT', 'ARB', 'OP', 'INJ', 'ATOM',
-  'FIL', 'ETC', 'XLM', 'HBAR', 'TRX', 'SEI', 'JUP', 'TAO', 'WIF', 'PEPE', 'ZEC',
-  'TON', 'SHIB', 'POL', 'BNB', 'EOS', 'GALA', 'SAND', 'MANA', 'CRV', 'LDO',
-  'RUNE', 'IMX', 'STX', 'TIA', 'PYTH', 'ENA', 'WLD', 'ORDI', 'NOT', 'FET',
-  'ICP', 'DYDX', 'GMX', 'KAS', 'ALGO', 'VET', 'FLOW', 'THETA', 'MKR', 'COMP',
-  'SNX', 'BONK', 'FLOKI', 'POPCAT', 'PENGU', 'TRUMP', 'KAITO', 'ONDO', 'PENDLE', 'JTO',
-  'STRK', 'AEVO', 'BLUR', 'MEME', 'NEO', 'IOTA', 'QTUM', 'CELO', 'JASMY',
+  'BTC', 'ETH', 'SOL', 'XRP', 'ZEC', 'BNB', 'SNDK', 'UNITREE', 'PUMP', 'SUI',
+  'ONDO', 'MSTRX', 'APT', 'TAO', 'LIT', 'LINK', 'AAVE', 'LDO', 'PYTH', 'HYPE',
+  'ARB', 'COINX', 'CRV', 'NVDAX', 'GOOGLX', 'MSFT', 'WLFI', 'IO', 'AI', 'AERO',
+  'ASTER', 'UNI', 'AKT', 'SKY', 'ZK', 'MORPHO', 'BREV', 'SKHYNIX',
 ].join(',');
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): BackendConfig {
@@ -229,7 +225,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
   const fundingScanAssets = parseAssetList(environment.GCT_FUNDING_SCAN_ASSETS ?? executionMarketSymbols.join(','), 'GCT_FUNDING_SCAN_ASSETS');
   const fundingResearchAssets = parseAssetList(environment.GCT_FUNDING_RESEARCH_ASSETS ?? DEFAULT_RESEARCH_ASSETS, 'GCT_FUNDING_RESEARCH_ASSETS');
   const fundingResearchEnabled = environment.GCT_FUNDING_RESEARCH_ENABLED === '1';
-  const fundingResearchModelVersion = (environment.GCT_FUNDING_RESEARCH_MODEL_VERSION ?? 'rolling_v6').trim();
+  const fundingResearchModelVersion = (environment.GCT_FUNDING_RESEARCH_MODEL_VERSION ?? 'rolling_v7').trim();
   if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(fundingResearchModelVersion)) {
     throw new Error('GCT_FUNDING_RESEARCH_MODEL_VERSION must use lowercase letters, digits, underscores, or hyphens');
   }

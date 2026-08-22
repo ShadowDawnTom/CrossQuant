@@ -128,6 +128,8 @@ describe('venue payload parsing', () => {
     expect(internal.books.get('DERIBIT:BTC')!.state.sequence).toBe(21);
     expect(nativeSymbol('KRAKEN', 'DOGE')).toBe('PF_DOGEUSD');
     expect(crossExFutureSymbol('DERIBIT', 'BTC')).toBe('DERIBIT_FUTURE_BTC_USDC');
+    expect(nativeSymbol('HYPERLIQUID', 'SKHYNIX')).toBe('SKHX');
+    expect(crossExFutureSymbol('HYPERLIQUID', 'SKHYNIX')).toBe('HYPERLIQUID_FUTURE_SKHX_USDC');
   });
 });
 
@@ -152,6 +154,31 @@ describe('ExecutionMarketHub certification', () => {
     await hub.replaceSymbols(['BTC']);
     expect(hub.health().symbols).toEqual(['BTC']);
     expect(() => hub.book('BINANCE', 'DOGE')).toThrow('execution_market_not_configured');
+  });
+
+  it('按逐所交易规则过滤不存在的研究合约', async () => {
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/futures/usdt/contracts')) return new Response(JSON.stringify([
+        { name: 'BTC_USDT', quanto_multiplier: '1' },
+      ]), { status: 200 });
+      return new Response(JSON.stringify({ data: [
+        { instId: 'BTC-USDT-SWAP', ctVal: '1' }, { instId: 'MSTRX-USDT-SWAP', ctVal: '1' },
+      ] }), { status: 200 });
+    });
+    const hub = new ExecutionMarketHub(fetchImpl as typeof fetch, {
+      symbols: ['BTC'], requiredSymbols: ['BTC'], quoteFx: new StaticQuoteFxReader(),
+    });
+
+    await hub.replaceSymbols(['MSTRX'], {
+      GATE: ['BTC'], BINANCE: ['BTC'], OKX: ['BTC'], BYBIT: ['BTC'],
+      KRAKEN: ['BTC', 'MSTRX'], HYPERLIQUID: ['BTC'], DERIBIT: ['BTC'],
+    });
+
+    const venues = new Map(hub.health().venues.map((item) => [item.venue, item]));
+    expect(venues.get('GATE')?.totalBooks).toBe(1);
+    expect(venues.get('KRAKEN')?.totalBooks).toBe(2);
+    expect(hub.health().symbols).toEqual(['BTC', 'MSTRX']);
   });
 
   it('waits for a websocket delta that bridges the REST snapshot', async () => {
